@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -39,49 +39,19 @@ import pytensor
 import pytest
 
 from pytensor import tensor as pt
+from pytensor.assumptions import assume
+from pytensor.compile.ops import DeepCopyOp
 from pytensor.graph import RewriteDatabaseQuery
-from pytensor.graph.rewriting.basic import in2out
-from pytensor.graph.rewriting.utils import rewrite_graph
-from pytensor.tensor.basic import Alloc
+from pytensor.tensor.random.type import random_generator_type
 from scipy import stats as st
 
-from pymc.logprob.basic import conditional_logp, logp
+import pymc as pm
+
+from pymc.logprob.basic import conditional_logp, icdf, logcdf, logp
 from pymc.logprob.rewriting import logprob_rewrites_db
-from pymc.logprob.tensor import naive_bcast_rv_lift
 from pymc.testing import assert_no_rvs
 
 
-def test_naive_bcast_rv_lift():
-    r"""Make sure `naive_bcast_rv_lift` can handle useless scalar `Alloc`\s."""
-    X_rv = pt.random.normal()
-    Z_at = Alloc()(X_rv, *())
-
-    # Make sure we're testing what we intend to test
-    assert isinstance(Z_at.owner.op, Alloc)
-
-    res = rewrite_graph(Z_at, custom_rewrite=in2out(naive_bcast_rv_lift), clone=False)
-    assert res is X_rv
-
-
-def test_naive_bcast_rv_lift_valued_var():
-    r"""Check that `naive_bcast_rv_lift` won't touch valued variables"""
-
-    x_rv = pt.random.normal(name="x")
-    broadcasted_x_rv = pt.broadcast_to(x_rv, (2,))
-
-    y_rv = pt.random.normal(broadcasted_x_rv, name="y")
-
-    x_vv = x_rv.clone()
-    y_vv = y_rv.clone()
-    logp_map = conditional_logp({x_rv: x_vv, y_rv: y_vv})
-    assert x_vv in logp_map
-    assert y_vv in logp_map
-    assert len(logp_map) == 2
-    assert np.allclose(logp_map[x_vv].eval({x_vv: 0}), st.norm(0).logpdf(0))
-    assert np.allclose(logp_map[y_vv].eval({x_vv: 0, y_vv: [0, 0]}), st.norm(0).logpdf([0, 0]))
-
-
-@pytest.mark.xfail(RuntimeError, reason="logprob for broadcasted RVs not implemented")
 def test_bcast_rv_logp():
     """Test that derived logp for broadcasted RV is correct"""
 
@@ -94,11 +64,11 @@ def test_bcast_rv_logp():
     logp_combined = pt.add(*logp.values())
     valid_logp = logp_combined.eval({broadcasted_x_vv: [0, 0]})
 
+    # The broadcast dimension is consumed like a support dimension
     assert valid_logp.shape == ()
     assert np.isclose(valid_logp, st.norm.logpdf(0))
 
     # It's not possible for broadcasted dimensions to have different values
-    # This should either raise or return -inf
     invalid_logp = logp_combined.eval({broadcasted_x_vv: [0, 1]})
     assert invalid_logp == -np.inf
 
@@ -132,6 +102,36 @@ def test_measurable_make_vector():
 
     assert make_vector_logp_eval.shape == y_testval.shape
     assert np.isclose(make_vector_logp_eval.sum(), ref_logp_eval_eval)
+
+
+def test_measurable_make_vector_with_constant_input():
+    base1_rv = pt.random.normal(name="base1")
+    base2_rv = pt.random.halfnormal(name="base2")
+    y_rv = pt.stack((base1_rv, pt.constant(0.0), base2_rv))
+    y_rv.name = "y"
+
+    base1_vv = base1_rv.clone()
+    base2_vv = base2_rv.clone()
+    y_vv = y_rv.clone()
+
+    ref_logp = conditional_logp({base1_rv: base1_vv, base2_rv: base2_vv})
+    ref_logp_combined = pt.sum([pt.sum(factor) for factor in ref_logp.values()])
+    y_logp = logp(y_rv, y_vv)
+
+    base1_testval = base1_rv.eval()
+    base2_testval = base2_rv.eval()
+    y_testval = np.stack((base1_testval, 0.0, base2_testval)).astype(y_vv.dtype)
+
+    ref_logp_eval = ref_logp_combined.eval({base1_vv: base1_testval, base2_vv: base2_testval})
+    y_logp_eval = y_logp.eval({y_vv: y_testval})
+
+    assert y_logp_eval.shape == y_testval.shape
+    assert np.isclose(y_logp_eval.sum(), ref_logp_eval)
+
+    y_testval_bad = y_testval.copy()
+    y_testval_bad[1] = 1.0
+    y_logp_eval_bad = y_logp.eval({y_vv: y_testval_bad})
+    assert y_logp_eval_bad[1] == -np.inf
 
 
 @pytest.mark.parametrize("reverse", (False, True))
@@ -221,6 +221,37 @@ def test_measurable_join_interdependent(reverse):
             }
         ),
     )
+
+
+def test_measurable_join_with_constant_input():
+    base1_rv = pt.random.normal(size=(2,), name="base1")
+    base2_rv = pt.random.exponential(size=(3,), name="base2")
+    const = pt.constant(np.array([0.0, 0.0, 0.0]))
+    y_rv = pt.join(0, base1_rv, const, base2_rv)
+    y_rv.name = "y"
+
+    base1_vv = base1_rv.clone()
+    base2_vv = base2_rv.clone()
+    y_vv = y_rv.clone()
+
+    ref_logp = conditional_logp({base1_rv: base1_vv, base2_rv: base2_vv})
+    ref_logp_combined = pt.sum([pt.sum(factor) for factor in ref_logp.values()])
+    y_logp = logp(y_rv, y_vv)
+
+    base1_testval = base1_rv.eval()
+    base2_testval = base2_rv.eval()
+    y_testval = np.concatenate([base1_testval, np.zeros(3), base2_testval]).astype(y_vv.dtype)
+
+    ref_logp_eval = ref_logp_combined.eval({base1_vv: base1_testval, base2_vv: base2_testval})
+    y_logp_eval = y_logp.eval({y_vv: y_testval})
+
+    assert y_logp_eval.shape == y_testval.shape
+    assert np.isclose(y_logp_eval.sum(), ref_logp_eval)
+
+    y_testval_bad = y_testval.copy()
+    y_testval_bad[2] = 1.0
+    y_logp_eval_bad = y_logp.eval({y_vv: y_testval_bad})
+    assert y_logp_eval_bad[2] == -np.inf
 
 
 @pytest.mark.parametrize(
@@ -343,10 +374,7 @@ def test_join_mixed_ndim_supp():
         (1, 2, 0),  # Swap
         (0, 1, 2, "x"),  # Expand
         ("x", 0, 1, 2),  # Expand
-        (
-            0,
-            2,
-        ),  # Drop
+        (0, 2),  # Drop
         (2, 0),  # Swap and drop
         (2, 1, "x", 0),  # Swap and expand
         ("x", 0, 2),  # Expand and drop
@@ -372,7 +400,7 @@ def test_measurable_dimshuffle(ds_order, multivariate):
 
     ref_logp = logp(base_rv, base_vv).dimshuffle(logp_ds_order)
 
-    # Disable local_dimshuffle_rv_lift to test fallback Aeppl rewrite
+    # Disable local_dimshuffle_rv_lift to test fallback logprob rewrite
     ir_rewriter = logprob_rewrites_db.query(
         RewriteDatabaseQuery(include=["basic"]).excluding("dimshuffle_lift")
     )
@@ -389,7 +417,7 @@ def test_measurable_dimshuffle(ds_order, multivariate):
     np.testing.assert_array_equal(ref_logp_fn(base_test_value), ds_logp_fn(ds_test_value))
 
 
-def test_unmeargeable_dimshuffles():
+def test_unmeasurable_dimshuffles():
     # Test that graphs with DimShuffles that cannot be lifted/merged fail
 
     # Initial support axis is at axis=-1
@@ -409,3 +437,484 @@ def test_unmeargeable_dimshuffles():
     # TODO: Check that logp is correct if this type of graphs is ever supported
     with pytest.raises(RuntimeError, match="could not be derived"):
         conditional_logp({w: w_vv})
+
+
+class TestMeasurableSplit:
+    def test_univariate(self):
+        rng = np.random.default_rng(388)
+        mu = np.arange(6)[:, None]
+        sigma = np.arange(5) + 1
+
+        x = pt.random.normal(mu, sigma, size=(6, 5), name="x")
+
+        # axis=0
+        x_parts = pt.split(x, splits_size=[2, 4], n_splits=2, axis=0)
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+        logp_parts = list(conditional_logp(dict(zip(x_parts, x_parts_vv))).values())
+
+        logp_fn = pytensor.function(x_parts_vv, logp_parts)
+        x_parts_test = [rng.normal(size=x_part.type.shape) for x_part in x_parts_vv]
+        logp_x1_eval, logp_x2_eval = logp_fn(*x_parts_test)
+        np.testing.assert_allclose(
+            logp_x1_eval,
+            st.norm.logpdf(x_parts_test[0], mu[:2], sigma),
+        )
+        np.testing.assert_allclose(
+            logp_x2_eval,
+            st.norm.logpdf(x_parts_test[1], mu[2:], sigma),
+        )
+
+        # axis=1
+        x_parts = pt.split(x, splits_size=[2, 1, 2], n_splits=3, axis=1)
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+        logp_parts = list(conditional_logp(dict(zip(x_parts, x_parts_vv))).values())
+
+        logp_fn = pytensor.function(x_parts_vv, logp_parts)
+        x_parts_test = [rng.normal(size=x_part.type.shape) for x_part in x_parts_vv]
+        logp_x1_eval, logp_x2_eval, logp_x3_eval = logp_fn(*x_parts_test)
+        np.testing.assert_allclose(
+            logp_x1_eval,
+            st.norm.logpdf(x_parts_test[0], mu, sigma[:2]),
+        )
+        np.testing.assert_allclose(
+            logp_x2_eval,
+            st.norm.logpdf(x_parts_test[1], mu, sigma[2:3]),
+        )
+        np.testing.assert_allclose(
+            logp_x3_eval,
+            st.norm.logpdf(x_parts_test[2], mu, sigma[3:]),
+        )
+
+    def test_multivariate(self):
+        @np.vectorize(signature=("(n),(n)->()"))
+        def scipy_dirichlet_logpdf(x, alpha):
+            """Compute the logpdf of a Dirichlet distribution using scipy."""
+            return st.dirichlet.logpdf(x, alpha)
+
+        # (3, 5) Dirichlet
+        rng = np.random.default_rng(426)
+        rng_pt = random_generator_type("rng")
+        alpha = np.linspace(1, 10, 5) * np.array([1, 10, 100])[:, None]
+        x = pt.random.dirichlet(alpha, rng=rng_pt)
+
+        # axis=-2 (i.e., 0, - batch dimension)
+        x_parts = pt.split(x, splits_size=[2, 1], n_splits=2, axis=-2)
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+        logp_parts = list(conditional_logp(dict(zip(x_parts, x_parts_vv))).values())
+        assert logp_parts[0].type.shape == (2,)
+        assert logp_parts[1].type.shape == (1,)
+
+        logp_fn = pytensor.function(x_parts_vv, logp_parts)
+        x_parts_test = pytensor.function([rng_pt], x_parts)(rng)
+        logp_x1_eval, logp_x2_eval = logp_fn(*x_parts_test)
+        np.testing.assert_allclose(
+            logp_x1_eval,
+            scipy_dirichlet_logpdf(x_parts_test[0], alpha[:2]),
+        )
+        np.testing.assert_allclose(
+            logp_x2_eval,
+            scipy_dirichlet_logpdf(x_parts_test[1], alpha[2:]),
+        )
+
+        # axis=-1 (i.e., 1, - support dimension)
+        x_parts = pt.split(x, splits_size=[2, 3], n_splits=2, axis=-1)
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+        logp_parts = list(conditional_logp(dict(zip(x_parts, x_parts_vv))).values())
+
+        assert logp_parts[0].type.shape == (3,)
+        assert logp_parts[1].type.shape == (3,)
+        logp_fn = pytensor.function(x_parts_vv, logp_parts)
+
+        x_parts_test = pytensor.function([rng_pt], x_parts)(rng)
+        logp_x1_eval, logp_x2_eval = logp_fn(*x_parts_test)
+        np.testing.assert_allclose(logp_x1_eval * 3, logp_x2_eval * 2)
+        logp_total = logp_x1_eval + logp_x2_eval
+        np.testing.assert_allclose(
+            logp_total,
+            scipy_dirichlet_logpdf(np.concatenate(x_parts_test, axis=1), alpha),
+        )
+
+    @pytest.mark.xfail(
+        reason="Rewrite from partial split to split on subtensor not implemented yet"
+    )
+    def test_not_all_splits_used(self):
+        x = pt.random.normal(mu=pt.arange(6), name="x")
+        x_parts = pt.split(x, splits_size=[2, 2, 2], n_splits=3, axis=0)[
+            ::2
+        ]  # Only use first two splits
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+        logp_parts = list(conditional_logp(dict(zip(x_parts, x_parts_vv))).values())
+        assert len(logp_parts) == 2
+
+        logp_fn = pytensor.function(x_parts_vv, logp_parts)
+        x_parts_test = [x_part.eval() for x_part in x_parts_vv]
+        logp_x1_eval, logp_x2_eval = logp_fn(*x_parts_test)
+        np.testing.assert_allclose(
+            logp_x1_eval,
+            st.norm.logpdf(x_parts_test[0], loc=[0, 1]),
+        )
+        np.testing.assert_allclose(
+            logp_x2_eval,
+            st.norm.logpdf(x_parts_test[1], loc=[4, 5]),
+        )
+
+    def test_not_all_splits_used_core_dim(self):
+        # TODO: We could support this for univariate/batch dimensions by rewriting as
+        # split(x, splits_size=[2, 2, 2], n_splits=3, axis=1)[:2] -> split(x[:-2], splits_size=[2, 2], n_splits=2, axis=1)
+        # And letting logp infer the probability of x[:-2]
+        x = pt.random.dirichlet(alphas=pt.ones(6), name="x")
+        x_parts = pt.split(x, splits_size=[2, 2, 2], n_splits=3, axis=0)[
+            :2
+        ]  # Only use first two splits
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+
+        with pytest.raises(
+            ValueError,
+            match="Split logp requires the number of values to match the number of splits",
+        ):
+            conditional_logp(dict(zip(x_parts, x_parts_vv)))
+
+    @pytest.mark.xfail(reason="Rewrite from subtensor to split not implemented yet")
+    def test_subtensor_converted_to_splits(self):
+        rng = np.random.default_rng(388)
+        x = pt.random.normal(mu=pt.arange(5), name="x")
+
+        x_parts = [x[:2], x[2:3], x[3:]]
+        x_parts_vv = [x_part.clone() for x_part in x_parts]
+        logp_parts = list(conditional_logp(dict(zip(x_parts, x_parts_vv))).values())
+        assert len(logp_parts) == 3
+        logp_fn = pytensor.function(x_parts_vv, logp_parts)
+        x_parts_test = [rng.normal(size=x_part.type.shape) for x_part in x_parts_vv]
+        logp_x1_eval, logp_x2_eval, logp_x3_eval = logp_fn(*x_parts_test)
+        np.testing.assert_allclose(logp_x1_eval, st.norm.logpdf(x_parts_test[0], loc=[0, 1]))
+        np.testing.assert_allclose(logp_x2_eval, st.norm.logpdf(x_parts_test[1], loc=[2]))
+        np.testing.assert_allclose(logp_x3_eval, st.norm.logpdf(x_parts_test[2], loc=[3, 4]))
+
+
+def test_measurable_broadcast():
+    b_shape = pt.vector("b_shape", shape=(3,), dtype=int)
+
+    x = pt.random.normal(size=(3, 1))
+    bcast_x = pt.broadcast_to(x, shape=b_shape)
+    bcast_x.name = "bcast_x"
+
+    bcast_x_value = bcast_x.clone()
+    logp_bcast_x = logp(bcast_x, bcast_x_value)
+    logp_fn = pytensor.function([b_shape, bcast_x_value], logp_bcast_x, on_unused_input="ignore")
+
+    # The expanded and broadcast dimensions are consumed like support dimensions:
+    # the logp has the base variable's remaining batch shape
+    # (assert_allclose also asserts shapes match, if neither is scalar)
+    np.testing.assert_allclose(
+        logp_fn([1, 3, 1], np.zeros((1, 3, 1))),
+        st.norm.logpdf(np.zeros(3)),
+    )
+    np.testing.assert_allclose(
+        logp_fn([1, 3, 5], np.zeros((1, 3, 5))),
+        st.norm.logpdf(np.zeros(3)),
+    )
+    np.testing.assert_allclose(
+        logp_fn([2, 3, 5], np.broadcast_to(np.arange(3).reshape(1, 3, 1), (2, 3, 5))),
+        st.norm.logpdf(np.arange(3)),
+    )
+    # Invalid broadcast value
+    np.testing.assert_array_equal(
+        logp_fn([1, 3, 5], np.arange(3 * 5).reshape(1, 3, 5)),
+        np.full(shape=(3,), fill_value=-np.inf),
+    )
+    # The invalidity check is elementwise over the base batch dimensions: an
+    # inconsistent row only invalidates its own logp
+    partially_valid = np.broadcast_to(np.arange(3).reshape(1, 3, 1), (1, 3, 5)).copy()
+    partially_valid[0, 1, 3] = 99.0
+    np.testing.assert_allclose(
+        logp_fn([1, 3, 5], partially_valid),
+        np.where([True, False, True], st.norm.logpdf(np.arange(3)), -np.inf),
+    )
+
+
+def test_measurable_broadcast_multivariate():
+    x = pt.random.dirichlet(pt.ones(3), size=(1,))
+    bcast_x = pt.broadcast_to(x, (5, 3))
+
+    bcast_x_value = bcast_x.clone()
+    logp_bcast_x = logp(bcast_x, bcast_x_value)
+
+    rng = np.random.default_rng(170)
+    row = rng.dirichlet(np.ones(3))
+    valid_value = np.broadcast_to(row, (5, 3))
+    valid_logp = logp_bcast_x.eval({bcast_x_value: valid_value})
+    assert valid_logp.shape == ()
+    np.testing.assert_allclose(
+        valid_logp,
+        st.dirichlet(np.ones(3)).logpdf(row),
+    )
+
+    invalid_value = rng.dirichlet(np.ones(3), size=(5,))
+    np.testing.assert_array_equal(
+        logp_bcast_x.eval({bcast_x_value: invalid_value}),
+        -np.inf,
+    )
+
+
+def test_broadcast_not_measurable_behind_other_ops():
+    # The broadcast dimensions are degenerate copies; other rewrites would treat them
+    # as independent entries (e.g., counting the jacobian of the exp once per copy),
+    # so the broadcast is only measurable when directly valued
+    x = pt.random.normal()
+    y = pt.exp(pt.broadcast_to(x, (3,)))
+    with pytest.raises(NotImplementedError):
+        logp(y, y.clone())
+
+
+class TestMeasurableCast:
+    def test_float_to_float(self):
+        y = pt.cast(pt.random.normal(0.5, 1), "float32")
+        y_vv = y.clone()
+
+        y_test = np.float32(0.7)
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.norm(0.5, 1).logpdf(y_test),
+        )
+        np.testing.assert_allclose(
+            logcdf(y, y_vv).eval({y_vv: y_test}),
+            st.norm(0.5, 1).logcdf(y_test),
+        )
+        np.testing.assert_allclose(
+            icdf(y, 0.3).eval(),
+            st.norm(0.5, 1).ppf(0.3),
+        )
+
+    def test_discrete_to_float(self):
+        y = pt.cast(pt.random.poisson(3), "float64")
+        y_vv = y.clone()
+
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: 3.0}),
+            st.poisson(3).logpmf(3),
+        )
+        # P(cast(X) <= 3.9) = P(X <= 3)
+        np.testing.assert_allclose(
+            logcdf(y, y_vv).eval({y_vv: 3.9}),
+            st.poisson(3).logcdf(3),
+        )
+
+        bern = pt.cast(pt.random.bernoulli(0.3), "float64")
+        bern_icdf = icdf(bern, 0.8)
+        assert bern_icdf.type.dtype == "float64"
+        np.testing.assert_allclose(bern_icdf.eval(), st.bernoulli(0.3).ppf(0.8))
+
+    def test_bool_to_int(self):
+        y = pt.cast(pt.random.bernoulli(0.3), "int64")
+        y_vv = y.clone()
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: 1}),
+            st.bernoulli(0.3).logpmf(1),
+        )
+
+    @pytest.mark.parametrize(
+        "value, lower, upper",
+        [(1, 1, 2), (0, -1, 1), (-1, -2, -1)],
+        ids=["positive", "zero", "negative"],
+    )
+    def test_float_to_int(self, value, lower, upper):
+        # The cast rounds towards zero, pooling (-1, 1) at zero
+        y = pt.cast(pt.random.normal(0.5, 1), "int64")
+        y_vv = y.clone()
+
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: value}),
+            np.log(st.norm(0.5, 1).cdf(upper) - st.norm(0.5, 1).cdf(lower)),
+        )
+
+    @pytest.mark.parametrize("rounding_fn", [pt.trunc, pt.floor, pt.ceil, pt.round])
+    def test_rounded_float_to_int(self, rounding_fn):
+        # The base variable is already supported on the integers, so the cast only
+        # relabels the dtype and must not introduce a second truncation
+        x = pt.random.normal(0.5, 1)
+        y = pt.cast(rounding_fn(x), "int64")
+        y_vv = y.clone()
+
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: 1}),
+            logp(rounding_fn(x), pt.constant(1.0)).eval(),
+        )
+
+    @pytest.mark.parametrize("out_dtype", ["bool", "uint8"])
+    def test_non_truncating_discretizing_cast_not_measurable(self, out_dtype):
+        # Casting to bool tests `x != 0` and casting to an unsigned int wraps around
+        # for negative values; neither is the truncation that float -> int performs
+        y = pt.cast(pt.random.normal(), out_dtype)
+        with pytest.raises(NotImplementedError):
+            logp(y, y.clone())
+
+    def test_indirect_discrete_to_float_not_measurable(self):
+        # If the cast is not directly valued, downstream rewrites would classify the
+        # discrete base variable as continuous (e.g., applying a continuous jacobian)
+        y = pt.exp(pt.cast(pt.random.poisson(3), "float64"))
+        with pytest.raises(NotImplementedError):
+            logp(y, y.clone())
+
+
+class TestMeasurableIdentityOps:
+    def test_scalar_from_tensor(self):
+        y = pt.scalar_from_tensor(pt.random.normal(0.5, 1))
+        y_vv = y.clone()
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: 0.7}),
+            st.norm(0.5, 1).logpdf(0.7),
+        )
+        np.testing.assert_allclose(
+            logcdf(y, y_vv).eval({y_vv: 0.7}),
+            st.norm(0.5, 1).logcdf(0.7),
+        )
+        np.testing.assert_allclose(
+            icdf(y, 0.3).eval(),
+            st.norm(0.5, 1).ppf(0.3),
+        )
+
+    def test_specify_assumptions(self):
+        y = assume(pt.random.normal(pt.arange(4), 1, size=(4,)), "unique_indices")
+        y_vv = y.clone()
+        y_test = np.zeros(4)
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.norm(np.arange(4), 1).logpdf(y_test),
+        )
+
+        # Identity ops keep composing with other measurable rewrites
+        y_exp = pt.exp(assume(pt.random.normal(0.5, 1), "diagonal"))
+        y_exp_vv = y_exp.clone()
+        np.testing.assert_allclose(
+            logp(y_exp, y_exp_vv).eval({y_exp_vv: 2.0}),
+            st.lognorm(s=1, scale=np.exp(0.5)).logpdf(2.0),
+        )
+
+    def test_deep_copy(self):
+        y = DeepCopyOp()(pt.random.normal(0.5, 1))
+        y_vv = y.clone()
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: 0.7}),
+            st.norm(0.5, 1).logpdf(0.7),
+        )
+
+
+class TestMeasurableJoinSplitDims:
+    def test_join_dims(self):
+        rng = np.random.default_rng(163)
+        x = pt.random.normal(pt.arange(6).reshape((2, 3)), 1, size=(2, 3))
+        y = pt.join_dims(x)
+        y_vv = y.clone()
+
+        y_test = rng.normal(size=6)
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.norm(np.arange(6), 1).logpdf(y_test),
+        )
+
+    def test_split_dims(self):
+        rng = np.random.default_rng(164)
+        x = pt.random.normal(pt.arange(6), 1, size=(6,))
+        y = pt.split_dims(x, shape=(2, 3), axis=0)
+        y_vv = y.clone()
+
+        y_test = rng.normal(size=(2, 3))
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.norm(np.arange(6).reshape((2, 3)), 1).logpdf(y_test),
+        )
+
+    @pytest.mark.parametrize("transform_first", (False, True))
+    def test_elemwise_chain(self, transform_first):
+        rng = np.random.default_rng(165)
+        x = pt.random.normal(pt.arange(6).reshape((2, 3)), 1, size=(2, 3))
+        y = pt.join_dims(pt.exp(x)) if transform_first else pt.exp(pt.join_dims(x))
+        y_vv = y.clone()
+
+        y_test = np.abs(rng.normal(size=6)) + 0.1
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.norm(np.arange(6), 1).logpdf(np.log(y_test)) - np.log(y_test),
+        )
+
+    def test_multivariate_directly_valued(self):
+        rng = np.random.default_rng(166)
+
+        # The joined region extends into the support dimension consumed by the logp,
+        # so only the remaining batch dimension is re-joined
+        x = pt.random.dirichlet(pt.ones(3), size=(2,))
+        y = pt.join_dims(x)
+        y_vv = y.clone()
+        y_test = rng.dirichlet(np.ones(3), size=2).ravel()
+        y_logp = logp(y, y_vv).eval({y_vv: y_test})
+        assert y_logp.shape == (2,)
+        np.testing.assert_allclose(
+            y_logp,
+            st.dirichlet(np.ones(3)).logpdf(y_test.reshape((2, 3)).T),
+        )
+
+        # The split dimension is the support dimension itself
+        x2 = pt.random.dirichlet(pt.ones(6))
+        y2 = pt.split_dims(x2, shape=(2, 3), axis=0)
+        y2_vv = y2.clone()
+        y2_test = rng.dirichlet(np.ones(6)).reshape((2, 3))
+        y2_logp = logp(y2, y2_vv).eval({y2_vv: y2_test})
+        assert y2_logp.shape == ()
+        np.testing.assert_allclose(
+            y2_logp,
+            st.dirichlet(np.ones(6)).logpdf(y2_test.ravel()),
+        )
+
+    def test_multivariate_indirect_join_within_batch(self):
+        # A join contained in the batch axes leaves the support axes rightmost,
+        # so it is measurable even behind other operations
+        rng = np.random.default_rng(168)
+        x = pt.random.dirichlet(pt.ones(3), size=(2, 2))
+        y = pt.exp(pt.join_dims(x, start_axis=0, n_axes=2))
+        y_vv = y.clone()
+        y_test = np.exp(rng.dirichlet(np.ones(3), size=(2, 2)).reshape((4, 3)))
+        y_logp = logp(y, y_vv).eval({y_vv: y_test})
+        assert y_logp.shape == (4,)
+        np.testing.assert_allclose(
+            y_logp,
+            st.dirichlet(np.ones(3)).logpdf(np.log(y_test).T) - np.log(y_test).sum(-1),
+        )
+
+    def test_multivariate_indirect_join_within_support(self):
+        # A join contained in the support axes just deflates them into fewer
+        # rightmost axes, so it is measurable even behind other operations
+        rng = np.random.default_rng(169)
+        x = pm.MatrixNormal.dist(mu=np.zeros((2, 3)), rowcov=np.eye(2), colcov=np.eye(3))
+        y = pt.exp(pt.join_dims(x, start_axis=0, n_axes=2))
+        y_vv = y.clone()
+        y_test = np.exp(rng.normal(size=6))
+        # With identity covariances the matrix normal entries are iid standard normal
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.norm.logpdf(np.log(y_test)).sum() - np.log(y_test).sum(),
+        )
+
+    # batch size 1 is the treacherous case: if the straddling join were wrongly
+    # claimed, the truncated logp would silently broadcast against the fused value
+    # dimension instead of raising a shape error
+    @pytest.mark.parametrize("batch_size", (1, 2))
+    def test_multivariate_indirect_straddling_join_not_measurable(self, batch_size):
+        # A join straddling the batch/support boundary merges batch and support axes;
+        # it is only measurable when directly valued
+        x = pt.random.dirichlet(pt.ones(3), size=(batch_size,))
+        y = pt.exp(pt.join_dims(x))
+        with pytest.raises(NotImplementedError):
+            logp(y, y.clone())
+
+    def test_multivariate_indirect_split(self):
+        # Splitting only inflates a single axis, so it is measurable even for
+        # multivariate variables behind other operations
+        rng = np.random.default_rng(167)
+        x = pt.random.dirichlet(pt.ones(6))
+        y = pt.exp(pt.split_dims(x, shape=(2, 3), axis=0))
+        y_vv = y.clone()
+        y_test = np.exp(rng.dirichlet(np.ones(6)).reshape((2, 3)))
+        np.testing.assert_allclose(
+            logp(y, y_vv).eval({y_vv: y_test}),
+            st.dirichlet(np.ones(6)).logpdf(np.log(y_test).ravel()) - np.log(y_test).sum(),
+        )

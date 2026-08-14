@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import pytensor
 import pytest
 import scipy as sp
 
-from numdifftools import Jacobian
+from numdifftools import Derivative, Jacobian
 from pytensor import scan
 from pytensor import tensor as pt
 from pytensor.compile.builders import OpFromGraph
@@ -30,7 +30,7 @@ import pymc as pm
 
 from pymc.distributions.transforms import _default_transform, log, logodds
 from pymc.logprob import conditional_logp
-from pymc.logprob.abstract import MeasurableVariable, _logprob
+from pymc.logprob.abstract import MeasurableOp, _logprob
 from pymc.logprob.transform_value import TransformValuesMapping, TransformValuesRewrite
 from pymc.logprob.transforms import ExpTransform, LogOddsTransform, LogTransform
 from pymc.testing import assert_no_rvs
@@ -42,13 +42,11 @@ def multiout_measurable_op():
     # Create a dummy Op that just returns the two inputs
     mu1, mu2 = pt.scalars("mu1", "mu2")
 
-    class TestOpFromGraph(OpFromGraph):
+    class TestOpFromGraph(MeasurableOp, OpFromGraph):
         def do_constant_folding(self, fgraph, node):
             False
 
     multiout_op = TestOpFromGraph([mu1, mu2], [mu1 + 0.0, mu2 + 0.0])
-
-    MeasurableVariable.register(TestOpFromGraph)
 
     @_logprob.register(TestOpFromGraph)
     def logp_multiout(op, values, mu1, mu2):
@@ -137,11 +135,15 @@ def test_original_values_output_dict():
             lambda mu, sigma: sp.stats.lognorm(s=sigma, scale=np.exp(mu)),
             (),
         ),
-        (
+        pytest.param(
             pt.random.halfcauchy,
             (1.5, 10.5),
             lambda alpha, beta: sp.stats.halfcauchy(loc=alpha, scale=beta),
             (),
+            marks=pytest.mark.xfail(
+                reason="We don't use PyTensor's HalfCauchy operator",
+                raises=NotImplementedError,
+            ),
         ),
         (
             pt.random.gamma,
@@ -193,7 +195,7 @@ def test_original_values_output_dict():
             pt.random.dirichlet,
             (np.array([[0.7, 0.3], [0.9, 0.1]]),),
             lambda alpha: DirichletScipyDist(alpha),
-            (),
+            None,
         ),
         pytest.param(
             pt.random.dirichlet,
@@ -281,7 +283,7 @@ def test_default_value_transform_logprob(pt_dist, dist_params, sp_dist, size):
 
             exp_log_jac_val = jacobian_estimate(a_trans_value)
         else:
-            jacobian_val = np.atleast_2d(sp.misc.derivative(a_backward_fn, a_trans_value, dx=1e-6))
+            jacobian_val = np.atleast_2d(Derivative(a_backward_fn, step=1e-6)(a_trans_value))
             exp_log_jac_val = np.linalg.slogdet(jacobian_val)[-1]
 
         log_jac_val = log_jac_fn(a_trans_value)
@@ -472,14 +474,20 @@ def test_transformed_rv_and_value():
 
 @pytest.mark.filterwarnings("error")
 def test_mixture_transform():
-    """Make sure that non-`RandomVariable` `MeasurableVariable`s can be transformed.
+    """Make sure that non-`RandomVariable` `MeasurableOp` variables can be transformed.
 
     This test is specific to `MixtureRV`, which is derived from an `OpFromGraph`.
     """
 
-    I_rv = pt.random.bernoulli(0.5, name="I")
-    Y_1_rv = pt.random.beta(100, 1, name="Y_1")
-    Y_2_rv = pt.random.beta(1, 100, name="Y_2")
+    _, I_rv = pt.random.bernoulli(
+        0.5, name="I", rng=pt.random.shared_rng(seed=None), return_next_rng=True
+    )
+    _, Y_1_rv = pt.random.beta(
+        100, 1, name="Y_1", rng=pt.random.shared_rng(seed=None), return_next_rng=True
+    )
+    _, Y_2_rv = pt.random.beta(
+        1, 100, name="Y_2", rng=pt.random.shared_rng(seed=None), return_next_rng=True
+    )
 
     # A `MixtureRV`, which is an `OpFromGraph` subclass, will replace this
     # `pt.stack` in the graph
@@ -519,18 +527,20 @@ def test_mixture_transform():
 def test_scan_transform():
     """Test that Scan valued variables can be transformed"""
 
-    init = pt.random.beta(1, 1, name="init")
+    rng, init = pt.random.beta(1, 1, name="init").owner.outputs
     init_vv = init.clone()
 
-    def scan_step(prev_innov):
-        next_innov = pt.random.beta(prev_innov * 10, (1 - prev_innov) * 10)
-        update = {next_innov.owner.inputs[0]: next_innov.owner.outputs[0]}
-        return next_innov, update
+    def scan_step(prev_innov, prev_rng):
+        next_rng, next_innov = pt.random.beta(
+            prev_innov * 10, (1 - prev_innov) * 10, rng=prev_rng
+        ).owner.outputs
+        return next_innov, next_rng
 
-    innov, _ = scan(
+    innov, _next_rng = scan(
         fn=scan_step,
-        outputs_info=[init],
+        outputs_info=[init, rng],
         n_steps=4,
+        return_updates=False,
     )
     innov.name = "innov"
     innov_vv = innov.clone()
@@ -574,6 +584,20 @@ def test_scan_transform():
     np.testing.assert_allclose(logp_fn(**test_point), ref_logp_fn(**test_point))
 
 
+def test_halfstudent_t_with_frozen_dims():
+    """Regression test: log_jac_det had mismatched broadcastable dims vs logp when
+    dims were frozen to a single-element coordinate, causing a ValueError.
+    """
+    from pymc.model.transform.optimization import freeze_dims_and_data
+
+    with pm.Model(coords={"x_dim": ["only_one"]}) as model:
+        pm.HalfStudentT("x", nu=7, sigma=1, dims="x_dim")
+
+    fmodel = freeze_dims_and_data(model)
+    [x_logp] = fmodel.logp(sum=False)
+    assert x_logp.type.shape == (1,)
+
+
 def test_weakref_leak():
     """Check that the rewrite does not have a growing memory footprint.
 
@@ -608,11 +632,10 @@ def test_weakref_leak():
         return [(name, stats[name], delta) for name, delta in deltas]
 
     rvs_to_values = {pt.random.beta(1, 1, name=f"p_{i}"): pt.scalar(f"p_{i}") for i in range(30)}
-    tr = TransformValuesRewrite({v: logodds for v in rvs_to_values.values()})
+    tr = TransformValuesRewrite(dict.fromkeys(rvs_to_values.values(), logodds))
 
-    for i in range(20):
+    for i in range(6):
         conditional_logp(rvs_to_values, extra_rewrites=tr)
         res = _growth()
-        # Only start checking after warmup
-        if i > 15:
+        if i > 2:
             assert not res, "Object counts are still growing"

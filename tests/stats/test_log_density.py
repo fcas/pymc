@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,11 +11,14 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import scipy.stats as st
 
-from arviz import InferenceData, dict_to_dataset, from_dict
+from arviz_base import from_dict
+from pytensor.compile import get_mode
 
 from pymc.distributions import Dirichlet, Normal
 from pymc.distributions.transforms import log
@@ -33,7 +36,7 @@ class TestComputeLogLikelihood:
             x_value_var = m.rvs_to_values[x]
             y = Normal("y", x, observed=[0, 1, 2], dims=("test_dim",))
 
-            idata = InferenceData(posterior=dict_to_dataset({"x": np.arange(100).reshape(4, 25)}))
+            idata = from_dict({"posterior": {"x": np.arange(100).reshape(4, 25)}})
             res = compute_log_likelihood(idata)
 
         # Check we didn't erase the original mappings
@@ -59,7 +62,7 @@ class TestComputeLogLikelihood:
                 "y", a=p.exp(), observed=y_draws, dims=("test_event_dim", "test_support_dim")
             )
 
-            idata = InferenceData(posterior=dict_to_dataset({"p": p_draws}))
+            idata = from_dict({"posterior": {"p": p_draws}})
             res = compute_log_likelihood(idata)
 
         assert res.log_likelihood.sizes == {"chain": 4, "draw": 25, "test_event_dim": 10}
@@ -75,7 +78,7 @@ class TestComputeLogLikelihood:
             y1 = Normal("y1", x, observed=[0, 1, 2])
             y2 = Normal("y2", x, observed=[3, 4])
 
-        idata = InferenceData(posterior=dict_to_dataset({"x": np.arange(100).reshape(4, 25)}))
+        idata = from_dict({"posterior": {"x": np.arange(100).reshape(4, 25)}})
 
         res_y1 = compute_log_likelihood(
             idata, var_names=["y1"], extend_inferencedata=False, model=m, progressbar=False
@@ -114,7 +117,7 @@ class TestComputeLogLikelihood:
             x = Normal("x")
             y = Normal("y", x, observed=[0, 1, 2])
 
-            idata = InferenceData(posterior=dict_to_dataset({"x": np.arange(100).reshape(4, 25)}))
+            idata = from_dict({"posterior": {"x": np.arange(100).reshape(4, 25)}})
             with pytest.raises(ValueError, match="var_names must refer to observed_RVs"):
                 compute_log_likelihood(idata, var_names=["x"])
 
@@ -124,7 +127,7 @@ class TestComputeLogLikelihood:
             x = Normal("x")
             y = Normal("y", x, observed=[0, 0, 0], shape=(3,), dims="obs")
 
-            trace = from_dict({"x": [[0, 1]]})
+            trace = from_dict({"posterior": {"x": np.array([[0, 1]])}})
             llike = compute_log_likelihood(trace)
 
         assert len(llike.log_likelihood["obs"]) == 3
@@ -141,7 +144,7 @@ class TestComputeLogLikelihood:
             x_value_var = m.rvs_to_values[x]
             Normal("y", x, observed=[0, 1, 2])
 
-            idata = InferenceData(posterior=dict_to_dataset({"x": np.arange(100).reshape(4, 25)}))
+            idata = from_dict({"posterior": {"x": np.arange(100).reshape(4, 25)}})
             res = compute_log_prior(idata)
 
         # Check we didn't erase the original mappings
@@ -162,7 +165,7 @@ class TestComputeLogLikelihood:
             Deterministic("d", 2 * x)
             Normal("y", x, observed=[0, 1, 2])
 
-            idata = InferenceData(posterior=dict_to_dataset({"x": np.arange(100).reshape(4, 25)}))
+            idata = from_dict({"posterior": {"x": np.arange(100).reshape(4, 25)}})
             res = compute_log_prior(idata)
 
         assert res is idata
@@ -174,3 +177,32 @@ class TestComputeLogLikelihood:
             res.log_prior["x"].values,
             st.norm(0, 1).logpdf(idata.posterior["x"].values),
         )
+
+    @pytest.mark.parametrize("via", ["compile_kwargs", "backend"])
+    def test_compilation_kwargs(self, via):
+        with Model() as m:
+            x = Normal("x")
+            Deterministic("d", 2 * x)
+            Normal("y", x, observed=[0, 1, 2])
+
+            idata = from_dict({"posterior": {"x": np.arange(100).reshape(4, 25)}})
+            prior_kwargs = (
+                {"compile_kwargs": {"mode": "JAX"}}
+                if via == "compile_kwargs"
+                else {"backend": "JAX"}
+            )
+            lik_kwargs = (
+                {"compile_kwargs": {"mode": "NUMBA"}}
+                if via == "compile_kwargs"
+                else {"backend": "NUMBA"}
+            )
+            with (
+                # apply_function_over_dataset fails with patched `compile_pymc`
+                patch("pymc.stats.log_density.apply_function_over_dataset"),
+                patch("pymc.model.core.compile") as patched_compile,
+            ):
+                compute_log_prior(idata, extend_inferencedata=False, **prior_kwargs)
+                compute_log_likelihood(idata, extend_inferencedata=False, **lik_kwargs)
+        assert len(patched_compile.call_args_list) == 2
+        assert get_mode(patched_compile.call_args_list[0].kwargs["mode"]) == get_mode("JAX")
+        assert get_mode(patched_compile.call_args_list[1].kwargs["mode"]) == get_mode("NUMBA")

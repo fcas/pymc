@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,10 +13,13 @@
 #   limitations under the License.
 from collections.abc import Sequence
 
-from pytensor import Variable
 from pytensor.graph import ancestors
+from pytensor.graph.basic import Variable
+from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.replace import clone_replace
 
-from pymc import Model
+from pymc.data import MinibatchOp
+from pymc.model.core import Model
 from pymc.model.fgraph import (
     ModelObservedRV,
     ModelVar,
@@ -29,7 +32,6 @@ ModelVariable = Variable | str
 
 def prune_vars_detached_from_observed(model: Model) -> Model:
     """Prune model variables that are not related to any observed variable in the Model."""
-
     # Potentials are ambiguous as whether they correspond to likelihood or prior terms,
     # We simply raise for now
     if model.potentials:
@@ -59,3 +61,23 @@ def parse_vars(model: Model, vars: ModelVariable | Sequence[ModelVariable]) -> l
     else:
         vars_seq = (vars,)
     return [model[var] if isinstance(var, str) else var for var in vars_seq]
+
+
+def remove_minibatched_nodes(model: Model) -> Model:
+    """Remove all uses of pm.Minibatch in the Model."""
+    fgraph, _ = fgraph_from_model(model)
+
+    replacements = {}
+    for var in fgraph.apply_nodes:
+        if isinstance(var.op, MinibatchOp):
+            for inp, out in zip(var.inputs, var.outputs):
+                replacements[out] = inp
+
+    old_outs, old_coords, old_dim_lengths = fgraph.outputs, fgraph._coords, fgraph._dim_lengths  # type: ignore[attr-defined]
+    # Using `rebuild_strict=False` means coords and dim information is lost (variable
+    # names are carried by the ModelVar Ops), so we restore it from the old fgraph
+    new_outs = clone_replace(old_outs, replacements, rebuild_strict=False)  # type: ignore[arg-type]
+    fgraph = FunctionGraph(outputs=new_outs, clone=False)
+    fgraph._coords = old_coords  # type: ignore[attr-defined]
+    fgraph._dim_lengths = old_dim_lengths  # type: ignore[attr-defined]
+    return model_from_fgraph(fgraph, mutate_fgraph=True)

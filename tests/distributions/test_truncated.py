@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@ import pytest
 import scipy
 
 from pytensor.scalar import Identity
+from pytensor.scan.op import Scan
 from pytensor.tensor.random.basic import GeometricRV, NormalRV
 from pytensor.tensor.random.type import RandomType
 
-from pymc import Model, draw, find_MAP
+from pymc import ExGaussian, Model, Normal, draw, find_MAP
 from pymc.distributions import (
     Censored,
     ChiSquared,
@@ -41,6 +42,7 @@ from pymc.logprob.abstract import _icdf
 from pymc.logprob.basic import logcdf, logp
 from pymc.logprob.transforms import IntervalTransform
 from pymc.logprob.utils import ParameterValueError
+from pymc.pytensorf import compile as pymc_compile
 from pymc.testing import assert_support_point_is_expected
 
 
@@ -125,8 +127,8 @@ def test_truncation_specialized_op(shape_info):
     # Test RNG is not reused
     assert xt.owner.inputs[0] is not rng
 
-    lower_upper = pt.stack(xt.owner.inputs[5:])
-    assert np.all(lower_upper.eval() == [5, 15])
+    lower_upper = pt.stack(xt.owner.inputs[4:])
+    assert np.all(lower_upper.eval().squeeze() == [5, 15])
 
 
 @pytest.mark.parametrize("lower, upper", [(-1, np.inf), (-1, 1.5), (-np.inf, 1.5)])
@@ -342,7 +344,7 @@ def test_truncation_exceptions():
     # Truncation does not work with SymbolicRV inputs
     with pytest.raises(
         NotImplementedError,
-        match="Truncation not implemented for SymbolicRandomVariable CensoredRV",
+        match="Truncation not implemented for CensoredRV",
     ):
         Truncated.dist(Censored.dist(pt.random.normal(), lower=-1, upper=1), -1, 1)
 
@@ -386,7 +388,7 @@ def test_truncated_default_transform():
 def test_truncated_transform_logp():
     with Model() as m:
         base_dist = rejection_normal(0, 1)
-        x = Truncated("x", base_dist, lower=0, upper=None, transform=None)
+        x = Truncated("x", base_dist, lower=0, upper=None, default_transform=None)
         y = Truncated("y", base_dist, lower=0, upper=None)
         logp_eval = m.compile_logp(sum=False)({"x": -1, "y_interval__": -1})
     assert logp_eval[0] == -np.inf
@@ -537,6 +539,26 @@ def test_truncated_multiple_rngs():
     next_rngs = [out for out in x_trunc.owner.outputs if isinstance(out.type, RandomType)]
     assert len(set(rngs)) == len(set(next_rngs)) == 3
 
+    # Verify that all RNG inputs inside the compiled scan are destroyed
+    # (i.e., mutated in-place by a consumer). A regression could turn an
+    # RNG update into a ViewOp or DeepCopy, leaving the original untouched
+    # and causing stuck draws across scan iterations.
+    fn = pymc_compile([], x_trunc)
+    [scan_node] = [n for n in fn.maker.fgraph.apply_nodes if isinstance(n.op, Scan)]
+    scan_fgraph = scan_node.op.fgraph
+    rng_inner_inps = [i for i in scan_node.op.inner_inputs if isinstance(i.type, RandomType)]
+    assert len(rng_inner_inps) == 3
+    destroyed_vars = {
+        node.inputs[idx]
+        for node in scan_fgraph.apply_nodes
+        for idxs in node.op.destroy_map.values()
+        for idx in idxs
+    }
+    for rng_inp in rng_inner_inps:
+        assert rng_inp in destroyed_vars, (
+            f"RNG input {rng_inp} is not destroyed — state won't advance between scan iterations"
+        )
+
     draws1 = draw(x_trunc, random_seed=1)
     draws2 = draw(x_trunc, random_seed=1)
     draws3 = draw(x_trunc, random_seed=2)
@@ -585,3 +607,34 @@ def test_truncated_identity_input(dist_op):
 
     rv_out = Truncated.dist(dist=dist_op(mu_identity, 5), lower=0, upper=1)
     assert np.ptp(draw(rv_out, draws=500)) < 1
+
+
+@pytest.mark.parametrize("rv_op", [icdf_normal, rejection_normal])
+def test_truncated_custom_dist_indexed_argument(rv_op):
+    # Regression test for https://github.com/pymc-devs/pymc/issues/7312
+
+    def dist(scale, size):
+        return pt.exp(rv_op(scale=scale, size=size))
+
+    scale = Exponential.dist(scale=[1, 2, 3])
+    latent = CustomDist.dist(scale[[0, 0, 1, 1, 2, 2]], dist=dist)
+    rv_out = Truncated.dist(latent, upper=7)
+
+    assert np.ptp(draw(rv_out, draws=100)) < 7
+
+
+@pytest.mark.parametrize(
+    "dist_fn",
+    [
+        lambda: ExGaussian.dist(nu=3),
+        pytest.param(
+            lambda: Censored.dist(Normal.dist(), lower=1),
+            marks=pytest.mark.xfail(raises=NotImplementedError),
+        ),
+    ],
+)
+def test_truncated_symbolic_rv(dist_fn):
+    dist = dist_fn()
+    trunc_dist = Truncated.dist(dist, lower=1, upper=3)
+    assert 1 <= draw(trunc_dist) <= 3
+    assert (logp(trunc_dist, 2.5) > logp(dist, 2.5)).eval()

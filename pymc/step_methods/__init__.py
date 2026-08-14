@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,6 +11,8 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+
+"""Step methods."""
 
 from pymc.step_methods.compound import BlockedStep, CompoundStep
 from pymc.step_methods.hmc import NUTS, HamiltonianMC
@@ -40,3 +42,19 @@ STEP_METHODS: list[type[BlockedStep]] = [
     Slice,
     CategoricalGibbsMetropolis,
 ]
+
+# Names intentionally excluded from the root pymc namespace: BlockedStep (base
+# class), CompoundStep (internal combinator), STEP_METHODS (internal registry),
+# and the *Proposal classes (Metropolis implementation detail). They remain
+# accessible via pymc.step_methods.<name>.
+__all__ = (
+    "NUTS",
+    "BinaryGibbsMetropolis",
+    "BinaryMetropolis",
+    "CategoricalGibbsMetropolis",
+    "DEMetropolis",
+    "DEMetropolisZ",
+    "HamiltonianMC",
+    "Metropolis",
+    "Slice",
+)

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,9 +16,12 @@ import numpy as np
 import pytest
 
 from pytensor import config
+from pytensor.compile import SharedVariable
+from pytensor.graph import Constant
 
 import pymc as pm
 
+from pymc import sample_posterior_predictive, set_data
 from pymc.distributions.transforms import logodds
 from pymc.model.transform.conditioning import (
     change_value_transforms,
@@ -26,6 +29,7 @@ from pymc.model.transform.conditioning import (
     observe,
     remove_value_transforms,
 )
+from pymc.model.transform.optimization import freeze_dims_and_data
 from pymc.variational.minibatch_rv import create_minibatch_rv
 
 
@@ -104,6 +108,25 @@ def test_observe_deterministic():
         pm.Censored("y_censored", pm.Normal.dist(x), lower=-1, upper=1, observed=y_censored_obs)
 
 
+def test_observe_sum_normal():
+    with pm.Model() as m_old:
+        x = pm.Normal("x")
+        y = pm.Normal.dist(mu=x, sigma=1.0, shape=(5,))
+        y_sum = pm.Deterministic("y_sum", pm.math.sum(y))
+
+    m_new = observe(m_old, {y_sum: 2.0})
+
+    with pm.Model() as m_ref:
+        x = pm.Normal("x")
+        pm.Normal("y_sum", mu=5.0 * x, sigma=np.sqrt(5.0), observed=2.0)
+
+    test_point = {"x": 0.3}
+    np.testing.assert_allclose(
+        m_new.compile_logp()(test_point),
+        m_ref.compile_logp()(test_point),
+    )
+
+
 def test_observe_dims():
     with pm.Model(coords={"test_dim": range(5)}) as m_old:
         x = pm.Normal("x", dims="test_dim")
@@ -155,16 +178,18 @@ def test_do_posterior_predictive():
     # Dummy posterior
     idata_m = az.from_dict(
         {
-            "x": np.full((2, 500), 25),
-            "y": np.full((2, 500), np.nan),
-            "z": np.full((2, 500), np.nan),
+            "posterior": {
+                "x": np.full((2, 500), 25),
+                "y": np.full((2, 500), np.nan),
+                "z": np.full((2, 500), np.nan),
+            }
         }
     )
 
     # Replace `y` by a constant `100.0`
     m_do = do(m, {y: 100.0})
     with m_do:
-        idata_do = pm.sample_posterior_predictive(idata_m, var_names="z")
+        idata_do = pm.sample_posterior_predictive(idata_m, sample_vars=["z"])
 
     assert 120 < idata_do.posterior_predictive["z"].mean() < 130
 
@@ -173,10 +198,13 @@ def test_do_posterior_predictive():
 def test_do_constant(mutable):
     rng = np.random.default_rng(seed=122)
     with pm.Model() as m:
-        x = pm.Data("x", 0, mutable=mutable)
+        x = pm.Data("x", 0)
         y = pm.Normal("y", x, 1e-3)
 
-    do_m = do(m, {x: 105})
+    if not mutable:
+        m = freeze_dims_and_data(m, data=["x"])
+
+    do_m = do(m, {m["x"]: 105})
     assert pm.draw(do_m["y"], random_seed=rng) > 100
 
 
@@ -253,9 +281,51 @@ def test_do_self_reference():
     np.testing.assert_allclose(draw_x + 100, draw_do_x)
 
 
+def test_do_make_intervenstions_shared():
+    with pm.Model(coords={"obs": [1]}) as m:
+        x = pm.Normal("x", dims="obs")
+        y = pm.Normal("y", dims="obs")
+
+    constant_m = do(m, {x: [0.5]}, make_interventions_shared=False)
+    constant_x = constant_m["x"]
+    assert isinstance(constant_x, Constant)
+    np.testing.assert_array_equal(constant_x.data, [0.5])
+
+    shared_m = do(m, {x: [0.5]}, make_interventions_shared=True)
+    shared_x = shared_m["x"]
+    assert isinstance(shared_x, SharedVariable)
+    np.testing.assert_array_equal(shared_x.get_value(borrow=True), [0.5])
+
+    with shared_m:
+        set_data({"x": [0.6, 0.9]}, coords={"obs": [2, 3]})
+        pp_y = pm.sample_prior_predictive(draws=3).prior["y"]
+    assert pp_y.sizes == {"chain": 1, "draw": 3, "obs": 2}
+    assert pp_y.shape == (1, 3, 2)
+
+
+@pytest.mark.parametrize(
+    "make_interventions_shared",
+    [True, pytest.param(False, marks=pytest.mark.xfail(reason="#6876"))],
+)
+def test_do_sample_posterior_predictive(make_interventions_shared):
+    # Regression test for https://github.com/pymc-devs/pymc/issues/6977
+    with pm.Model() as model:
+        a = pm.Normal("a")
+        b = pm.Deterministic("b", a * 2)
+        c = pm.Normal("c", b / 2)
+
+    idata = az.from_dict(
+        {"posterior": {"a": np.array([[1.0]]), "b": np.array([[2.0]]), "c": np.array([[1.0]])}}
+    )
+
+    with do(model, {a: 1000}, make_interventions_shared=make_interventions_shared):
+        pp = sample_posterior_predictive(idata, sample_vars=["c"], predictions=True).predictions
+    assert (pp["c"] > 500).all()
+
+
 def test_change_value_transforms():
     with pm.Model() as base_m:
-        p = pm.Uniform("p", 0, 1, transform=None)
+        p = pm.Uniform("p", 0, 1, default_transform=None)
         w = pm.Binomial("w", n=9, p=p, observed=6)
         assert base_m.rvs_to_transforms[p] is None
         assert base_m.rvs_to_values[p].name == "p"

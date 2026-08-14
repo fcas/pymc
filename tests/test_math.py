@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,16 +12,14 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-import warnings
 
 import numpy as np
-import numpy.testing as npt
-import pytensor
 import pytensor.tensor as pt
 import pytest
 
+from pytensor.graph.basic import equal_computations
+
 from pymc.math import (
-    LogDet,
     cartesian,
     expand_packed_triangular,
     invprobit,
@@ -29,14 +27,13 @@ from pymc.math import (
     kron_solve_lower,
     kronecker,
     log1mexp,
-    log1mexp_numpy,
     logdet,
     logdiffexp,
-    logdiffexp_numpy,
     probit,
 )
 from pymc.pytensorf import floatX
-from tests.helpers import verify_grad
+
+pytestmark = pytest.mark.filterwarnings("error")
 
 
 def test_kronecker():
@@ -45,7 +42,7 @@ def test_kronecker():
     [a, b, c] = [np.random.rand(3, 3 + i) for i in range(3)]
 
     custom = kronecker(a, b, c)  # Custom version
-    nested = pt.slinalg.kron(a, pt.slinalg.kron(b, c))
+    nested = pt.linalg.kron(a, pt.linalg.kron(b, c))
     np.testing.assert_array_almost_equal(custom.eval(), nested.eval())  # Standard nested version
 
 
@@ -115,7 +112,7 @@ def test_kron_solve_lower():
     x = np.random.rand(tot_size).reshape((tot_size, 1))
     # Construct entire kronecker product then solve
     big = kronecker(*Ls)
-    slow_ans = pt.slinalg.solve_triangular(big, x, lower=True)
+    slow_ans = pt.linalg.solve_triangular(big, x, lower=True)
     # Use tricks to avoid construction of entire kronecker product
     fast_ans = kron_solve_lower(Ls, x)
     np.testing.assert_array_almost_equal(slow_ans.eval(), fast_ans.eval())
@@ -126,122 +123,49 @@ def test_probit():
     np.testing.assert_allclose(invprobit(probit(p)).eval(), p, atol=1e-5)
 
 
-def test_log1mexp():
-    vals = np.array([-1, 0, 1e-20, 1e-4, 10, 100, 1e20])
-    vals_ = vals.copy()
-    # import mpmath
-    # mpmath.mp.dps = 1000
-    # [float(mpmath.log(1 - mpmath.exp(-x))) for x in vals]
-    expected = np.array(
-        [
-            np.nan,
-            -np.inf,
-            -46.051701859880914,
-            -9.210390371559516,
-            -4.540096037048921e-05,
-            -3.720075976020836e-44,
-            0.0,
-        ]
-    )
-    actual = pt.log1mexp(-vals).eval()
-    npt.assert_allclose(actual, expected)
-
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", "divide by zero encountered in log", RuntimeWarning)
-        warnings.filterwarnings("ignore", "invalid value encountered in log", RuntimeWarning)
-        with pytest.warns(FutureWarning, match="deprecated"):
-            actual_ = log1mexp_numpy(-vals, negative_input=True)
-    npt.assert_allclose(actual_, expected)
-    # Check that input was not changed in place
-    npt.assert_allclose(vals, vals_)
-
-
-@pytest.mark.filterwarnings("error")
-def test_log1mexp_numpy_no_warning():
-    """Assert RuntimeWarning is not raised for very small numbers"""
-    with pytest.warns(FutureWarning, match="deprecated"):
-        log1mexp_numpy(-1e-25, negative_input=True)
-
-
-def test_log1mexp_numpy_integer_input():
-    with pytest.warns(FutureWarning, match="deprecated"):
-        assert np.isclose(log1mexp_numpy(-2, negative_input=True), pt.log1mexp(-2).eval())
-
-
 @pytest.mark.filterwarnings("error")
 def test_log1mexp_deprecation_warnings():
-    with pytest.warns(FutureWarning, match="deprecated"):
-        with pytest.warns(
-            FutureWarning,
-            match="pymc.math.log1mexp_numpy will expect a negative input",
-        ):
-            res_pos = log1mexp_numpy(2)
+    with pytest.raises(
+        ValueError,
+        match="log1mexp with negative_input=False is no longer supported",
+    ):
+        log1mexp(2, negative_input=False).eval()
 
-        res_neg = log1mexp_numpy(-2, negative_input=True)
+    with pytest.warns(FutureWarning):
+        res_1 = log1mexp(-2, negative_input=True).eval()
 
-        with pytest.warns(
-            FutureWarning,
-            match="pymc.math.log1mexp will expect a negative input",
-        ):
-            res_pos_at = log1mexp(2).eval()
+    res_2 = log1mexp(-2).eval()
+    res_ref = pt.log1mexp(-2).eval()
 
-        res_neg_at = log1mexp(-2, negative_input=True).eval()
-
-    assert np.isclose(res_pos, res_neg)
-    assert np.isclose(res_pos_at, res_neg)
-    assert np.isclose(res_neg_at, res_neg)
+    assert np.isclose(res_ref, res_1)
+    assert np.isclose(res_ref, res_2)
 
 
 def test_logdiffexp():
-    a = np.log([1, 2, 3, 4])
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", "divide by zero encountered in log", RuntimeWarning)
-        b = np.log([0, 1, 2, 3])
-    with pytest.warns(FutureWarning, match="deprecated"):
-        assert np.allclose(logdiffexp_numpy(a, b), 0)
-    assert np.allclose(logdiffexp(a, b).eval(), 0)
+    a = pt.vector("a")
+    b = pt.vector("b")
+    a_test = np.log([1, 2, 3, 4])
+    with np.errstate(divide="ignore"):
+        b_test = np.log([0, 1, 2, 3])
+    np.testing.assert_allclose(logdiffexp(a, b).eval({a: a_test, b: b_test}), 0, atol=1e-15)
 
-
-class TestLogDet:
-    def setup_method(self):
-        np.random.seed(899853)
-        self.op_class = LogDet
-        self.op = logdet
-
-    @pytensor.config.change_flags(compute_test_value="ignore")
-    def validate(self, input_mat):
-        x = pytensor.tensor.matrix()
-        f = pytensor.function([x], self.op(x))
-        out = f(input_mat)
-        svd_diag = np.linalg.svd(input_mat, compute_uv=False)
-        numpy_out = np.sum(np.log(np.abs(svd_diag)))
-
-        # Compare the result computed to the expected value.
-        np.allclose(numpy_out, out)
-
-        # Test gradient:
-        verify_grad(self.op, [input_mat])
-
-    @pytest.mark.skipif(
-        pytensor.config.device in ["cuda", "gpu"],
-        reason="No logDet implementation on GPU.",
+    np.testing.assert_array_equal(
+        logdiffexp(a, b).eval({a: [-np.inf, -np.inf, -1], b: [-1, -np.inf, -np.inf]}),
+        [np.nan, -np.inf, -1],
     )
-    def test_basic(self):
-        # Calls validate with different params
-        test_case_1 = np.random.randn(3, 3) / np.sqrt(3)
-        test_case_2 = np.random.randn(10, 10) / np.sqrt(10)
-        self.validate(test_case_1.astype(pytensor.config.floatX))
-        self.validate(test_case_2.astype(pytensor.config.floatX))
+
+
+def test_logdet():
+    x = pt.matrix("x")
+    assert equal_computations([logdet(x)], [pt.linalg.slogdet(x)[1]])
 
 
 def test_expand_packed_triangular():
     with pytest.raises(ValueError):
         x = pt.matrix("x")
-        x.tag.test_value = np.array([[1.0]], dtype=pytensor.config.floatX)
         expand_packed_triangular(5, x)
     N = 5
     packed = pt.vector("packed")
-    packed.tag.test_value = floatX(np.zeros(N * (N + 1) // 2))
     with pytest.raises(TypeError):
         expand_packed_triangular(packed.shape[0], packed)
     np.random.seed(42)

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,30 +12,34 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 from collections.abc import Sequence
-from typing import Literal
+from typing import Any, Literal
 
-from arviz import InferenceData
-from xarray import Dataset
+from xarray import Dataset, DataTree
 
 from pymc.backends.arviz import (
     apply_function_over_dataset,
     coords_and_dims_for_inferencedata,
 )
-from pymc.model import Model, modelcontext
+from pymc.model import BaseModel, modelcontext
+from pymc.pytensorf import resolve_backend_compile_kwargs
 
 __all__ = ("compute_log_likelihood", "compute_log_prior")
 
+from pymc.model.transform.conditioning import remove_value_transforms
+
 
 def compute_log_likelihood(
-    idata: InferenceData,
+    idata: DataTree,
     *,
     var_names: Sequence[str] | None = None,
     extend_inferencedata: bool = True,
-    model: Model | None = None,
+    model: BaseModel | None = None,
     sample_dims: Sequence[str] = ("chain", "draw"),
     progressbar=True,
+    backend: str | None = None,
+    compile_kwargs: dict[str, Any] | None = None,
 ):
-    """Compute elemwise log_likelihood of model given InferenceData with posterior group
+    """Compute elemwise log_likelihood of model given InferenceData with posterior group.
 
     Parameters
     ----------
@@ -46,9 +50,14 @@ def compute_log_likelihood(
         Defaults to all observed variables.
     extend_inferencedata : bool, default True
         Whether to extend the original InferenceData or return a new one
-    model : Model, optional
+    model : BaseModel, optional
     sample_dims : sequence of str, default ("chain", "draw")
     progressbar : bool, default True
+    backend : str, optional
+        Which computational backend to use. Recommended to be one of "numba", "c", and "jax".
+    compile_kwargs : dict[str, Any] | None
+        Extra compilation arguments to supply to :py:func:`~pymc.stats.compute_log_density`.
+        ``compile_kwargs["mode"]`` cannot be combined with ``backend``.
 
     Returns
     -------
@@ -63,18 +72,23 @@ def compute_log_likelihood(
         kind="likelihood",
         sample_dims=sample_dims,
         progressbar=progressbar,
+        backend=backend,
+        compile_kwargs=compile_kwargs,
     )
 
 
 def compute_log_prior(
-    idata: InferenceData,
+    idata: DataTree,
+    *,
     var_names: Sequence[str] | None = None,
     extend_inferencedata: bool = True,
-    model: Model | None = None,
+    model: BaseModel | None = None,
     sample_dims: Sequence[str] = ("chain", "draw"),
     progressbar=True,
+    backend: str | None = None,
+    compile_kwargs=None,
 ):
-    """Compute elemwise log_prior of model given InferenceData with posterior group
+    """Compute elemwise log_prior of model given InferenceData with posterior group.
 
     Parameters
     ----------
@@ -85,9 +99,14 @@ def compute_log_prior(
         Defaults to all all free variables.
     extend_inferencedata : bool, default True
         Whether to extend the original InferenceData or return a new one
-    model : Model, optional
+    model : BaseModel, optional
     sample_dims : sequence of str, default ("chain", "draw")
     progressbar : bool, default True
+    backend : str, optional
+        Which computational backend to use. Recommended to be one of "numba", "c", and "jax".
+    compile_kwargs : dict[str, Any] | None
+        Extra compilation arguments to supply to :py:func:`~pymc.stats.compute_log_density`.
+        ``compile_kwargs["mode"]`` cannot be combined with ``backend``.
 
     Returns
     -------
@@ -102,70 +121,108 @@ def compute_log_prior(
         kind="prior",
         sample_dims=sample_dims,
         progressbar=progressbar,
+        backend=backend,
+        compile_kwargs=compile_kwargs,
     )
 
 
 def compute_log_density(
-    idata: InferenceData,
+    idata: DataTree,
     *,
     var_names: Sequence[str] | None = None,
     extend_inferencedata: bool = True,
-    model: Model | None = None,
+    model: BaseModel | None = None,
     kind: Literal["likelihood", "prior"] = "likelihood",
     sample_dims: Sequence[str] = ("chain", "draw"),
     progressbar=True,
-) -> InferenceData | Dataset:
+    backend: str | None = None,
+    compile_kwargs=None,
+) -> DataTree | Dataset:
     """
-    Compute elemwise log_likelihood or log_prior of model given InferenceData with posterior group
-    """
+    Compute elemwise log_likelihood or log_prior of model given InferenceData with posterior group.
 
+    Parameters
+    ----------
+    idata : InferenceData
+        InferenceData with posterior group
+    var_names : sequence of str, optional
+        List of Observed variable names for which to compute log_prior.
+        Defaults to all all free variables.
+    extend_inferencedata : bool, default True
+        Whether to extend the original InferenceData or return a new one
+    model : BaseModel, optional
+    kind: Literal["likelihood", "prior"]
+        Whether to compute the log density of the observed random variables (likelihood)
+        or to compute the log density of the latent random variables (prior). This
+        parameter determines the group that gets added to the returned `~arviz.InferenceData` object.
+    sample_dims : sequence of str, default ("chain", "draw")
+    progressbar : bool, default True
+    backend : str, optional
+        Which computational backend to use. Recommended to be one of "numba", "c", and "jax".
+    compile_kwargs : dict[str, Any] | None
+        Extra compilation arguments to supply to :py:func:`pymc.model.core.Model.compile_fn`.
+        ``compile_kwargs["mode"]`` cannot be combined with ``backend``.
+
+    Returns
+    -------
+    idata : InferenceData
+        InferenceData with the ``log_likelihood`` group when ``kind == "likelihood"``
+        or the ``log_prior`` group when ``kind == "prior"``.
+    """
     posterior = idata["posterior"]
 
     model = modelcontext(model)
+    compile_kwargs = resolve_backend_compile_kwargs(backend, compile_kwargs)
 
     if kind not in ("likelihood", "prior"):
         raise ValueError("kind must be either 'likelihood' or 'prior'")
 
+    # We need to disable transforms, because the InferenceData only keeps the untransformed values
+    umodel = remove_value_transforms(model)
+
     if kind == "likelihood":
-        target_rvs = model.observed_RVs
+        target_rvs = list(umodel.observed_RVs)
         target_str = "observed_RVs"
     else:
-        target_rvs = model.free_RVs
+        target_rvs = list(umodel.free_RVs)
         target_str = "free_RVs"
 
     if var_names is None:
         vars = target_rvs
         var_names = tuple(rv.name for rv in vars)
     else:
-        vars = [model.named_vars[name] for name in var_names]
+        vars = [umodel.named_vars[name] for name in var_names]
         if not set(vars).issubset(target_rvs):
             raise ValueError(f"var_names must refer to {target_str} in the model. Got: {var_names}")
 
-    # We need to temporarily disable transforms, because the InferenceData only keeps the untransformed values
-    try:
-        original_rvs_to_values = model.rvs_to_values
-        original_rvs_to_transforms = model.rvs_to_transforms
+    elemwise_logdens_fn = umodel.compile_fn(
+        inputs=umodel.value_vars,
+        outs=umodel.logp(vars=vars, sum=False),
+        on_unused_input="ignore",
+        **compile_kwargs,
+    )
 
-        model.rvs_to_values = {
-            rv: rv.clone() if rv not in model.observed_RVs else value
-            for rv, value in model.rvs_to_values.items()
-        }
-        model.rvs_to_transforms = {rv: None for rv in model.basic_RVs}
+    coords, dims = coords_and_dims_for_inferencedata(umodel)
 
-        elemwise_logdens_fn = model.compile_fn(
-            inputs=model.value_vars,
-            outs=model.logp(vars=vars, sum=False),
-            on_unused_input="ignore",
-        )
-    finally:
-        model.rvs_to_values = original_rvs_to_values
-        model.rvs_to_transforms = original_rvs_to_transforms
-
-    coords, dims = coords_and_dims_for_inferencedata(model)
+    is_datatree = hasattr(posterior, "to_dataset")
+    input_dataset: Dataset = posterior.to_dataset() if is_datatree else posterior  # type: ignore[assignment]
+    free_rv_names = [rv.name for rv in model.free_RVs]
+    input_dataset = input_dataset[free_rv_names]  # type: ignore[assignment]
+    # Cast each variable to the dtype expected by the corresponding value var
+    # so that ``trust_input=True`` calls inside ``apply_function_over_dataset``
+    # do not trip the strict type checks of PyTensor v3. ``copy=False`` skips
+    # the copy when the dtype already matches.
+    input_dataset = input_dataset.astype(
+        {
+            umodel.rvs_to_values[rv].name: umodel.rvs_to_values[rv].type.dtype
+            for rv in umodel.free_RVs
+        },
+        copy=False,
+    )
 
     logdens_dataset = apply_function_over_dataset(
         elemwise_logdens_fn,
-        posterior[[rv.name for rv in model.free_RVs]],
+        input_dataset,
         output_var_names=var_names,
         sample_dims=sample_dims,
         dims=dims,
@@ -174,7 +231,7 @@ def compute_log_density(
     )
 
     if extend_inferencedata:
-        idata.add_groups({f"log_{kind}": logdens_dataset})
+        idata[f"log_{kind}"] = logdens_dataset
         return idata
     else:
         return logdens_dataset

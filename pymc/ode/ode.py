@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -20,10 +20,10 @@ import pytensor.tensor as pt
 import scipy
 
 from pytensor.graph.basic import Apply
-from pytensor.graph.op import Op, get_test_value
+from pytensor.graph.op import Op
 from pytensor.tensor.type import TensorType
 
-from pymc.exceptions import DtypeError, ShapeError
+from pymc.exceptions import ShapeError
 from pymc.ode import utils
 
 _log = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ floatX = pytensor.config.floatX
 
 class DifferentialEquation(Op):
     r"""
-    Specify an ordinary differential equation
+    Specify an ordinary differential equation.
 
     Due to the nature of the model (as well as included solvers), the process of ODE solution may perform slowly.  A faster alternative library based on PyMC--sunode--has implemented Adams' method and BDF (backward differentation formula).  More information about sunode is available at: https://github.com/aseyboldt/sunode.
 
@@ -59,8 +59,9 @@ class DifferentialEquation(Op):
     .. code-block:: python
 
         def odefunc(y, t, p):
-            #Logistic differential equation
+            # Logistic differential equation
             return p[0] * y[0] * (1 - y[0])
+
 
         times = np.arange(0.5, 5, 0.5)
 
@@ -107,7 +108,9 @@ class DifferentialEquation(Op):
         self._output_sensitivities = {}
 
     def _system(self, Y, t, p):
-        r"""The function that will be passed to odeint. Solves both ODE and sensitivities.
+        r"""Solve both ODE and sensitivities.
+
+        This function will be passed to odeint.
 
         Parameters
         ----------
@@ -169,46 +172,6 @@ class DifferentialEquation(Op):
         # use default implementation to prepare symbolic outputs (via make_node)
         states, sens = super().__call__(y0, theta, **kwargs)
 
-        if pytensor.config.compute_test_value != "off":
-            # compute test values from input test values
-            test_states, test_sens = self._simulate(
-                y0=get_test_value(y0), theta=get_test_value(theta)
-            )
-
-            # check types of simulation result
-            if not test_states.dtype == self._otypes[0].dtype:
-                raise DtypeError(
-                    "Simulated states have the wrong type.",
-                    actual=test_states.dtype,
-                    expected=self._otypes[0].dtype,
-                )
-            if not test_sens.dtype == self._otypes[1].dtype:
-                raise DtypeError(
-                    "Simulated sensitivities have the wrong type.",
-                    actual=test_sens.dtype,
-                    expected=self._otypes[1].dtype,
-                )
-
-            # check shapes of simulation result
-            expected_states_shape = (self.n_times, self.n_states)
-            expected_sens_shape = (self.n_times, self.n_states, self.n_p)
-            if not test_states.shape == expected_states_shape:
-                raise ShapeError(
-                    "Simulated states have the wrong shape.",
-                    test_states.shape,
-                    expected_states_shape,
-                )
-            if not test_sens.shape == expected_sens_shape:
-                raise ShapeError(
-                    "Simulated sensitivities have the wrong shape.",
-                    test_sens.shape,
-                    expected_sens_shape,
-                )
-
-            # attach results as test values to the outputs
-            states.tag.test_value = test_states
-            sens.tag.test_value = test_sens
-
         if return_sens:
             return states, sens
         return states
@@ -218,7 +181,7 @@ class DifferentialEquation(Op):
         # simulate states and sensitivities in one forward pass
         output_storage[0][0], output_storage[1][0] = self._simulate(y0, theta)
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         s_y0, s_theta = input_shapes
         output_shapes = [(self.n_times, self.n_states), (self.n_times, self.n_states, self.n_p)]
         return output_shapes

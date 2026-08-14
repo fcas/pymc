@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -20,8 +20,10 @@ from pytensor.graph import Constant
 from pymc import Deterministic, do
 from pymc.data import Data
 from pymc.distributions import HalfNormal, Normal
+from pymc.exceptions import NotConstantValueError
 from pymc.model import Model
 from pymc.model.transform.optimization import freeze_dims_and_data
+from pymc.pytensorf import constant_fold
 
 
 def test_freeze_dims_and_data():
@@ -70,6 +72,26 @@ def test_freeze_dims_nothing_to_change():
         y = Normal("y", shape=x.shape[0] + 1)
 
     assert m.point_logps() == freeze_dims_and_data(m).point_logps()
+
+
+def test_freeze_dims_and_data_preserves_initvals():
+    # fgraph_from_model drops (and rejects) initial values; freeze_dims_and_data preserves
+    # constant and strategy-string ones on the rebuilt model without touching the original.
+    with Model() as m:
+        Normal("u", initval=7.0)  # concrete
+        Normal("p", shape=3, initval="prior")  # strategy string
+
+    frozen_m = freeze_dims_and_data(m)
+    assert m.rvs_to_initial_values[m["u"]] == 7.0  # original untouched
+    np.testing.assert_allclose(frozen_m.initial_point(0)["u"], m.initial_point(0)["u"])
+    np.testing.assert_allclose(frozen_m.initial_point(1)["p"], m.initial_point(1)["p"])
+
+    # Symbolic initial values reference the original graph and cannot be transplanted.
+    with Model() as m2:
+        d = Data("d", [1.0, 2.0])
+        Normal("s", shape=2, initval=d * 2)
+    with pytest.raises(NotImplementedError, match="symbolic initial value"):
+        freeze_dims_and_data(m2)
 
 
 def test_freeze_dims_and_data_subset():
@@ -144,3 +166,16 @@ def test_freeze_dim_after_do_intervention():
 
     frozen_do_m = freeze_dims_and_data(do_m)
     assert frozen_do_m["x"].type.shape == (5,)
+
+
+def test_freeze_dims_and_data_partially_observed_rv():
+    # Regression test for #7387
+
+    with Model(coords={"a": [0, 1, 2]}) as model:
+        y = Normal("y", 0, observed=[0, 0, np.nan], dims="a")
+
+    with pytest.raises(NotConstantValueError):
+        constant_fold([y.shape])
+
+    frozen_y = freeze_dims_and_data(model)["y"]
+    assert constant_fold([frozen_y.shape]) == (3,)

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import pytest
 
 import pymc as pm
 
+from pymc.testing import assert_no_rvs
 from pymc.variational import opvi
 from pymc.variational.approximations import (
     Empirical,
@@ -83,19 +84,19 @@ def test_group_api_vfam(three_var_model, raises, vfam, type_, kw):
     [
         (
             not_raises(),
-            dict(mu=np.ones((10, 2), "float32"), rho=np.ones((10, 2), "float32")),
+            {"mu": np.ones((10, 2), "float32"), "rho": np.ones((10, 2), "float32")},
             MeanFieldGroup,
             {},
             None,
         ),
         (
             not_raises(),
-            dict(
-                mu=np.ones((10, 2), "float32"),
-                L_tril=np.ones(
+            {
+                "mu": np.ones((10, 2), "float32"),
+                "L_tril": np.ones(
                     FullRankGroup.get_param_spec_for(d=np.prod((10, 2)))["L_tril"], "float32"
                 ),
-            ),
+            },
             FullRankGroup,
             {},
             None,
@@ -207,24 +208,27 @@ def three_var_approx_single_group_mf(three_var_model):
     return MeanField(model=three_var_model)
 
 
-def test_pickle_approx(three_var_approx):
+def test_pickle_approx(three_var_model, three_var_approx):
     import cloudpickle
 
     dump = cloudpickle.dumps(three_var_approx)
     new = cloudpickle.loads(dump)
-    assert new.sample(1)
+    with three_var_model:
+        assert new.sample(1)
 
 
-def test_pickle_single_group(three_var_approx_single_group_mf):
+def test_pickle_single_group(three_var_model, three_var_approx_single_group_mf):
     import cloudpickle
 
     dump = cloudpickle.dumps(three_var_approx_single_group_mf)
     new = cloudpickle.loads(dump)
-    assert new.sample(1)
+    with three_var_model:
+        assert new.sample(1)
 
 
-def test_sample_simple(three_var_approx):
-    trace = three_var_approx.sample(100, return_inferencedata=False)
+def test_sample_simple(three_var_model, three_var_approx):
+    with three_var_model:
+        trace = three_var_approx.sample(100, return_inferencedata=False)
     assert set(trace.varnames) == {"one", "one_log__", "three", "two"}
     assert len(trace) == 100
     assert trace[0]["one"].shape == (10, 2)
@@ -261,7 +265,7 @@ def test_logq_mini_2_sample_2_var(parametric_grouped_approxes, three_var_model):
 
 def test_logq_globals(three_var_approx):
     if not three_var_approx.has_logq:
-        pytest.skip("%s does not implement logq" % three_var_approx)
+        pytest.skip(f"{three_var_approx} does not implement logq")
     approx = three_var_approx
     logq, symbolic_logq = approx.set_size_and_deterministic(
         [approx.logq, approx.symbolic_logq], 1, 0
@@ -278,3 +282,18 @@ def test_logq_globals(three_var_approx):
     es = symbolic_logq.eval()
     assert e.shape == ()
     assert es.shape == (2,)
+
+
+def test_symbolic_normalizing_constant_no_rvs():
+    # Test that RVs aren't included in the graph of symbolic_normalizing_constant
+    rng = np.random.default_rng()
+
+    with pm.Model() as m:
+        obs = pm.Data("obs", rng.normal(size=(1000,)))
+        obs_batch = pm.Minibatch(obs, batch_size=128)
+        x = pm.Normal("x")  # Need at least one Free_RV in the graph
+        y_hat = pm.Flat("y_hat", observed=obs_batch, total_size=1000)
+
+        step = pm.ADVI()
+
+    assert_no_rvs(step.approx.symbolic_normalizing_constant)

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -45,15 +45,20 @@ from pytensor.graph.basic import equal_computations
 
 from pymc.distributions.continuous import Cauchy, ChiSquared
 from pymc.distributions.discrete import Bernoulli
-from pymc.logprob.basic import conditional_logp, icdf, logcdf, logp
+from pymc.logprob.basic import conditional_logp, icdf, logccdf, logcdf, logp
 from pymc.logprob.transforms import (
     ArccoshTransform,
+    ArccosTransform,
     ArcsinhTransform,
+    ArcsinTransform,
     ArctanhTransform,
+    ArctanTransform,
     ChainedTransform,
     CoshTransform,
+    ErfcinvTransform,
     ErfcTransform,
     ErfcxTransform,
+    ErfinvTransform,
     ErfTransform,
     ExpTransform,
     LocTransform,
@@ -182,9 +187,14 @@ class TestTransform:
             ErfTransform(),
             ErfcTransform(),
             ErfcxTransform(),
+            ErfinvTransform(),
+            ErfcinvTransform(),
             SinhTransform(),
             CoshTransform(),
             TanhTransform(),
+            ArcsinTransform(),
+            ArccosTransform(),
+            ArctanTransform(),
             ArcsinhTransform(),
             ArccoshTransform(),
             ArctanhTransform(),
@@ -219,6 +229,7 @@ def test_exp_transform_rv():
         logp_fn(y_val),
         sp.stats.lognorm(s=1).logpdf(y_val),
     )
+
     np.testing.assert_almost_equal(
         logcdf_fn(y_val),
         sp.stats.lognorm(s=1).logcdf(y_val),
@@ -249,7 +260,7 @@ class TestLocScaleRVTransform:
     @pytest.mark.parametrize(
         "rv_size, loc_type, addition",
         [
-            (None, pt.scalar, True),
+            ((), pt.scalar, True),
             (2, pt.vector, False),
             ((2, 1), pt.col, True),
         ],
@@ -288,7 +299,7 @@ class TestLocScaleRVTransform:
     @pytest.mark.parametrize(
         "rv_size, scale_type, product",
         [
-            (None, pt.scalar, True),
+            ((), pt.scalar, True),
             (1, pt.TensorType("floatX", (True,)), True),
             ((2, 3), pt.matrix, False),
         ],
@@ -323,6 +334,29 @@ class TestLocScaleRVTransform:
             icdf_fn(scale_test_val, q_test_val),
             sp.stats.norm(0, scale_test_val).ppf(q_test_val),
         )
+
+    @pytest.mark.parametrize(
+        "pt_transform, scale",
+        [
+            (pt.deg2rad, np.pi / 180),
+            (pt.rad2deg, 180 / np.pi),
+        ],
+    )
+    def test_deg2rad_rad2deg_transform_rv(self, pt_transform, scale):
+        y_rv = pt_transform(pt.random.normal(0.5, 1, name="base_rv"))
+        y_rv.name = "y"
+        y_vv = y_rv.clone()
+
+        logp_fn = pytensor.function([y_vv], logp(y_rv, y_vv))
+        logcdf_fn = pytensor.function([y_vv], logcdf(y_rv, y_vv))
+        icdf_fn = pytensor.function([y_vv], icdf(y_rv, y_vv))
+
+        y_test_val = 0.7
+        q_test_val = 0.3
+        ref_dist = sp.stats.norm(0.5 * scale, scale)
+        np.testing.assert_allclose(logp_fn(y_test_val), ref_dist.logpdf(y_test_val))
+        np.testing.assert_allclose(logcdf_fn(y_test_val), ref_dist.logcdf(y_test_val))
+        np.testing.assert_allclose(icdf_fn(q_test_val), ref_dist.ppf(q_test_val))
 
     def test_negated_rv_transform(self):
         x_rv = -pt.random.halfnormal()
@@ -379,9 +413,7 @@ class TestPowerRVTransform:
         x_vv = x_rv.clone()
         x_logp_fn = pytensor.function([x_vv], logp(x_rv, x_vv))
         x_logcdf_fn = pytensor.function([x_vv], logcdf(x_rv, x_vv))
-
-        with pytest.raises(NotImplementedError):
-            icdf(x_rv, x_vv)
+        x_icdf_fn = pytensor.function([x_vv], icdf(x_rv, x_vv))
 
         x_test_val = np.r_[-0.5, 1.5]
         np.testing.assert_allclose(
@@ -391,6 +423,10 @@ class TestPowerRVTransform:
         np.testing.assert_allclose(
             x_logcdf_fn(x_test_val),
             sp.stats.invgamma(shape, scale=scale * numerator).logcdf(x_test_val),
+        )
+        np.testing.assert_allclose(
+            x_icdf_fn(x_test_val),
+            sp.stats.invgamma(shape, scale=scale * numerator).ppf(x_test_val),
         )
 
     def test_reciprocal_real_rv_transform(self):
@@ -406,8 +442,10 @@ class TestPowerRVTransform:
             logcdf(test_rv, test_value).eval(),
             sp.stats.cauchy(1 / 5, 2 / 5).logcdf(test_value),
         )
-        with pytest.raises(NotImplementedError):
-            icdf(test_rv, test_value)
+        np.testing.assert_allclose(
+            icdf(test_rv, test_value).eval(),
+            sp.stats.cauchy(1 / 5, 2 / 5).ppf(test_value),
+        )
 
     def test_sqr_transform(self):
         # The square of a normal with unit variance is a noncentral chi-square with 1 df and nc = mean ** 2
@@ -451,7 +489,7 @@ class TestPowerRVTransform:
         # ICDF is not implemented for chisquare, so we have to test with another identity
         # sqrt(exponential(lam)) = rayleigh(1 / sqrt(2 * lam))
         lam = 2.5
-        y_rv = pt.sqrt(pt.random.exponential(scale=1 / lam))
+        y_rv = pt.sqrt(pt.random.exponential(scale=1 / lam, size=(4,)))
         y_vv = x_rv.clone()
         y_icdf_fn = pytensor.function([y_vv], icdf(y_rv, y_vv))
         q_test_val = np.r_[0.2, 0.5, 0.7, 0.9]
@@ -520,8 +558,13 @@ def test_absolute_rv_transform(test_val):
         (pt.erf, ErfTransform()),
         (pt.erfc, ErfcTransform()),
         (pt.erfcx, ErfcxTransform()),
+        (pt.erfinv, ErfinvTransform()),
+        (pt.erfcinv, ErfcinvTransform()),
         (pt.sinh, SinhTransform()),
         (pt.tanh, TanhTransform()),
+        (pt.arcsin, ArcsinTransform()),
+        (pt.arccos, ArccosTransform()),
+        (pt.arctan, ArctanTransform()),
         (pt.arcsinh, ArcsinhTransform()),
         (pt.arccosh, ArccoshTransform()),
         (pt.arctanh, ArctanhTransform()),
@@ -542,6 +585,57 @@ def test_extra_bijective_rv_transforms(pt_transform, transform):
     np.testing.assert_allclose(
         rv_logp.eval({vv: vv_test}),
         np.nan_to_num(expected_logp.eval({vv: vv_test}), nan=-np.inf),
+    )
+
+
+@pytest.mark.parametrize(
+    "pt_transform, transform",
+    [
+        (pt.erfc, ErfcTransform()),
+        (pt.erfcx, ErfcxTransform()),
+        (pt.erfcinv, ErfcinvTransform()),
+        (pt.arccos, ArccosTransform()),
+    ],
+)
+def test_monotonically_decreasing_transform_logcdf(pt_transform, transform):
+    """Test logcdf for monotonically decreasing transforms."""
+    base_rv = pt.random.normal(0.5, 1, name="base_rv")
+    rv = pt_transform(base_rv)
+
+    vv = rv.clone()
+    rv_logcdf = logcdf(rv, vv)
+
+    # For decreasing transform: P(Y <= y) = P(X >= backward(y)) = 1 - P(X < backward(y))
+    expected_logcdf = logccdf(base_rv, transform.backward(vv))
+
+    vv_test = np.array(0.25)
+    np.testing.assert_allclose(
+        rv_logcdf.eval({vv: vv_test}),
+        expected_logcdf.eval({vv: vv_test}),
+    )
+
+
+@pytest.mark.parametrize(
+    "pt_transform, transform, decreasing",
+    [
+        (pt.arctan, ArctanTransform(), False),
+        (pt.erfcinv, ErfcinvTransform(), True),
+    ],
+)
+def test_monotonic_transform_icdf(pt_transform, transform, decreasing):
+    base_rv = pt.random.normal(0.5, 1, name="base_rv")
+    rv = pt_transform(base_rv)
+
+    vv = rv.clone()
+    rv_icdf = icdf(rv, vv)
+
+    q = 1 - vv if decreasing else vv
+    expected_icdf = transform.forward(icdf(base_rv, q))
+
+    vv_test = np.array(0.3)
+    np.testing.assert_allclose(
+        rv_icdf.eval({vv: vv_test}),
+        expected_icdf.eval({vv: vv_test}),
     )
 
 
@@ -615,10 +709,10 @@ def test_measurable_power_exponent_with_constant_base():
 
     np.testing.assert_allclose(x_logp_fn_pow(0.1), x_logp_fn_exp2(0.1))
 
+    x_rv_neg = pt.pow(-2, pt.random.normal())
+    x_vv_neg = x_rv_neg.clone()
     with pytest.raises(ParameterValueError, match="base >= 0"):
-        x_rv_neg = pt.pow(-2, pt.random.normal())
-        x_vv_neg = x_rv_neg.clone()
-        logp(x_rv_neg, x_vv_neg)
+        logp(x_rv_neg, x_vv_neg).eval({x_vv_neg: 1.5})
 
 
 def test_measurable_power_exponent_with_variable_base():
@@ -693,37 +787,53 @@ def test_not_implemented_discrete_rv_transform():
 
 def test_negated_discrete_rv_transform():
     p = 0.7
-    rv = -Bernoulli.dist(p=p)
+    rv = -Bernoulli.dist(p=p, shape=(4,))
     vv = rv.type()
-    logp_fn = pytensor.function([vv], logp(rv, vv))
 
     # A negated Bernoulli has pmf {p if x == -1; 1-p if x == 0; 0 otherwise}
-    assert logp_fn(-2) == -np.inf
-    np.testing.assert_allclose(logp_fn(-1), np.log(p))
-    np.testing.assert_allclose(logp_fn(0), np.log(1 - p))
-    assert logp_fn(1) == -np.inf
+    logp_fn = pytensor.function([vv], logp(rv, vv))
+    np.testing.assert_allclose(
+        logp_fn([-2, -1, 0, 1]), [-np.inf, np.log(p), np.log(1 - p), -np.inf]
+    )
 
-    # Logcdf and icdf not supported yet
-    for func in (logcdf, icdf):
-        with pytest.raises(NotImplementedError):
-            func(rv, 0)
+    logcdf_fn = pytensor.function([vv], logcdf(rv, vv))
+    np.testing.assert_allclose(logcdf_fn([-2, -1, 0, 1]), [-np.inf, np.log(p), 0, 0])
+
+    # logccdf: P(Y > y)
+    logccdf_fn = pytensor.function([vv], logccdf(rv, vv))
+    np.testing.assert_allclose(logccdf_fn([-2, -1, 0, 1]), [0, np.log(1 - p), -np.inf, -np.inf])
+
+    with pytest.raises(NotImplementedError):
+        icdf(rv, [-2, -1, 0, 1])
 
 
 def test_shifted_discrete_rv_transform():
     p = 0.7
     rv = Bernoulli.dist(p=p) + 5
     vv = rv.type()
-    rv_logp_fn = pytensor.function([vv], logp(rv, vv))
 
+    rv_logp_fn = pytensor.function([vv], logp(rv, vv))
     assert rv_logp_fn(4) == -np.inf
     np.testing.assert_allclose(rv_logp_fn(5), np.log(1 - p))
     np.testing.assert_allclose(rv_logp_fn(6), np.log(p))
     assert rv_logp_fn(7) == -np.inf
 
-    # Logcdf and icdf not supported yet
-    for func in (logcdf, icdf):
-        with pytest.raises(NotImplementedError):
-            func(rv, 0)
+    rv_logcdf_fn = pytensor.function([vv], logcdf(rv, vv))
+    assert rv_logcdf_fn(4) == -np.inf
+    np.testing.assert_allclose(rv_logcdf_fn(5), np.log(1 - p))
+    np.testing.assert_allclose(rv_logcdf_fn(6), 0)
+    assert rv_logcdf_fn(7) == 0
+
+    # logccdf: P(Y > y)
+    rv_logccdf_fn = pytensor.function([vv], logccdf(rv, vv))
+    np.testing.assert_allclose(rv_logccdf_fn(4), 0)
+    np.testing.assert_allclose(rv_logccdf_fn(5), np.log(p))
+    assert rv_logccdf_fn(6) == -np.inf
+    assert rv_logccdf_fn(7) == -np.inf
+
+    # icdf not supported yet
+    with pytest.raises(NotImplementedError):
+        icdf(rv, 0)
 
 
 @pytest.mark.xfail(reason="Check not implemented yet")

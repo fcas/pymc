@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -18,7 +18,9 @@ import pytest
 
 import pymc as pm
 
+from pymc.pytensorf import floatX
 from pymc.variational.approximations import Empirical, MeanField
+from pymc.variational.operators import KL
 from tests import models
 
 
@@ -55,8 +57,7 @@ def test_elbo():
 
     # Create variational gradient tensor
     mean_field = MeanField(model=model)
-    with pytensor.config.change_flags(compute_test_value="off"):
-        elbo = -pm.operators.KL(mean_field)()(10000)
+    elbo = -KL(mean_field)()(10000)
 
     mean_field.shared_params["mu"].set_value(post_mu)
     mean_field.shared_params["rho"].set_value(np.log(np.exp(post_sigma) - 1))
@@ -100,8 +101,7 @@ def test_scale_cost_to_minibatch_works(aux_total_size):
             mean_field_1.shared_params["mu"].set_value(post_mu)
             mean_field_1.shared_params["rho"].set_value(np.log(np.exp(post_sigma) - 1))
 
-            with pytensor.config.change_flags(compute_test_value="off"):
-                elbo_via_total_size_scaled = -pm.operators.KL(mean_field_1)()(10000)
+            elbo_via_total_size_scaled = -KL(mean_field_1)()(10000)
 
         with pm.Model():
             mu = pm.Normal("mu", mu=mu0, sigma=sigma)
@@ -114,12 +114,11 @@ def test_scale_cost_to_minibatch_works(aux_total_size):
             mean_field_2.shared_params["mu"].set_value(post_mu)
             mean_field_2.shared_params["rho"].set_value(np.log(np.exp(post_sigma) - 1))
 
-        with pytensor.config.change_flags(compute_test_value="off"):
-            elbo_via_total_size_unscaled = -pm.operators.KL(mean_field_2)()(10000)
+        elbo_via_total_size_unscaled = -KL(mean_field_2)()(10000)
 
         np.testing.assert_allclose(
             elbo_via_total_size_unscaled.eval(),
-            elbo_via_total_size_scaled.eval() * pm.floatX(1 / beta),
+            elbo_via_total_size_scaled.eval() * floatX(1 / beta),
             rtol=0.02,
             atol=1e-1,
         )
@@ -145,8 +144,7 @@ def test_elbo_beta_kl(aux_total_size):
             mean_field_1.shared_params["mu"].set_value(post_mu)
             mean_field_1.shared_params["rho"].set_value(np.log(np.exp(post_sigma) - 1))
 
-            with pytensor.config.change_flags(compute_test_value="off"):
-                elbo_via_total_size_scaled = -pm.operators.KL(mean_field_1)()(10000)
+            elbo_via_total_size_scaled = -KL(mean_field_1)()(10000)
 
         with pm.Model():
             mu = pm.Normal("mu", mu=mu0, sigma=sigma)
@@ -156,8 +154,7 @@ def test_elbo_beta_kl(aux_total_size):
             mean_field_3.shared_params["mu"].set_value(post_mu)
             mean_field_3.shared_params["rho"].set_value(np.log(np.exp(post_sigma) - 1))
 
-            with pytensor.config.change_flags(compute_test_value="off"):
-                elbo_via_beta_kl = -pm.operators.KL(mean_field_3, beta=beta)()(10000)
+        elbo_via_beta_kl = -KL(mean_field_3, beta=beta)()(10000)
 
         np.testing.assert_allclose(
             elbo_via_total_size_scaled.eval(), elbo_via_beta_kl.eval(), rtol=0, atol=1e-1

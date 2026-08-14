@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,9 +14,11 @@
 
 import numpy as np
 import pytest
+import scipy as sp
 
 import pymc as pm
 
+from pymc import logcdf, logp
 from pymc.distributions.shape_utils import change_dist_size
 
 
@@ -93,8 +95,8 @@ class TestCensored:
     def test_change_dist_size(self):
         base_dist = pm.Censored.dist(pm.Normal.dist(), -1, 1, size=(3, 2))
 
-        new_dist = change_dist_size(base_dist, (4,))
-        assert new_dist.eval().shape == (4,)
+        new_dist = change_dist_size(base_dist, (4, 1))
+        assert new_dist.eval().shape == (4, 1)
 
         new_dist = change_dist_size(base_dist, (4,), expand=True)
         assert new_dist.eval().shape == (4, 3, 2)
@@ -110,3 +112,157 @@ class TestCensored:
             pm.Normal.dist(size=(3, 4, 2)), lower=np.zeros((2,)), upper=np.zeros((4, 2))
         )
         assert tuple(x.owner.inputs[0].shape.eval()) == (3, 4, 2)
+
+    def test_censored_categorical(self):
+        cat = pm.Categorical.dist([0.1, 0.2, 0.2, 0.3, 0.2], shape=())
+
+        np.testing.assert_allclose(
+            logp(cat, [-1, 0, 1, 2, 3, 4, 5]).exp().eval(),
+            [0, 0.1, 0.2, 0.2, 0.3, 0.2, 0],
+        )
+
+        censored_cat = pm.Censored.dist(cat, lower=1, upper=3, shape=())
+
+        np.testing.assert_allclose(
+            logp(censored_cat, [-1, 0, 1, 2, 3, 4, 5]).exp().eval(),
+            [0, 0, 0.3, 0.2, 0.5, 0, 0],
+        )
+
+    def test_censored_discrete_unbounded_side(self):
+        # An unbounded side must not upcast the censored variable to float
+        cat = pm.Categorical.dist([0.1, 0.2, 0.2, 0.3, 0.2], shape=())
+        eval_points = [-1, 0, 1, 2, 3, 4, 5]
+
+        # No censoring
+        censored_cat = pm.Censored.dist(cat, lower=None, upper=None, shape=())
+        assert censored_cat.dtype == "int64"
+        np.testing.assert_allclose(
+            logp(censored_cat, eval_points).exp().eval(),
+            [0, 0.1, 0.2, 0.2, 0.3, 0.2, 0],
+        )
+
+        # Left censoring
+        censored_cat = pm.Censored.dist(cat, lower=1, upper=None, shape=())
+        assert censored_cat.dtype == "int64"
+        np.testing.assert_allclose(
+            logp(censored_cat, eval_points).exp().eval(),
+            [0, 0, 0.3, 0.2, 0.3, 0.2, 0],
+        )
+
+        # Right censoring
+        censored_cat = pm.Censored.dist(cat, lower=None, upper=3, shape=())
+        assert censored_cat.dtype == "int64"
+        np.testing.assert_allclose(
+            logp(censored_cat, eval_points).exp().eval(),
+            [0, 0.1, 0.2, 0.2, 0.5, 0, 0],
+        )
+
+    def test_censored_logcdf_continuous(self):
+        norm = pm.Normal.dist(0, 1)
+        eval_points = np.array([-np.inf, -2, -1, 0, 1, 2, np.inf])
+        expected_logcdf_uncensored = sp.stats.norm.logcdf(eval_points)
+
+        match_str = "divide by zero encountered in log|invalid value encountered in subtract"
+
+        # No censoring
+        censored_norm = pm.Censored.dist(norm, lower=None, upper=None)
+        censored_eval = logcdf(censored_norm, eval_points).eval()
+        np.testing.assert_allclose(censored_eval, expected_logcdf_uncensored)
+
+        # Left censoring
+        censored_norm = pm.Censored.dist(norm, lower=-1, upper=None)
+        expected_left = np.where(eval_points < -1, -np.inf, expected_logcdf_uncensored)
+        censored_eval = logcdf(censored_norm, eval_points).eval()
+        np.testing.assert_allclose(
+            censored_eval,
+            expected_left,
+            rtol=1e-6,
+        )
+
+        # Right censoring
+        censored_norm = pm.Censored.dist(norm, lower=None, upper=1)
+        expected_right = np.where(eval_points >= 1, 0.0, expected_logcdf_uncensored)
+        censored_eval = logcdf(censored_norm, eval_points).eval()
+        np.testing.assert_allclose(
+            censored_eval,
+            expected_right,
+            rtol=1e-6,
+        )
+
+        # Interval censoring
+        censored_norm = pm.Censored.dist(norm, lower=-1, upper=1)
+        expected_interval = np.where(eval_points < -1, -np.inf, expected_logcdf_uncensored)
+        expected_interval = np.where(eval_points >= 1, 0.0, expected_interval)
+        censored_eval = logcdf(censored_norm, eval_points).eval()
+        np.testing.assert_allclose(
+            censored_eval,
+            expected_interval,
+            rtol=1e-6,
+        )
+
+    def test_censored_logcdf_discrete(self):
+        probs = [0.1, 0.2, 0.2, 0.3, 0.2]
+        cat = pm.Categorical.dist(probs)
+        eval_points = np.array([-1, 0, 1, 2, 3, 4, 5])
+
+        cdf = np.cumsum(probs)
+        log_cdf_base = np.log(cdf)
+        expected_logcdf_uncensored = np.full_like(eval_points, -np.inf, dtype=float)
+        expected_logcdf_uncensored[1:6] = log_cdf_base
+        expected_logcdf_uncensored[6] = 0.0
+
+        # No censoring
+        censored_cat = pm.Censored.dist(cat, lower=None, upper=None)
+        np.testing.assert_allclose(
+            logcdf(censored_cat, eval_points).eval(),
+            expected_logcdf_uncensored,
+        )
+
+        # Left censoring
+        censored_cat = pm.Censored.dist(cat, lower=1, upper=None)
+        expected_left = np.where(eval_points < 1, -np.inf, expected_logcdf_uncensored)
+        np.testing.assert_allclose(
+            logcdf(censored_cat, eval_points).eval(),
+            expected_left,
+        )
+
+        # Right censoring
+        censored_cat = pm.Censored.dist(cat, lower=None, upper=3)
+        expected_right = np.where(eval_points >= 3, 0.0, expected_logcdf_uncensored)
+        np.testing.assert_allclose(
+            logcdf(censored_cat, eval_points).eval(),
+            expected_right,
+        )
+
+        # Interval censoring
+        censored_cat = pm.Censored.dist(cat, lower=1, upper=3)
+        expected_interval = np.where(eval_points < 1, -np.inf, expected_logcdf_uncensored)
+        expected_interval = np.where(eval_points >= 3, 0.0, expected_interval)
+        np.testing.assert_allclose(
+            logcdf(censored_cat, eval_points).eval(),
+            expected_interval,
+        )
+
+    @pytest.mark.parametrize(
+        "censoring_side,bound_value",
+        [
+            ("right", 100.0),
+            ("left", -100.0),
+        ],
+    )
+    def test_censored_logp_numerical_stability(self, censoring_side, bound_value):
+        """Censored logp at 100 sigma should be finite, not -inf."""
+        ref_scipy = sp.stats.norm(0, 1)
+
+        normal_dist = pm.Normal.dist(mu=0.0, sigma=1.0)
+        if censoring_side == "right":
+            censored = pm.Censored.dist(normal_dist, lower=None, upper=bound_value)
+            expected_logp = ref_scipy.logsf(bound_value)
+        else:
+            censored = pm.Censored.dist(normal_dist, lower=bound_value, upper=None)
+            expected_logp = ref_scipy.logcdf(bound_value)
+
+        logp_at_bound = logp(censored, bound_value).eval()
+
+        assert np.isfinite(logp_at_bound)
+        assert np.isclose(logp_at_bound, expected_logp, rtol=1e-6)

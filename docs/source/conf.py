@@ -66,7 +66,7 @@ numpydoc_xref_aliases = {
     "ndarray": ":class:`~numpy.ndarray`",
     "Covariance": ":mod:`Covariance <pymc.gp.cov>`",
     "Mean": ":mod:`Mean <pymc.gp.mean>`",
-    "InferenceData": ":class:`~arviz.InferenceData`",
+    "DataTree": ":class:`~xarray.DataTree`",
     "MultiTrace": ":class:`~pymc.backends.base.MultiTrace`",
     "BaseTrace": ":class:`~pymc.backends.base.BaseTrace`",
     "Point": ":class:`~pymc.Point`",
@@ -98,7 +98,7 @@ master_doc = "index"
 
 # General information about the project.
 project = "PyMC"
-copyright = "2021, The PyMC Development Team"
+copyright = "2020-present, The PyMC Development Team"
 author = "PyMC contributors"
 
 # The version info for the project you're documenting, acts as replacement for
@@ -146,7 +146,9 @@ exclude_patterns = [
 ]
 
 # myst config
-nb_execution_mode = "force" if on_readthedocs else "off"
+# Use commented code after https://github.com/pymc-devs/pymc/issues/7384 is fixed
+# nb_execution_mode = "force" if on_readthedocs else "off"
+nb_execution_mode = "off"
 nb_execution_allow_errors = False
 nb_execution_raise_on_error = True
 nb_execution_timeout = 300
@@ -297,6 +299,8 @@ todo_include_todos = False
 # intersphinx configuration to ease linking arviz docs
 intersphinx_mapping = {
     "arviz": ("https://python.arviz.org/en/latest/", None),
+    "arviz_plots": ("https://python.arviz.org/projects/plots/en/latest/", None),
+    "arviz_stats": ("https://python.arviz.org/projects/stats/en/latest/", None),
     "pytensor": ("https://pytensor.readthedocs.io/en/latest/", None),
     "home": ("https://www.pymc.io", None),
     "pmx": ("https://www.pymc.io/projects/experimental/en/latest", None),
@@ -307,6 +311,7 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3/", None),
     "scipy": ("https://docs.scipy.org/doc/scipy/", None),
     "xarray": ("https://docs.xarray.dev/en/stable/", None),
+    "zarr": ("https://zarr.readthedocs.io/en/stable/", None),
 }
 
 
@@ -348,6 +353,14 @@ html_theme_options = {
     "logo": {
         "link": "https://www.pymc.io",
     },
+    "search_bar_text": "Search within PyMC library docs...",
+    "icon_links": [
+        {
+            "url": "https://github.com/pymc-devs/pymc",
+            "icon": "fa-brands fa-github",
+            "name": "GitHub",
+        },
+    ],
 }
 html_context = {
     "github_user": "pymc-devs",

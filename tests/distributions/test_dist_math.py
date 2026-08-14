@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 import numpy as np
-import pytensor
 import pytensor.tensor as pt
 import pytest
 import scipy.special
@@ -30,7 +29,7 @@ from pymc.distributions.dist_math import (
     clipped_beta_rvs,
     factln,
     i0e,
-    incomplete_beta,
+    logpow,
     multigammaln,
 )
 from pymc.logprob.utils import ParameterValueError
@@ -60,7 +59,7 @@ def test_check_parameters(conditions, succeeds):
     if succeeds:
         assert ret.eval()
     else:
-        with pytest.raises(ParameterValueError, match="^parameter check msg$"):
+        with pytest.raises(ParameterValueError, match="^parameter check msg*"):
             ret.eval()
 
 
@@ -103,6 +102,53 @@ class MultinomialB(Discrete):
         )
 
 
+def test_logpow():
+    x, m = pt.dscalars("x", "m")
+    fn = function([x, m], logpow(x, m))
+
+    assert fn(2.0, 3.0) == 2.0794415416798357
+    assert fn(0.0, 0.0) == 0.0  # x ** 0 == 1 for any x
+    assert fn(2.0, 0.0) == 0.0
+    assert fn(0.0, 3.0) == -np.inf
+    assert fn(0.0, -3.0) == -np.inf  # +inf in exact math, -inf at the edge of the support
+
+
+def test_logpow_underflowed_base():
+    """Check logpow does not discard a base that PyTensor can stabilize.
+
+    Both bases below collapse to exactly zero -- exp(-800) by underflow and
+    1 - sigmoid(800) by cancellation -- but their logs are rewritten into -800
+    either way, so the result is representable and must not be diverted to the
+    guard's +-inf.
+    """
+    a, m = pt.dscalars("a", "m")
+    exp_fn = function([a, m], logpow(pt.exp(a), m))
+    sigmoid_fn = function([a, m], logpow(1 - pt.sigmoid(a), m))
+
+    for fn, a_val in ((exp_fn, -800.0), (sigmoid_fn, 800.0)):
+        assert fn(a_val, 3.0) == -2400.0
+        assert fn(a_val, -3.0) == 2400.0
+        assert fn(a_val, 0.0) == 0.0
+
+
+def test_logpow_stabilization_reaches_logp():
+    """Check the stabilized form survives in the distributions that build on logpow.
+
+    Poisson and Binomial reach it through their parameters, Gamma through a value
+    that underflows (and with alpha < 1, so a negative exponent).
+    """
+    a = pt.dscalar("a")
+
+    poisson = pm.logp(pm.Poisson.dist(mu=pt.exp(a)), 3)
+    np.testing.assert_allclose(poisson.eval({a: -800.0}), -2401.791759469228)
+
+    binomial = pm.logp(pm.Binomial.dist(n=10, logit_p=a), 1)
+    np.testing.assert_allclose(binomial.eval({a: 800.0}), -7197.697414907006)
+
+    gamma = pm.logp(pm.Gamma.dist(alpha=0.5, beta=1.0), pt.exp(a))
+    np.testing.assert_allclose(gamma.eval({a: -800.0}), 399.4276350736618)
+
+
 def test_multinomial_check_parameters():
     x = np.array([1, 5])
     n = x.sum()
@@ -121,14 +167,12 @@ def test_multinomial_check_parameters():
 
 
 class TestSplineWrapper:
-    @pytensor.config.change_flags(compute_test_value="ignore")
     def test_grad(self):
         x = np.linspace(0, 1, 100)
         y = x * x
         spline = SplineWrapper(interpolate.InterpolatedUnivariateSpline(x, y, k=1))
         verify_grad(spline, [0.5])
 
-    @pytensor.config.change_flags(compute_test_value="ignore")
     def test_hessian(self):
         x = np.linspace(0, 1, 100)
         y = x * x
@@ -140,7 +184,6 @@ class TestSplineWrapper:
 
 
 class TestI0e:
-    @pytensor.config.change_flags(compute_test_value="ignore")
     def test_grad(self):
         verify_grad(i0e, [0.5])
         verify_grad(i0e, [-2.0])
@@ -176,9 +219,3 @@ def test_multigamma():
         for x in xvals:
             if np.all(x > 0.5 * (p - 1)):
                 check_vals(multigammaln_, ref_multigammaln, x, p)
-
-
-def test_incomplete_beta_deprecation():
-    with pytest.warns(FutureWarning, match="incomplete_beta has been deprecated"):
-        res = incomplete_beta(3, 5, 0.5).eval()
-    assert np.isclose(res, pt.betainc(3, 5, 0.5).eval())

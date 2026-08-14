@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -21,13 +21,24 @@ See https://arviz-devs.github.io/arviz/ for details.
 
 import sys
 
-import arviz as az
-
-for attr in az.stats.__all__:
-    obj = getattr(az.stats, attr)
-    if not attr.startswith("__"):
-        setattr(sys.modules[__name__], attr, obj)
-
 from pymc.stats.log_density import compute_log_likelihood, compute_log_prior
 
-__all__ = ("compute_log_likelihood", "compute_log_prior", *az.stats.__all__)
+__all__ = ("compute_log_likelihood", "compute_log_prior")
+
+
+def __getattr__(name):
+    import arviz_stats as azs
+
+    try:
+        value = getattr(azs, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    setattr(sys.modules[__name__], name, value)
+    return value
+
+
+def __dir__():
+    import arviz_stats as azs
+
+    own = ["compute_log_likelihood", "compute_log_prior"]
+    return own + [attr for attr in dir(azs) if not attr.startswith("_")]

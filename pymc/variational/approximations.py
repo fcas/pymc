@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -15,16 +15,15 @@
 import numpy as np
 import pytensor
 
-from arviz import InferenceData
 from pytensor import tensor as pt
 from pytensor.graph.basic import Variable
 from pytensor.graph.replace import graph_replace
 from pytensor.tensor.variable import TensorVariable
-
-import pymc as pm
+from xarray import DataTree
 
 from pymc.blocking import DictToArrayBijection
 from pymc.distributions.dist_math import rho2sigma
+from pymc.pytensorf import floatX
 from pymc.util import makeiter
 from pymc.variational import opvi
 from pymc.variational.opvi import (
@@ -35,18 +34,20 @@ from pymc.variational.opvi import (
     node_property,
 )
 
-__all__ = ["MeanField", "FullRank", "Empirical", "sample_approx"]
+__all__ = ["Empirical", "FullRank", "MeanField", "sample_approx"]
 
 
 @Group.register
 class MeanFieldGroup(Group):
-    R"""Mean Field approximation to the posterior where spherical Gaussian family
-    is fitted to minimize KL divergence from True posterior. It is assumed
-    that latent space variables are uncorrelated that is the main drawback
-    of the method
+    """Mean Field approximation to the posterior.
+
+    Spherical Gaussian family is fitted to minimize KL divergence from posterior.
+
+    It is assumed that latent space variables are uncorrelated that is the main
+    drawback of the method.
     """
 
-    __param_spec__ = dict(mu=("d",), rho=("d",))
+    __param_spec__ = {"mu": ("d",), "rho": ("d",)}
     short_name = "mean_field"
     alias_names = frozenset(["mf"])
 
@@ -67,7 +68,6 @@ class MeanFieldGroup(Group):
     def std(self):
         return rho2sigma(self.rho)
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def __init_group__(self, group):
         super().__init_group__(group)
         if not self._check_user_params():
@@ -93,8 +93,8 @@ class MeanFieldGroup(Group):
         rho = rho1
 
         return {
-            "mu": pytensor.shared(pm.floatX(start), "mu"),
-            "rho": pytensor.shared(pm.floatX(rho), "rho"),
+            "mu": pytensor.shared(floatX(start), "mu"),
+            "rho": pytensor.shared(floatX(rho), "rho"),
         }
 
     @node_property
@@ -116,17 +116,18 @@ class MeanFieldGroup(Group):
 
 @Group.register
 class FullRankGroup(Group):
-    """Full Rank approximation to the posterior where Multivariate Gaussian family
-    is fitted to minimize KL divergence from True posterior. In contrast to
-    MeanField approach correlations between variables are taken in account. The
-    main drawback of the method is computational cost.
+    """Full Rank approximation to the posterior.
+
+    Multivariate Gaussian family is fitted to minimize KL divergence from posterior.
+
+    In contrast to MeanField approach, correlations between variables are taken
+    into account. The main drawback of the method is its computational cost.
     """
 
-    __param_spec__ = dict(mu=("d",), L_tril=("int(d * (d + 1) / 2)",))
+    __param_spec__ = {"mu": ("d",), "L_tril": ("int(d * (d + 1) / 2)",)}
     short_name = "full_rank"
     alias_names = frozenset(["fr"])
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def __init_group__(self, group):
         super().__init_group__(group)
         if not self._check_user_params():
@@ -188,19 +189,19 @@ class FullRankGroup(Group):
 
 @Group.register
 class EmpiricalGroup(Group):
-    """Builds Approximation instance from a given trace,
-    it has the same interface as variational approximation
+    """Builds Approximation instance from a given trace.
+
+    It has the same interface as variational approximation.
     """
 
     has_logq = False
-    __param_spec__ = dict(histogram=("s", "d"))
+    __param_spec__ = {"histogram": ("s", "d")}
     short_name = "empirical"
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def __init_group__(self, group):
         super().__init_group__(group)
         self._check_trace()
-        if not self._check_user_params(spec_kw=dict(s=-1)):
+        if not self._check_user_params(spec_kw={"s": -1}):
             self.shared_params = self.create_shared_params(
                 trace=self._kwargs.get("trace", None),
                 size=self._kwargs.get("size", None),
@@ -217,7 +218,7 @@ class EmpiricalGroup(Group):
                 start = self._prepare_start(start)
                 # Initialize particles
                 histogram = np.tile(start, (size, 1))
-                histogram += pm.floatX(np.random.normal(0, jitter, histogram.shape))
+                histogram += floatX(np.random.normal(0, jitter, histogram.shape))
         else:
             histogram = np.empty((len(trace) * len(trace.chains), self.ddim))
             i = 0
@@ -225,18 +226,18 @@ class EmpiricalGroup(Group):
                 for j in range(len(trace)):
                     histogram[i] = DictToArrayBijection.map(trace.point(j, t)).data
                     i += 1
-        return dict(histogram=pytensor.shared(pm.floatX(histogram), "histogram"))
+        return {"histogram": pytensor.shared(floatX(histogram), "histogram")}
 
     def _check_trace(self):
         trace = self._kwargs.get("trace", None)
-        if isinstance(trace, InferenceData):
+        if isinstance(trace, DataTree):
             raise NotImplementedError(
-                "The `Empirical` approximation does not yet support `InferenceData` inputs."
+                "The `Empirical` approximation does not yet support `DataTree` inputs."
                 " Pass `pm.sample(return_inferencedata=False)` to get a `MultiTrace` to use with `Empirical`."
                 " Please help us to refactor: https://github.com/pymc-devs/pymc/issues/5884"
             )
         elif trace is not None and not all(
-            [self.model.rvs_to_values[var].name in trace.varnames for var in self.group]
+            self.model.rvs_to_values[var].name in trace.varnames for var in self.group
         ):
             raise ValueError("trace has not all free RVs in the group")
 
@@ -252,12 +253,14 @@ class EmpiricalGroup(Group):
                 pass
         else:
             size = tuple(np.atleast_1d(size))
-        return pt.random.integers(
+        _, draws = pt.random.integers(
             size=size,
             low=0,
             high=self.histogram.shape[0],
-            rng=pytensor.shared(np.random.default_rng()),
+            rng=pt.random.shared_rng(seed=None),
+            return_next_rng=True,
         )
+        return draws
 
     def _new_initial(self, size, deterministic, more_replacements=None):
         pytensor_condition_is_here = isinstance(deterministic, Variable)
@@ -294,7 +297,7 @@ class EmpiricalGroup(Group):
     @node_property
     def cov(self):
         x = self.histogram - self.mean
-        return x.T.dot(x) / pm.floatX(self.histogram.shape[0])
+        return x.T.dot(x) / floatX(self.histogram.shape[0])
 
     @node_property
     def std(self):
@@ -325,12 +328,13 @@ def sample_approx(approx, draws=100, include_transformed=True):
     trace: class:`pymc.backends.base.MultiTrace`
         Samples drawn from variational posterior.
     """
-    return approx.sample(draws=draws, include_transformed=include_transformed)
+    with approx.model:
+        return approx.sample(draws=draws, include_transformed=include_transformed)
 
 
 # single group shortcuts exported to user
 class SingleGroupApproximation(Approximation):
-    """Base class for Single Group Approximation"""
+    """Base class for Single Group Approximation."""
 
     _group_class: type | None = None
 
@@ -344,7 +348,7 @@ class SingleGroupApproximation(Approximation):
     def __dir__(self):
         d = set(super().__dir__())
         d.update(self.groups[0].__dir__())
-        return list(sorted(d))
+        return sorted(d)
 
 
 class MeanField(SingleGroupApproximation):
@@ -372,7 +376,7 @@ class Empirical(SingleGroupApproximation):
 
     def evaluate_over_trace(self, node):
         R"""
-        Allows to statically evaluate any symbolic expression over the trace.
+        Allow to statically evaluate any symbolic expression over the trace.
 
         Parameters
         ----------
@@ -387,7 +391,10 @@ class Empirical(SingleGroupApproximation):
         def sample(post, *_):
             return graph_replace(node, {self.input: post}, strict=False)
 
-        nodes, _ = pytensor.scan(
-            sample, self.histogram, non_sequences=_known_scan_ignored_inputs(makeiter(node))
+        nodes = pytensor.scan(
+            sample,
+            self.histogram,
+            non_sequences=_known_scan_ignored_inputs(makeiter(node)),
+            return_updates=False,
         )
         return nodes

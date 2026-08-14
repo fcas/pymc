@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,3 +11,34 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+
+"""Model transforms."""
+
+from pymc.model.transform.basic import (
+    prune_vars_detached_from_observed,
+    remove_minibatched_nodes,
+)
+from pymc.model.transform.conditioning import (
+    change_value_transforms,
+    do,
+    observe,
+    remove_value_transforms,
+)
+from pymc.model.transform.deterministic import (
+    extract_deterministics,
+    insert_deterministics,
+)
+from pymc.model.transform.optimization import freeze_dims_and_data, freeze_model
+
+__all__ = (
+    "change_value_transforms",
+    "do",
+    "extract_deterministics",
+    "freeze_dims_and_data",
+    "freeze_model",
+    "insert_deterministics",
+    "observe",
+    "prune_vars_detached_from_observed",
+    "remove_minibatched_nodes",
+    "remove_value_transforms",
+)

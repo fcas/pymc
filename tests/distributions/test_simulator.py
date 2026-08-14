@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+import sys
 import warnings
 
 import cloudpickle
@@ -19,19 +20,17 @@ import pytensor
 import pytest
 import scipy.stats as st
 
+from pytensor.compile.mode import get_default_mode
 from pytensor.graph import ancestors
+from pytensor.link.numba import NumbaLinker
 from pytensor.tensor.random.op import RandomVariable
-from pytensor.tensor.random.var import (
-    RandomGeneratorSharedVariable,
-    RandomStateSharedVariable,
-)
+from pytensor.tensor.random.variable import RandomGeneratorSharedVariable
 from pytensor.tensor.sort import SortOp
 
 import pymc as pm
 
-from pymc import floatX
 from pymc.initial_point import make_initial_point_fn
-from pymc.pytensorf import compile_pymc
+from pymc.pytensorf import compile, floatX
 from pymc.smc.kernels import IMH
 
 
@@ -92,7 +91,20 @@ class TestSimulator:
         assert abs(self.data.mean() - po_p["s"].mean()) < 0.10
         assert abs(self.data.std() - po_p["s"].std()) < 0.10
 
-    @pytest.mark.parametrize("floatX", ["float32", "float64"])
+    @pytest.mark.parametrize(
+        "floatX",
+        [
+            pytest.param(
+                "float32",
+                marks=pytest.mark.xfail(
+                    condition=sys.version_info.minor == 14
+                    and not isinstance(get_default_mode().linker, NumbaLinker),
+                    reason="Needs investigation",
+                ),
+            ),
+            "float64",
+        ],
+    )
     def test_custom_dist_sum_stat(self, seeded_test, floatX):
         with pytensor.config.change_flags(floatX=floatX):
             with pm.Model() as m:
@@ -257,7 +269,7 @@ class TestSimulator:
         shared_rng_vars = [
             node
             for node in ancestors(compiled_graph)
-            if isinstance(node, RandomStateSharedVariable | RandomGeneratorSharedVariable)
+            if isinstance(node, RandomGeneratorSharedVariable)
         ]
         assert len(shared_rng_vars) == 1
 
@@ -360,12 +372,12 @@ class TestSimulator:
         x = cloudpickle.loads(cloudpickle.dumps(x))
 
         x_logp = pm.logp(x, [0, 1, 2])
-        x_logp_fn = compile_pymc([], x_logp, random_seed=1)
+        x_logp_fn = compile([], x_logp, random_seed=1)
         res1, res2 = x_logp_fn(), x_logp_fn()
         assert res1.shape == (3,)
         assert np.all(res1 != res2)
 
-        x_logp_fn = compile_pymc([], x_logp, random_seed=1)
+        x_logp_fn = compile([], x_logp, random_seed=1)
         res3, res4 = x_logp_fn(), x_logp_fn()
         assert np.all(res1 == res3)
         assert np.all(res2 == res4)

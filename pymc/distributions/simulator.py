@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ import pytensor.tensor as pt
 
 from pytensor.graph.op import Apply, Op
 from pytensor.tensor.random.op import RandomVariable
+from pytensor.tensor.utils import safe_signature
 from pytensor.tensor.variable import TensorVariable
-from scipy.spatial import cKDTree
 
 from pymc.distributions.distribution import Distribution, _support_point
 from pymc.logprob.abstract import _logprob
@@ -33,14 +33,12 @@ _log = logging.getLogger(__name__)
 
 class SimulatorRV(RandomVariable):
     """
-    Base class for SimulatorRVs
+    Base class for SimulatorRVs.
 
     This should be subclassed when defining custom Simulator objects.
     """
 
     name = "SimulatorRV"
-    ndim_supp = None
-    ndims_params = None
     dtype = "floatX"
     _print_name = ("Simulator", "\\operatorname{Simulator}")
 
@@ -64,8 +62,7 @@ class SimulatorRV(RandomVariable):
 
 class Simulator(Distribution):
     r"""
-    Simulator distribution, used for Approximate Bayesian Inference (ABC)
-    with Sequential Monte Carlo (SMC) sampling via :func:`~pymc.sample_smc`.
+    Used for Approximate Bayesian Inference with SMC sampling via :func:`~pymc.sample_smc`.
 
     Simulator distributions have a stochastic pseudo-loglikelihood defined by
     a distance metric between the observed and simulated data, and tweaked
@@ -123,6 +120,7 @@ class Simulator(Distribution):
         def simulator_fn(rng, loc, scale, size):
             return rng.normal(loc, scale, size=size)
 
+
         with pm.Model() as m:
             loc = pm.Normal("loc", 0, 1)
             scale = pm.HalfNormal("scale", 1)
@@ -145,7 +143,7 @@ class Simulator(Distribution):
         return super().__new__(cls, name, *args, **kwargs)
 
     @classmethod
-    def dist(  # type: ignore
+    def dist(  # type: ignore[override]
         cls,
         fn,
         *unnamed_params,
@@ -153,7 +151,8 @@ class Simulator(Distribution):
         distance="gaussian",
         sum_stat="identity",
         epsilon=1,
-        ndim_supp=0,
+        signature=None,
+        ndim_supp=None,
         ndims_params=None,
         dtype="floatX",
         class_name: str = "Simulator",
@@ -199,13 +198,19 @@ class Simulator(Distribution):
             if unnamed_params:
                 raise ValueError("Cannot pass both unnamed parameters and `params`")
 
-        # Assume scalar ndims_params
-        if ndims_params is None:
-            ndims_params = [0] * len(params)
+        if signature is None:
+            # Assume scalar ndims_params
+            temp_ndims_params = ndims_params if ndims_params is not None else [0] * len(params)
+            # Assume scalar ndim_supp
+            temp_ndim_supp = ndim_supp if ndim_supp is not None else 0
+            signature = safe_signature(
+                core_inputs_ndim=temp_ndims_params, core_outputs_ndim=[temp_ndim_supp]
+            )
 
         return super().dist(
             params,
             fn=fn,
+            signature=signature,
             ndim_supp=ndim_supp,
             ndims_params=ndims_params,
             dtype=dtype,
@@ -228,29 +233,31 @@ class Simulator(Distribution):
         sum_stat,
         epsilon,
         class_name,
+        signature,
         **kwargs,
     ):
         sim_op = type(
             class_name,
             (SimulatorRV,),
-            dict(
-                name=class_name,
-                ndim_supp=ndim_supp,
-                ndims_params=ndims_params,
-                dtype=dtype,
-                inplace=False,
-                fn=fn,
-                _distance=distance,
-                _sum_stat=sum_stat,
-                epsilon=epsilon,
-            ),
+            {
+                "name": class_name,
+                "ndim_supp": ndim_supp,
+                "ndims_params": ndims_params,
+                "signature": signature,
+                "dtype": dtype,
+                "inplace": False,
+                "fn": fn,
+                "_distance": distance,
+                "_sum_stat": sum_stat,
+                "epsilon": epsilon,
+            },
         )()
         return sim_op(*params, **kwargs)
 
 
-@_support_point.register(SimulatorRV)  # type: ignore
+@_support_point.register(SimulatorRV)
 def simulator_support_point(op, rv, *inputs):
-    sim_inputs = inputs[3:]
+    sim_inputs = op.dist_params(rv.owner)
     # Take the mean of 10 draws
     multiple_sim = rv.owner.op(*sim_inputs, size=pt.concatenate([[10], rv.shape]))
     return pt.mean(multiple_sim, axis=0)
@@ -295,6 +302,8 @@ class KullbackLeibler:
     """Approximate Kullback-Leibler."""
 
     def __init__(self, obs_data):
+        from scipy.spatial import cKDTree
+
         if obs_data.ndim == 1:
             obs_data = obs_data[:, None]
         n, d = obs_data.shape
@@ -305,6 +314,8 @@ class KullbackLeibler:
         self.obs_data = obs_data
 
     def __call__(self, epsilon, obs_data, sim_data):
+        from scipy.spatial import cKDTree
+
         if sim_data.ndim == 1:
             sim_data = sim_data[:, None]
         nu_d, _ = cKDTree(sim_data).query(self.obs_data, 1)
@@ -330,7 +341,7 @@ def create_sum_stat_op_from_fn(fn):
 
         def perform(self, node, inputs, outputs):
             (x,) = inputs
-            outputs[0][0] = np.atleast_1d(fn(x)).astype(pytensor.config.floatX)
+            outputs[0][0] = np.atleast_1d(fn(x)).astype(node.outputs[0].dtype)
 
     return SumStat()
 
@@ -357,8 +368,6 @@ def create_distance_op_from_fn(fn):
 
         def perform(self, node, inputs, outputs):
             eps, obs_data, sim_data = inputs
-            outputs[0][0] = np.atleast_1d(fn(eps, obs_data, sim_data)).astype(
-                pytensor.config.floatX
-            )
+            outputs[0][0] = np.atleast_1d(fn(eps, obs_data, sim_data)).astype(node.outputs[0].dtype)
 
     return Distance()

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -26,9 +26,11 @@ import numpy as np
 
 from rich.progress import BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 
+from pymc.backends import _ZarrChainBase
 from pymc.backends.base import BaseTrace
 from pymc.initial_point import PointType
 from pymc.model import Model, modelcontext
+from pymc.progress_bar import CustomProgress
 from pymc.stats.convergence import log_warning_stats
 from pymc.step_methods import CompoundStep
 from pymc.step_methods.arraystep import (
@@ -36,8 +38,8 @@ from pymc.step_methods.arraystep import (
     PopulationArrayStepShared,
     StatsType,
 )
+from pymc.step_methods.compound import StepMethodState
 from pymc.step_methods.metropolis import DEMetropolis
-from pymc.util import CustomProgress, RandomSeed
 
 __all__ = ()
 
@@ -53,7 +55,7 @@ def _sample_population(
     initial_points: Sequence[PointType],
     draws: int,
     start: Sequence[PointType],
-    random_seed: RandomSeed,
+    rngs: Sequence[np.random.Generator],
     step: BlockedStep | CompoundStep,
     tune: int,
     model: Model,
@@ -62,7 +64,7 @@ def _sample_population(
     traces: Sequence[BaseTrace],
     **kwargs,
 ):
-    """Performs sampling of a population of chains using the ``PopulationStepper``.
+    """Perform sampling of a population of chains using the ``PopulationStepper``.
 
     Parameters
     ----------
@@ -70,7 +72,8 @@ def _sample_population(
         The number of samples to draw
     start : list
         Start points for each chain
-    random_seed : single random seed, optional
+    rngs: sequence of random Generators
+        A list of :py:class:`~numpy.random.Generator` objects, one for each chain
     step : function
         Step function (should be or contain a population step method)
     tune : int
@@ -80,6 +83,11 @@ def _sample_population(
         Show progress bars? (defaults to True)
     parallelize : bool
         Setting for multiprocess parallelization
+    traces : Sequence[BaseTrace]
+        A sequences of chain traces where the sampling results will be stored. Can be
+        a sequence of :py:class:`~pymc.backends.ndarray.NDArray`,
+        :py:class:`~pymc.backends.mcbackend.ChainRecordAdapter`, or
+        :py:class:`~pymc.backends.zarr.ZarrChain`.
     """
     warn_population_size(
         step=step,
@@ -96,7 +104,7 @@ def _sample_population(
         traces=traces,
         tune=tune,
         model=model,
-        random_seed=random_seed,
+        rngs=rngs,
         progressbar=progressbar,
     )
 
@@ -233,7 +241,7 @@ class PopulationStepper:
 
     @staticmethod
     def _run_secondary(c, stepper_dumps, secondary_end, task, progress):
-        """The method is started on a separate process to perform stepping of a chain.
+        """Perform stepping of a chain from a separate process.
 
         Parameters
         ----------
@@ -248,8 +256,6 @@ class PopulationStepper:
         progress : progress.Progress
             The progress bar
         """
-        # re-seed each child process to make them unique
-        np.random.seed(None)
         try:
             stepper = cloudpickle.loads(stepper_dumps)
             # the stepper is not necessarily a PopulationArraySharedStep itself,
@@ -264,6 +270,9 @@ class PopulationStepper:
                 # receiving a None is the signal to exit
                 if incoming is None:
                     break
+                elif incoming == "sampling_state":
+                    secondary_end.send((c, stepper.sampling_state))
+                    continue
                 tune_stop, population = incoming
                 if tune_stop:
                     stepper.stop_tuning()
@@ -308,6 +317,14 @@ class PopulationStepper:
                 updates.append(self._steppers[c].step(population[c]))
         return updates
 
+    def request_sampling_state(self, chain) -> StepMethodState:
+        if self.is_parallelized:
+            self._primary_ends[chain].send(("sampling_state",))
+            _, sampling_state = self._primary_ends[chain].recv()
+        else:
+            sampling_state = self._steppers[chain].sampling_state
+        return sampling_state
+
 
 def _prepare_iter_population(
     *,
@@ -317,8 +334,8 @@ def _prepare_iter_population(
     parallelize: bool,
     traces: Sequence[BaseTrace],
     tune: int,
+    rngs: Sequence[np.random.Generator],
     model=None,
-    random_seed: RandomSeed = None,
     progressbar=True,
 ) -> Iterator[int]:
     """Prepare a PopulationStepper and traces for population sampling.
@@ -333,10 +350,16 @@ def _prepare_iter_population(
         Start points for each chain
     parallelize : bool
         Setting for multiprocess parallelization
+    traces : Sequence[BaseTrace]
+        A sequences of chain traces where the sampling results will be stored. Can be
+        a sequence of :py:class:`~pymc.backends.ndarray.NDArray`,
+        :py:class:`~pymc.backends.mcbackend.ChainRecordAdapter`, or
+        :py:class:`~pymc.backends.zarr.ZarrChain`.
     tune : int
         Number of iterations to tune.
+    rngs: sequence of random Generators
+        A list of :py:class:`~numpy.random.Generator` objects, one for each chain
     model : Model (optional if in ``with`` context)
-    random_seed : single random seed, optional
     progressbar : bool
         ``progressbar`` argument for the ``PopulationStepper``, (defaults to True)
 
@@ -352,9 +375,6 @@ def _prepare_iter_population(
     if draws < 1:
         raise ValueError("Argument `draws` should be above 0.")
 
-    if random_seed is not None:
-        np.random.seed(random_seed)
-
     # The initialization of traces, samplers and points must happen in the right order:
     # 1. population of points is created
     # 2. steppers are initialized and linked to the points object
@@ -366,13 +386,18 @@ def _prepare_iter_population(
 
     # 2. Set up the steppers
     steppers: list[Step] = []
-    for c in range(nchains):
+    assert len(rngs) == nchains, (
+        f"There must be one random Generator per chain. Got {len(rngs)} instead of {nchains}"
+    )
+    for c, rng in enumerate(rngs):
         # need independent samplers for each chain
         # it is important to copy the actual steppers (but not the delta_logp)
         if isinstance(step, CompoundStep):
             chainstep = CompoundStep([copy(m) for m in step.methods])
         else:
             chainstep = copy(step)
+        # `draws` includes tuning here, but `setup_chain` expects the two separately
+        chainstep.setup_chain(rng, tune, draws - tune)
         # link population samplers to the shared population state
         for sm in chainstep.methods if isinstance(step, CompoundStep) else [chainstep]:
             if isinstance(sm, PopulationArrayStepShared):
@@ -410,8 +435,11 @@ def _iter_population(
         the helper object for (parallelized) stepping of chains
     steppers : list
         The step methods for each chain
-    traces : list
-        Traces for each chain
+    traces : Sequence[BaseTrace]
+        A sequences of chain traces where the sampling results will be stored. Can be
+        a sequence of :py:class:`~pymc.backends.ndarray.NDArray`,
+        :py:class:`~pymc.backends.mcbackend.ChainRecordAdapter`, or
+        :py:class:`~pymc.backends.zarr.ZarrChain`.
     points : list
         population of chain states
 
@@ -431,8 +459,11 @@ def _iter_population(
                 # apply the update to the points and record to the traces
                 for c, strace in enumerate(traces):
                     points[c], stats = updates[c]
-                    strace.record(points[c], stats)
+                    flushed = strace.record(points[c], stats, in_warmup=i < tune)
                     log_warning_stats(stats)
+                    if flushed and isinstance(strace, _ZarrChainBase):
+                        sampling_state = popstep.request_sampling_state(c)
+                        strace.store_sampling_state(sampling_state)
                 # yield the state of all chains in parallel
                 yield i
     except KeyboardInterrupt:

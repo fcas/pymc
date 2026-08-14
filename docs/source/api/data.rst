@@ -6,9 +6,6 @@ Data
 .. autosummary::
    :toctree: generated/
 
-   ConstantData
-   MutableData
-   get_data
    Data
-   GeneratorAdapter
+   get_data
    Minibatch

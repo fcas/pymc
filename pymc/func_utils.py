@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,15 +11,19 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+import warnings
+
 from collections.abc import Callable
 
 import numpy as np
 import pytensor.tensor as pt
 
 from pytensor.gradient import NullTypeGradError
-from scipy import optimize
+from pytensor.utils import lazy_scipy_module
 
 import pymc as pm
+
+optimize = lazy_scipy_module("optimize")
 
 __all__ = ["find_constrained_prior"]
 
@@ -35,8 +39,7 @@ def find_constrained_prior(
     **kwargs,
 ) -> dict[str, float]:
     """
-    Find optimal parameters to get `mass` % of probability
-    of a :ref:`distribution <api_distributions>` between `lower` and `upper`.
+    Find optimal parameters to get `mass` % of probability of a distribution between `lower` and `upper`.
 
     Note: only works for one- and two-parameter distributions, as there
     are exactly two constraints. Fix some combination of parameters
@@ -96,7 +99,7 @@ def find_constrained_prior(
 
         # use these parameters in a model
         with pm.Model():
-            x = pm.Gamma('x', **opt_params)
+            x = pm.Gamma("x", **opt_params)
 
         # specify fixed values before optimization
         opt_params = pm.find_constrained_prior(
@@ -119,12 +122,20 @@ def find_constrained_prior(
         opt_params = pm.find_constrained_prior(
             pm.Exponential,
             lower=0,
-            upper=3.,
+            upper=3.0,
             mass=0.9,
             init_guess={"lam": 1},
             mass_below_lower=0,
         )
     """
+    warnings.warn(
+        "find_constrained_prior is deprecated and will be removed in a future version. "
+        "Please use maxent function from PreliZ. "
+        "https://preliz.readthedocs.io/en/latest/api_reference.html#preliz.unidimensional.maxent",
+        FutureWarning,
+        stacklevel=2,
+    )
+
     assert 0.01 <= mass <= 0.99, (
         "This function optimizes the mass of the given distribution +/- "
         f"1%, so `mass` has to be between 0.01 and 0.99. You provided {mass}."
@@ -150,8 +161,8 @@ def find_constrained_prior(
     dist = distribution.dist(**params_to_optim)
 
     try:
-        logcdf_lower = pm.logcdf(dist, pm.floatX(lower))
-        logcdf_upper = pm.logcdf(dist, pm.floatX(upper))
+        logcdf_lower = pm.logcdf(dist, pm.pytensorf.floatX(lower))
+        logcdf_upper = pm.logcdf(dist, pm.pytensorf.floatX(upper))
     except AttributeError:
         raise AttributeError(
             f"You cannot use `find_constrained_prior` with {distribution} -- it doesn't have a logcdf "
@@ -160,18 +171,18 @@ def find_constrained_prior(
         )
 
     target = (pt.exp(logcdf_lower) - mass_below_lower) ** 2
-    target_fn = pm.pytensorf.compile_pymc([dist_params], target, allow_input_downcast=True)
+    target_fn = pm.pytensorf.compile([dist_params], target, allow_input_downcast=True)
 
     constraint = pt.exp(logcdf_upper) - pt.exp(logcdf_lower)
-    constraint_fn = pm.pytensorf.compile_pymc([dist_params], constraint, allow_input_downcast=True)
+    constraint_fn = pm.pytensorf.compile([dist_params], constraint, allow_input_downcast=True)
 
     jac: str | Callable
     constraint_jac: str | Callable
     try:
-        pytensor_jac = pm.gradient(target, [dist_params])
-        jac = pm.pytensorf.compile_pymc([dist_params], pytensor_jac, allow_input_downcast=True)
-        pytensor_constraint_jac = pm.gradient(constraint, [dist_params])
-        constraint_jac = pm.pytensorf.compile_pymc(
+        pytensor_jac = pm.pytensorf.gradient(target, [dist_params])
+        jac = pm.pytensorf.compile([dist_params], pytensor_jac, allow_input_downcast=True)
+        pytensor_constraint_jac = pm.pytensorf.gradient(constraint, [dist_params])
+        constraint_jac = pm.pytensorf.compile(
             [dist_params], pytensor_constraint_jac, allow_input_downcast=True
         )
     # when PyMC cannot compute the gradient
@@ -189,9 +200,7 @@ def find_constrained_prior(
         )
 
     # save optimal parameters
-    opt_params = {
-        param_name: param_value for param_name, param_value in zip(init_guess.keys(), opt.x)
-    }
+    opt_params = dict(zip(init_guess.keys(), opt.x))
     if fixed_params is not None:
         opt_params.update(fixed_params)
     return opt_params

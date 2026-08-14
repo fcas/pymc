@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,13 +14,11 @@
 
 import pytensor.tensor as pt
 
-__all__ = ["Zero", "Constant", "Linear"]
+__all__ = ["Constant", "Linear", "Zero"]
 
 
 class Mean:
-    R"""
-    Base class for mean functions
-    """
+    """Base class for mean functions."""
 
     def __call__(self, X):
         R"""
@@ -40,17 +38,14 @@ class Mean:
 
 
 class Zero(Mean):
-    R"""
-    Zero mean function for Gaussian process.
-
-    """
+    """Zero mean function for Gaussian process."""
 
     def __call__(self, X):
         return pt.alloc(0.0, X.shape[0])
 
 
 class Constant(Mean):
-    R"""
+    """
     Constant mean function for Gaussian process.
 
     Parameters
@@ -68,7 +63,7 @@ class Constant(Mean):
 
 
 class Linear(Mean):
-    R"""
+    """
     Linear mean function for Gaussian process.
 
     Parameters

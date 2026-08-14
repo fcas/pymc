@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,7 +12,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-R"""
+R"""Operational Variational Inference.
+
 Variational inference is a great approach for doing really complex,
 often intractable Bayesian inference in approximate form. Common methods
 (e.g. ADVI) lack from complexity so that approximate posterior does not
@@ -51,16 +52,18 @@ import collections
 import itertools
 import warnings
 
+from dataclasses import dataclass
 from typing import Any, overload
 
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
-import xarray
 
 from pytensor.graph.basic import Variable
 from pytensor.graph.replace import graph_replace
-from pytensor.tensor.shape import unbroadcast
+from pytensor.scalar.basic import identity as scalar_identity
+from pytensor.tensor.elemwise import Elemwise
+from xarray import DataArray, Dataset
 
 import pymc as pm
 
@@ -71,9 +74,10 @@ from pymc.initial_point import make_initial_point_fn
 from pymc.model import modelcontext
 from pymc.pytensorf import (
     SeedSequenceSeed,
-    compile_pymc,
+    compile,
+    constant_fold,
     find_rng_nodes,
-    identity,
+    floatX,
     reseed_rngs,
 )
 from pymc.util import (
@@ -84,45 +88,62 @@ from pymc.util import (
     makeiter,
 )
 from pymc.variational.minibatch_rv import MinibatchRandomVariable, get_scaling
-from pymc.variational.updates import adagrad_window
+from pymc.variational.updates import adagrad_window, get_or_compute_grads
 from pymc.vartypes import discrete_types
 
-__all__ = ["ObjectiveFunction", "Operator", "TestFunction", "Group", "Approximation"]
+__all__ = ["Approximation", "Group", "ObjectiveFunction", "Operator", "TestFunction"]
 
 
 class VariationalInferenceError(Exception):
-    """Exception for VI specific cases"""
+    """Exception for VI specific cases."""
 
 
 class NotImplementedInference(VariationalInferenceError, NotImplementedError):
-    """Marking non functional parts of code"""
+    """Marking non functional parts of code."""
 
 
 class ExplicitInferenceError(VariationalInferenceError, TypeError):
-    """Exception for bad explicit inference"""
+    """Exception for bad explicit inference."""
 
 
 class AEVBInferenceError(VariationalInferenceError, TypeError):
-    """Exception for bad aevb inference"""
+    """Exception for bad aevb inference."""
 
 
 class ParametrizationError(VariationalInferenceError, ValueError):
-    """Error raised in case of bad parametrization"""
+    """Error raised in case of bad parametrization."""
 
 
 class GroupError(VariationalInferenceError, TypeError):
-    """Error related to VI groups"""
+    """Error related to VI groups."""
+
+
+@dataclass
+class VIState:
+    """State of a fitted variational inference approximation.
+
+    Parameters
+    ----------
+    mean : Dataset
+        Posterior mean of each latent variable.
+    std : Dataset or None
+        Posterior standard deviation of each latent variable.
+        ``None`` for particle-based methods.
+    """
+
+    mean: Dataset
+    std: Dataset | None
 
 
 def _known_scan_ignored_inputs(terms):
     # TODO: remove when scan issue with grads is fixed
-    from pymc.data import MinibatchIndexRV
+    from pymc.data import MinibatchOp
     from pymc.distributions.simulator import SimulatorRV
 
     return [
         n.owner.inputs[0]
         for n in pytensor.graph.ancestors(terms)
-        if n.owner is not None and isinstance(n.owner.op, MinibatchIndexRV | SimulatorRV)
+        if n.owner is not None and isinstance(n.owner.op, MinibatchOp | SimulatorRV)
     ]
 
 
@@ -142,45 +163,20 @@ def append_name(name):
 
 
 def node_property(f):
-    """A shortcut for wrapping method to accessible tensor"""
-
+    """Wrap method to accessible tensor."""
     if isinstance(f, str):
 
         def wrapper(fn):
             ff = append_name(f)(fn)
-            f_ = pytensor.config.change_flags(compute_test_value="off")(ff)
-            return property(locally_cachedmethod(f_))
+            return property(locally_cachedmethod(ff))
 
         return wrapper
     else:
-        f_ = pytensor.config.change_flags(compute_test_value="off")(f)
-        return property(locally_cachedmethod(f_))
+        return property(locally_cachedmethod(f))
 
 
-@pytensor.config.change_flags(compute_test_value="ignore")
-def try_to_set_test_value(node_in, node_out, s):
-    _s = s
-    if s is None:
-        s = 1
-    s = pytensor.compile.view_op(pt.as_tensor(s))
-    if not isinstance(node_in, list | tuple):
-        node_in = [node_in]
-    if not isinstance(node_out, list | tuple):
-        node_out = [node_out]
-    for i, o in zip(node_in, node_out):
-        if hasattr(i.tag, "test_value"):
-            if not hasattr(s.tag, "test_value"):
-                continue
-            else:
-                tv = i.tag.test_value[None, ...]
-                tv = np.repeat(tv, s.tag.test_value, 0)
-                if _s is None:
-                    tv = tv[0]
-                o.tag.test_value = tv
-
-
-class ObjectiveUpdates(pytensor.OrderedUpdates):
-    """OrderedUpdates extension for storing loss"""
+class ObjectiveUpdates(dict):
+    """OrderedUpdates extension for storing loss."""
 
     loss = None
 
@@ -190,7 +186,7 @@ def _warn_not_used(smth, where):
 
 
 class ObjectiveFunction:
-    """Helper class for construction loss and updates for variational inference
+    """Helper class for construction loss and updates for variational inference.
 
     Parameters
     ----------
@@ -220,8 +216,7 @@ class ObjectiveFunction:
         more_replacements=None,
         total_grad_norm_constraint=None,
     ):
-        """Calculate gradients for objective function, test function and then
-        constructs updates for optimization step
+        """Construct updates for optimization step after calculating gradients.
 
         Parameters
         ----------
@@ -249,7 +244,7 @@ class ObjectiveFunction:
         :class:`ObjectiveUpdates`
         """
         if more_updates is None:
-            more_updates = dict()
+            more_updates = {}
         resulting_updates = ObjectiveUpdates()
         if self.test_params:
             self.add_test_updates(
@@ -288,11 +283,11 @@ class ObjectiveFunction:
         if more_tf_params is None:
             more_tf_params = []
         if more_replacements is None:
-            more_replacements = dict()
+            more_replacements = {}
         tf_target = self(
             tf_n_mc, more_tf_params=more_tf_params, more_replacements=more_replacements
         )
-        grads = pm.updates.get_or_compute_grads(tf_target, self.obj_params + more_tf_params)
+        grads = get_or_compute_grads(tf_target, self.obj_params + more_tf_params)
         if total_grad_norm_constraint is not None:
             grads = pm.total_norm_constraint(grads, total_grad_norm_constraint)
         updates.update(test_optimizer(grads, self.test_params + more_tf_params))
@@ -309,18 +304,17 @@ class ObjectiveFunction:
         if more_obj_params is None:
             more_obj_params = []
         if more_replacements is None:
-            more_replacements = dict()
+            more_replacements = {}
         obj_target = self(
             obj_n_mc, more_obj_params=more_obj_params, more_replacements=more_replacements
         )
-        grads = pm.updates.get_or_compute_grads(obj_target, self.obj_params + more_obj_params)
+        grads = get_or_compute_grads(obj_target, self.obj_params + more_obj_params)
         if total_grad_norm_constraint is not None:
             grads = pm.total_norm_constraint(grads, total_grad_norm_constraint)
         updates.update(obj_optimizer(grads, self.obj_params + more_obj_params))
         if self.op.returns_loss:
             updates.loss = obj_target
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def step_function(
         self,
         obj_n_mc=None,
@@ -333,6 +327,7 @@ class ObjectiveFunction:
         more_replacements=None,
         total_grad_norm_constraint=None,
         score=False,
+        compile_kwargs=None,
         fn_kwargs=None,
     ):
         R"""Step function that should be called on each optimization step.
@@ -363,8 +358,13 @@ class ObjectiveFunction:
             Bounds gradient norm, prevents exploding gradient problem
         score: `bool`
             calculate loss on each step? Defaults to False for speed
-        fn_kwargs: `dict`
+        compile_kwargs: `dict`
             Add kwargs to pytensor.function (e.g. `{'profile': True}`)
+        fn_kwargs: dict
+            arbitrary kwargs passed to `pytensor.function`
+
+            .. warning:: `fn_kwargs` is deprecated and will be removed in future versions
+
         more_replacements: `dict`
             Apply custom replacements before calculating gradients
 
@@ -372,10 +372,18 @@ class ObjectiveFunction:
         -------
         `pytensor.function`
         """
-        if fn_kwargs is None:
-            fn_kwargs = {}
+        if fn_kwargs is not None:
+            warnings.warn(
+                "`fn_kwargs` is deprecated and will be removed in future versions. Use "
+                "`compile_kwargs` instead.",
+                DeprecationWarning,
+            )
+            compile_kwargs = fn_kwargs
+
+        if compile_kwargs is None:
+            compile_kwargs = {}
         if score and not self.op.returns_loss:
-            raise NotImplementedError("%s does not have loss" % self.op)
+            raise NotImplementedError(f"{self.op} does not have loss")
         updates = self.updates(
             obj_n_mc=obj_n_mc,
             tf_n_mc=tf_n_mc,
@@ -389,16 +397,15 @@ class ObjectiveFunction:
         )
         seed = self.approx.rng.randint(2**30, dtype=np.int64)
         if score:
-            step_fn = compile_pymc([], updates.loss, updates=updates, random_seed=seed, **fn_kwargs)
+            step_fn = compile([], updates.loss, updates=updates, random_seed=seed, **compile_kwargs)
         else:
-            step_fn = compile_pymc([], [], updates=updates, random_seed=seed, **fn_kwargs)
+            step_fn = compile([], [], updates=updates, random_seed=seed, **compile_kwargs)
         return step_fn
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def score_function(
-        self, sc_n_mc=None, more_replacements=None, fn_kwargs=None
+        self, sc_n_mc=None, more_replacements=None, compile_kwargs=None, fn_kwargs=None
     ):  # pragma: no cover
-        R"""Compile scoring function that operates which takes no inputs and returns Loss
+        R"""Compile scoring function that operates which takes no inputs and returns Loss.
 
         Parameters
         ----------
@@ -406,24 +413,35 @@ class ObjectiveFunction:
             number of scoring MC samples
         more_replacements:
             Apply custom replacements before compiling a function
+        compile_kwargs: `dict`
+            arbitrary kwargs passed to `pytensor.function`
         fn_kwargs: `dict`
             arbitrary kwargs passed to `pytensor.function`
+
+            .. warning:: `fn_kwargs` is deprecated and will be removed in future versions
 
         Returns
         -------
         pytensor.function
         """
-        if fn_kwargs is None:
-            fn_kwargs = {}
+        if fn_kwargs is not None:
+            warnings.warn(
+                "`fn_kwargs` is deprecated and will be removed in future versions. Use "
+                "`compile_kwargs` instead",
+                DeprecationWarning,
+            )
+            compile_kwargs = fn_kwargs
+
+        if compile_kwargs is None:
+            compile_kwargs = {}
         if not self.op.returns_loss:
-            raise NotImplementedError("%s does not have loss" % self.op)
+            raise NotImplementedError(f"{self.op} does not have loss")
         if more_replacements is None:
             more_replacements = {}
         loss = self(sc_n_mc, more_replacements=more_replacements)
         seed = self.approx.rng.randint(2**30, dtype=np.int64)
-        return compile_pymc([], loss, random_seed=seed, **fn_kwargs)
+        return compile([], loss, random_seed=seed, **compile_kwargs)
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def __call__(self, nmc, **kwargs):
         if "more_tf_params" in kwargs:
             m = -1.0
@@ -435,7 +453,7 @@ class ObjectiveFunction:
 
 
 class Operator:
-    R"""**Base class for Operator**
+    R"""**Base class for Operator**.
 
     Parameters
     ----------
@@ -452,7 +470,7 @@ class Operator:
     require_logq = True
     objective_class = ObjectiveFunction
     supports_aevb = property(lambda self: not self.approx.any_histograms)
-    T = identity
+    T = Elemwise(scalar_identity)
 
     def __init__(self, approx):
         self.approx = approx
@@ -474,7 +492,7 @@ class Operator:
     model = property(lambda self: self.approx.model)
 
     def apply(self, f):  # pragma: no cover
-        R"""Operator itself
+        R"""Operator itself.
 
         .. math::
 
@@ -496,13 +514,13 @@ class Operator:
     def __call__(self, f=None):
         if self.has_test_function:
             if f is None:
-                raise ParametrizationError("Operator %s requires TestFunction" % self)
+                raise ParametrizationError(f"Operator {self} requires TestFunction")
             else:
                 if not isinstance(f, TestFunction):
                     f = TestFunction.from_function(f)
         else:
             if f is not None:
-                warnings.warn("TestFunction for %s is redundant and removed" % self, stacklevel=3)
+                warnings.warn(f"TestFunction for {self} is redundant and removed", stacklevel=3)
             else:
                 pass
             f = TestFunction()
@@ -510,12 +528,12 @@ class Operator:
         return self.objective_class(self, f)
 
     def __str__(self):  # pragma: no cover
+        """Return a string representation of the object."""
         return f"{self.__class__.__name__}[{self.approx.__class__.__name__}]"
 
 
 def collect_shared_to_list(params):
-    """Helper function for getting a list from
-    usable representation of parameters
+    """Get a list from a usable representation of parameters.
 
     Parameters
     ----------
@@ -526,11 +544,11 @@ def collect_shared_to_list(params):
     List
     """
     if isinstance(params, dict):
-        return list(
+        return [
             t[1]
             for t in sorted(params.items(), key=lambda t: t[0])
             if isinstance(t[1], pytensor.compile.SharedVariable)
-        )
+        ]
     elif params is None:
         return []
     else:
@@ -555,14 +573,14 @@ class TestFunction:
     @classmethod
     def from_function(cls, f):
         if not callable(f):
-            raise ParametrizationError("Need callable, got %r" % f)
+            raise ParametrizationError(f"Need callable, got {f!r}")
         obj = TestFunction()
         obj.__call__ = f
         return obj
 
 
 class Group(WithMemoization):
-    R"""**Base class for grouping variables in VI**
+    R"""**Base class for grouping variables in VI**.
 
     Grouped Approximation is used for modelling mutual dependencies
     for a specified group of variables. Base for local and global group.
@@ -602,9 +620,9 @@ class Group(WithMemoization):
     Passing the correct `vfam` (Variational FAMily) argument you'll tell what
     parametrization is desired for the group. This helps not to overload code with lots of classes.
 
-    .. code:: python
+    .. code-block:: python
 
-        >>> group = Group([latent1, latent2], vfam='mean_field')
+        >>> group = Group([latent1, latent2], vfam="mean_field")
 
     The other way to select approximation is to provide `params` dictionary that has some
     predefined well shaped parameters. Keys of the dict serve as an identifier for variational family and help
@@ -613,7 +631,7 @@ class Group(WithMemoization):
     passing both `vfam` and `params` is prohibited. Partial parametrization is prohibited by design to
     avoid corner cases and possible problems.
 
-    .. code:: python
+    .. code-block:: python
 
         >>> group = Group([latent3], params=dict(mu=my_mu, rho=my_rho))
 
@@ -637,10 +655,10 @@ class Group(WithMemoization):
     correctly initialized. For those groups which have group equal to `None` it will collect all
     the rest variables not covered by other groups and perform delayed init.
 
-    .. code:: python
+    .. code-block:: python
 
-        >>> group_1 = Group([latent1], vfam='fr')  # latent1 has full rank approximation
-        >>> group_other = Group(None, vfam='mf')  # other variables have mean field Q
+        >>> group_1 = Group([latent1], vfam="fr")  # latent1 has full rank approximation
+        >>> group_other = Group(None, vfam="mf")  # other variables have mean field Q
         >>> approx = Approximation([group_1, group_other])
 
     **Summing Up**
@@ -648,7 +666,7 @@ class Group(WithMemoization):
     When you have created all the groups they need to pass all the groups to :class:`Approximation`.
     It does not accept any other parameter rather than `groups`
 
-    .. code:: python
+    .. code-block:: python
 
         >>> approx = Approximation(my_groups)
 
@@ -676,17 +694,17 @@ class Group(WithMemoization):
     initial_dist_map = 0.0
 
     # for handy access using class methods
-    __param_spec__: dict = dict()
+    __param_spec__: dict = {}
     short_name = ""
     alias_names: frozenset[str] = frozenset()
-    __param_registry: dict[frozenset, Any] = dict()
-    __name_registry: dict[str, Any] = dict()
+    __param_registry: dict[frozenset, Any] = {}
+    __name_registry: dict[str, Any] = {}
 
     @classmethod
     def register(cls, sbcls):
-        assert (
-            frozenset(sbcls.__param_spec__) not in cls.__param_registry
-        ), "Duplicate __param_spec__"
+        assert frozenset(sbcls.__param_spec__) not in cls.__param_registry, (
+            "Duplicate __param_spec__"
+        )
         cls.__param_registry[frozenset(sbcls.__param_spec__)] = sbcls
         assert sbcls.short_name not in cls.__name_registry, "Duplicate short_name"
         cls.__name_registry[sbcls.short_name] = sbcls
@@ -739,7 +757,7 @@ class Group(WithMemoization):
         if isinstance(vfam, str):
             vfam = vfam.lower()
         if options is None:
-            options = dict()
+            options = {}
         self.options = options
         self._vfam = vfam
         self.rng = np.random.RandomState(random_seed)
@@ -771,14 +789,15 @@ class Group(WithMemoization):
 
     @classmethod
     def get_param_spec_for(cls, **kwargs):
-        res = dict()
+        res = {}
         for name, fshape in cls.__param_spec__.items():
             res[name] = tuple(eval(s, kwargs) for s in fshape)
         return res
 
     def _check_user_params(self, **kwargs):
-        R"""*Dev* - checks user params, allocates them if they are correct, returns True.
-        If they are not present, returns False
+        R"""*Dev* - check user params, if correct allocate them and return True.
+
+        If they are not present, returns False.
 
         Parameters
         ----------
@@ -800,7 +819,7 @@ class Group(WithMemoization):
                 "Passed parameters do not have a needed set of keys, "
                 f"they should be equal, got {givens}, needed {needed}"
             )
-        self._user_params = dict()
+        self._user_params = {}
         spec = self.get_param_spec_for(d=self.ddim, **kwargs.pop("spec_kw", {}))
         for name, param in self.user_params.items():
             shape = spec[name]
@@ -808,7 +827,7 @@ class Group(WithMemoization):
         return True
 
     def _initial_type(self, name):
-        R"""*Dev* - initial type with given name. The correct type depends on `self.batched`
+        R"""*Dev* - initial type with given name. The correct type depends on `self.batched`.
 
         Parameters
         ----------
@@ -822,7 +841,7 @@ class Group(WithMemoization):
         return pt.matrix(name)
 
     def _input_type(self, name):
-        R"""*Dev* - input type with given name. The correct type depends on `self.batched`
+        R"""*Dev* - input type with given name. The correct type depends on `self.batched`.
 
         Parameters
         ----------
@@ -835,8 +854,8 @@ class Group(WithMemoization):
         """
         return pt.vector(name)
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def __init_group__(self, group):
+        """Initialize the group."""
         if not group:
             raise GroupError("Got empty group")
         if self.group is None:
@@ -875,7 +894,7 @@ class Group(WithMemoization):
             start_idx += size
 
     def _finalize_init(self):
-        """*Dev* - clean up after init"""
+        """*Dev* - clean up after init."""
         del self._kwargs
 
     @property
@@ -895,7 +914,7 @@ class Group(WithMemoization):
             return collect_shared_to_list(self.shared_params)
 
     def _new_initial_shape(self, size, dim, more_replacements=None):
-        """*Dev* - correctly proceeds sampling with variable batch size
+        """*Dev* - correctly proceeds sampling with variable batch size.
 
         Parameters
         ----------
@@ -921,7 +940,7 @@ class Group(WithMemoization):
         return sum(s.stop - s.start for _, s, _, _ in self.ordering.values())
 
     def _new_initial(self, size, deterministic, more_replacements=None):
-        """*Dev* - allocates new initial random generator
+        """*Dev* - allocates new initial random generator.
 
         Parameters
         ----------
@@ -955,20 +974,29 @@ class Group(WithMemoization):
         size = pt.as_tensor(size)
         shape = self._new_initial_shape(size, dim, more_replacements)
         # apply optimizations if possible
+        rv_op = getattr(pt.random, dist_name)
         if not isinstance(deterministic, Variable):
             if deterministic:
                 return pt.ones(shape, dtype) * dist_map
             else:
-                return getattr(pt.random, dist_name)(size=shape)
+                _, sample = rv_op(
+                    size=shape,
+                    rng=pt.random.shared_rng(seed=None),
+                    return_next_rng=True,
+                )
+                return sample
         else:
-            sample = getattr(pt.random, dist_name)(size=shape)
+            _, sample = rv_op(
+                size=shape,
+                rng=pt.random.shared_rng(seed=None),
+                return_next_rng=True,
+            )
             initial = pt.switch(deterministic, pt.ones(shape, dtype) * dist_map, sample)
             return initial
 
     @node_property
     def symbolic_random(self):
-        """*Dev* - abstract node that takes `self.symbolic_initial` and creates
-        approximate posterior that is parametrized with `self.params_dict`.
+        """*Dev* - abstract node that takes `self.symbolic_initial` and creates approximate posterior that is parametrized with `self.params_dict`.
 
         Implementation should take in account `self.batched`. If `self.batched` is `True`, then
         `self.symbolic_initial` is 3d tensor, else 2d
@@ -989,12 +1017,10 @@ class Group(WithMemoization):
         self, node: list[Variable], s, d: bool, more_replacements: dict | None = None
     ) -> list[Variable]: ...
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def set_size_and_deterministic(
         self, node: Variable | list[Variable], s, d: bool, more_replacements: dict | None = None
     ) -> Variable | list[Variable]:
-        """*Dev* - after node is sampled via :func:`symbolic_sample_over_posterior` or
-        :func:`symbolic_single_sample` new random generator can be allocated and applied to node
+        """*Dev* - after node is sampled via :func:`symbolic_sample_over_posterior` or :func:`symbolic_single_sample` new random generator can be allocated and applied to node.
 
         Parameters
         ----------
@@ -1011,23 +1037,22 @@ class Group(WithMemoization):
         -------
         :class:`Variable` or list with applied replacements, ready to use
         """
-
         flat2rand = self.make_size_and_deterministic_replacements(s, d, more_replacements)
         node_out = graph_replace(node, flat2rand, strict=False)
         assert not (
             set(makeiter(self.input)) & set(pytensor.graph.graph_inputs(makeiter(node_out)))
         )
-        try_to_set_test_value(node, node_out, s)
         assert self.symbolic_random not in set(pytensor.graph.graph_inputs(makeiter(node_out)))
         return node_out
 
     def to_flat_input(self, node):
-        """*Dev* - replace vars with flattened view stored in `self.inputs`"""
+        """*Dev* - replace vars with flattened view stored in `self.inputs`."""
         return graph_replace(node, self.replacements, strict=False)
 
     def symbolic_sample_over_posterior(self, node):
-        """*Dev* - performs sampling of node applying independent samples from posterior each time.
-        Note that it is done symbolically and this node needs :func:`set_size_and_deterministic` call
+        """*Dev* - perform sampling of node applying independent samples from posterior each time.
+
+        Note that it is done symbolically and this node needs :func:`set_size_and_deterministic` call.
         """
         node = self.to_flat_input(node)
         random = self.symbolic_random.astype(self.symbolic_initial.dtype)
@@ -1036,24 +1061,27 @@ class Group(WithMemoization):
         def sample(post, *_):
             return graph_replace(node, {self.input: post}, strict=False)
 
-        nodes, _ = pytensor.scan(
-            sample, random, non_sequences=_known_scan_ignored_inputs(makeiter(random))
+        nodes = pytensor.scan(
+            sample,
+            random,
+            non_sequences=_known_scan_ignored_inputs(makeiter(random)),
+            return_updates=False,
         )
         assert self.input not in set(pytensor.graph.graph_inputs(makeiter(nodes)))
         return nodes
 
     def symbolic_single_sample(self, node):
-        """*Dev* - performs sampling of node applying single sample from posterior.
+        """*Dev* - perform sampling of node applying single sample from posterior.
+
         Note that it is done symbolically and this node needs
-        :func:`set_size_and_deterministic` call with `size=1`
+        :func:`set_size_and_deterministic` call with `size=1`.
         """
         node = self.to_flat_input(node)
         random = self.symbolic_random.astype(self.symbolic_initial.dtype)
         return graph_replace(node, {self.input: random[0]}, strict=False)
 
     def make_size_and_deterministic_replacements(self, s, d, more_replacements=None):
-        """*Dev* - creates correct replacements for initial depending on
-        sample size and deterministic flag
+        """*Dev* - create correct replacements for initial depending on sample size and deterministic flag.
 
         Parameters
         ----------
@@ -1070,24 +1098,20 @@ class Group(WithMemoization):
         """
         initial = self._new_initial(s, d, more_replacements)
         initial = pt.specify_shape(initial, self.symbolic_initial.type.shape)
-        # The static shape of initial may be more precise than self.symbolic_initial,
-        # and reveal previously unknown broadcastable dimensions. We have to mask those again.
-        if initial.type.broadcastable != self.symbolic_initial.type.broadcastable:
-            unbroadcast_axes = (
-                i for i, b in enumerate(self.symbolic_initial.type.broadcastable) if not b
-            )
-            initial = unbroadcast(initial, *unbroadcast_axes)
         if more_replacements:
             initial = graph_replace(initial, more_replacements, strict=False)
         return {self.symbolic_initial: initial}
 
     @node_property
     def symbolic_normalizing_constant(self):
-        """*Dev* - normalizing constant for `self.logq`, scales it to `minibatch_size` instead of `total_size`"""
+        """*Dev* - normalizing constant for `self.logq`, scales it to `minibatch_size` instead of `total_size`."""
         t = self.to_flat_input(
             pt.max(
                 [
-                    get_scaling(v.owner.inputs[1:], v.shape)
+                    get_scaling(
+                        v.owner.inputs[1:],
+                        constant_fold([v.owner.inputs[0].shape], raise_not_constant=False),
+                    )
                     for v in self.group
                     if isinstance(v.owner.op, MinibatchRandomVariable)
                 ]
@@ -1095,32 +1119,30 @@ class Group(WithMemoization):
             )
         )
         t = self.symbolic_single_sample(t)
-        return pm.floatX(t)
+        return floatX(t)
 
     @node_property
     def symbolic_logq_not_scaled(self):
-        """*Dev* - symbolically computed logq for `self.symbolic_random`
-        computations can be more efficient since all is known beforehand including
-        `self.symbolic_random`
-        """
+        """*Dev* - symbolically computed logq for `self.symbolic_random` computations can be more efficient since all is known beforehand including `self.symbolic_random`."""
         raise NotImplementedError  # shape (s,)
 
     @node_property
     def symbolic_logq(self):
-        """*Dev* - correctly scaled `self.symbolic_logq_not_scaled`"""
+        """*Dev* - correctly scaled `self.symbolic_logq_not_scaled`."""
         return self.symbolic_logq_not_scaled
 
     @node_property
     def logq(self):
-        """*Dev* - Monte Carlo estimate for group `logQ`"""
+        """*Dev* - Monte Carlo estimate for group `logQ`."""
         return self.symbolic_logq.mean(0)
 
     @node_property
     def logq_norm(self):
-        """*Dev* - Monte Carlo estimate for group `logQ` normalized"""
+        """*Dev* - Monte Carlo estimate for group `logQ` normalized."""
         return self.logq / self.symbolic_normalizing_constant
 
     def __str__(self):
+        """Return a string representation for the object."""
         if self.group is None:
             shp = "undefined"
         else:
@@ -1129,27 +1151,25 @@ class Group(WithMemoization):
 
     @node_property
     def std(self) -> pt.TensorVariable:
-        """Standard deviation of the latent variables as an unstructured 1-dimensional tensor variable"""
+        """Return the standard deviation of the latent variables as an unstructured 1-dimensional tensor variable."""
         raise NotImplementedError()
 
     @node_property
     def cov(self) -> pt.TensorVariable:
-        """Covariance between the latent variables as an unstructured 2-dimensional tensor variable"""
+        """Return the covariance between the latent variables as an unstructured 2-dimensional tensor variable."""
         raise NotImplementedError()
 
     @node_property
     def mean(self) -> pt.TensorVariable:
-        """Mean of the latent variables as an unstructured 1-dimensional tensor variable"""
+        """Return the mean of the latent variables as an unstructured 1-dimensional tensor variable."""
         raise NotImplementedError()
 
-    def var_to_data(self, shared: pt.TensorVariable) -> xarray.Dataset:
-        """Takes a flat 1-dimensional tensor variable and maps it to an xarray data set based on the information in
-        `self.ordering`.
-        """
+    def var_to_data(self, shared: pt.TensorVariable) -> Dataset:
+        """Take a flat 1-dimensional tensor variable and maps it to an xarray data set based on the information in `self.ordering`."""
         # This is somewhat similar to `DictToArrayBijection.rmap`, which doesn't work here since we don't have
         # `RaveledVars` and need to take the information from `self.ordering` instead
         shared_nda = shared.eval()
-        result = dict()
+        result = {}
         for name, s, shape, dtype in self.ordering.values():
             dims = self.model.named_vars_to_dims.get(name, None)
             if dims is not None:
@@ -1157,18 +1177,57 @@ class Group(WithMemoization):
             else:
                 coords = None
             values = shared_nda[s].reshape(shape).astype(dtype)
-            result[name] = xarray.DataArray(values, coords=coords, dims=dims, name=name)
-        return xarray.Dataset(result)
+            result[name] = DataArray(values, coords=coords, dims=dims, name=name)
+        return Dataset(result)
 
     @property
-    def mean_data(self) -> xarray.Dataset:
-        """Mean of the latent variables as an xarray Dataset"""
+    def mean_data(self) -> Dataset:
+        """Mean of the latent variables as an xarray Dataset.
+
+        These are the values the optimizer works with. For the
+        original model space, use :meth:`state` instead.
+        """
         return self.var_to_data(self.mean)
 
     @property
-    def std_data(self) -> xarray.Dataset:
-        """Standard deviation of the latent variables as an xarray Dataset"""
+    def std_data(self) -> Dataset:
+        """Standard deviation of the latent variables as an xarray Dataset.
+
+        These are the values the optimizer works with. For the
+        original model space, use :meth:`state` instead.
+        """
         return self.var_to_data(self.std)
+
+    @property
+    def state(self) -> VIState:
+        """Fit state with mean and std as xarray Datasets."""
+        from pymc.model.transform_values import constrain_values
+
+        include_transformed = getattr(self, "include_transformed", False)
+
+        def _constrain_flat(flat_tensor: pt.TensorVariable) -> Dataset:
+            ds = self.var_to_data(flat_tensor)
+            ds = ds.expand_dims("__sample__")
+            result = constrain_values(
+                ds,
+                model=self.model,
+                sample_dims=("__sample__",),
+                compile_kwargs={"mode": "FAST_COMPILE"},
+            )
+            return result.squeeze("__sample__", drop=True)
+
+        mean_ds = _constrain_flat(self.mean)
+        std_ds = _constrain_flat(self.std) if self.has_logq else None
+
+        if include_transformed:
+            mean_ds = mean_ds.merge(self.mean_data, compat="override")
+            if std_ds is not None:
+                std_ds = std_ds.merge(self.std_data, compat="override")
+
+        return VIState(
+            mean=mean_ds,
+            std=std_ds,
+        )
 
 
 group_for_params = Group.group_for_params
@@ -1176,7 +1235,7 @@ group_for_short_name = Group.group_for_short_name
 
 
 class Approximation(WithMemoization):
-    """**Wrapper for grouped approximations**
+    """**Wrapper for grouped approximations**.
 
     Wraps list of groups, creates an Approximation instance that collects
     sampled variables from all the groups, also collects logQ needed for
@@ -1206,13 +1265,13 @@ class Approximation(WithMemoization):
         model = modelcontext(model)
         if not model.free_RVs:
             raise TypeError("Model does not have an free RVs")
-        self.groups = list()
+        self.groups = []
         seen = set()
         rest = None
         for g in groups:
             if g.group is None:
                 if rest is not None:
-                    raise GroupError("More than one group is specified for " "the rest variables")
+                    raise GroupError("More than one group is specified for the rest variables")
                 else:
                     rest = g
             else:
@@ -1228,7 +1287,10 @@ class Approximation(WithMemoization):
             else:
                 rest.__init_group__(unseen_free_RVs)
                 self.groups.append(rest)
-        self.model = model
+
+    @property
+    def model(self):
+        return modelcontext(self.groups[0].model if self.groups else None)
 
     @property
     def has_logq(self):
@@ -1242,7 +1304,7 @@ class Approximation(WithMemoization):
 
     @property
     def scale_cost_to_minibatch(self):
-        """*Dev* - Property to control scaling cost to minibatch"""
+        """*Dev* - Property to control scaling cost to minibatch."""
         return bool(self._scale_cost_to_minibatch.get_value())
 
     @scale_cost_to_minibatch.setter
@@ -1252,37 +1314,41 @@ class Approximation(WithMemoization):
     @node_property
     def symbolic_normalizing_constant(self):
         """*Dev* - normalizing constant for `self.logq`, scales it to `minibatch_size` instead of `total_size`.
-        Here the effect is controlled by `self.scale_cost_to_minibatch`
+
+        Here the effect is controlled by `self.scale_cost_to_minibatch`.
         """
         t = pt.max(
             self.collect("symbolic_normalizing_constant")
             + [
-                get_scaling(obs.owner.inputs[1:], obs.shape)
+                get_scaling(
+                    obs.owner.inputs[1:],
+                    constant_fold([obs.owner.inputs[0].shape], raise_not_constant=False),
+                )
                 for obs in self.model.observed_RVs
                 if isinstance(obs.owner.op, MinibatchRandomVariable)
             ]
         )
         t = pt.switch(self._scale_cost_to_minibatch, t, pt.constant(1, dtype=t.dtype))
-        return pm.floatX(t)
+        return floatX(t)
 
     @node_property
     def symbolic_logq(self):
-        """*Dev* - collects `symbolic_logq` for all groups"""
+        """*Dev* - collects `symbolic_logq` for all groups."""
         return pt.add(*self.collect("symbolic_logq"))
 
     @node_property
     def logq(self):
-        """*Dev* - collects `logQ` for all groups"""
+        """*Dev* - collects `logQ` for all groups."""
         return pt.add(*self.collect("logq"))
 
     @node_property
     def logq_norm(self):
-        """*Dev* - collects `logQ` for all groups and normalizes it"""
+        """*Dev* - collects `logQ` for all groups and normalizes it."""
         return self.logq / self.symbolic_normalizing_constant
 
     @node_property
     def _sized_symbolic_varlogp_and_datalogp(self):
-        """*Dev* - computes sampled prior term from model via `pytensor.scan`"""
+        """*Dev* - computes sampled prior term from model via `pytensor.scan`."""
         varlogp_s, datalogp_s = self.symbolic_sample_over_posterior(
             [self.model.varlogp, self.model.datalogp]
         )
@@ -1290,83 +1356,79 @@ class Approximation(WithMemoization):
 
     @node_property
     def sized_symbolic_varlogp(self):
-        """*Dev* - computes sampled prior term from model via `pytensor.scan`"""
+        """*Dev* - computes sampled prior term from model via `pytensor.scan`."""
         return self._sized_symbolic_varlogp_and_datalogp[0]  # shape (s,)
 
     @node_property
     def sized_symbolic_datalogp(self):
-        """*Dev* - computes sampled data term from model via `pytensor.scan`"""
+        """*Dev* - computes sampled data term from model via `pytensor.scan`."""
         return self._sized_symbolic_varlogp_and_datalogp[1]  # shape (s,)
 
     @node_property
     def sized_symbolic_logp(self):
-        """*Dev* - computes sampled logP from model via `pytensor.scan`"""
+        """*Dev* - computes sampled logP from model via `pytensor.scan`."""
         return self.sized_symbolic_varlogp + self.sized_symbolic_datalogp  # shape (s,)
 
     @node_property
     def logp(self):
-        """*Dev* - computes :math:`E_{q}(logP)` from model via `pytensor.scan` that can be optimized later"""
+        """*Dev* - computes :math:`E_{q}(logP)` from model via `pytensor.scan` that can be optimized later."""
         return self.varlogp + self.datalogp
 
     @node_property
     def varlogp(self):
-        """*Dev* - computes :math:`E_{q}(prior term)` from model via `pytensor.scan` that can be optimized later"""
+        """*Dev* - computes :math:`E_{q}(prior term)` from model via `pytensor.scan` that can be optimized later."""
         return self.sized_symbolic_varlogp.mean(0)
 
     @node_property
     def datalogp(self):
-        """*Dev* - computes :math:`E_{q}(data term)` from model via `pytensor.scan` that can be optimized later"""
+        """*Dev* - computes :math:`E_{q}(data term)` from model via `pytensor.scan` that can be optimized later."""
         return self.sized_symbolic_datalogp.mean(0)
 
     @node_property
     def _single_symbolic_varlogp_and_datalogp(self):
-        """*Dev* - computes sampled prior term from model via `pytensor.scan`"""
+        """*Dev* - computes sampled prior term from model via `pytensor.scan`."""
         varlogp, datalogp = self.symbolic_single_sample([self.model.varlogp, self.model.datalogp])
         return varlogp, datalogp
 
     @node_property
     def single_symbolic_varlogp(self):
-        """*Dev* - for single MC sample estimate of :math:`E_{q}(prior term)` `pytensor.scan`
-        is not needed and code can be optimized"""
+        """*Dev* - for single MC sample estimate of :math:`E_{q}(prior term)` `pytensor.scan` is not needed and code can be optimized."""
         return self._single_symbolic_varlogp_and_datalogp[0]
 
     @node_property
     def single_symbolic_datalogp(self):
-        """*Dev* - for single MC sample estimate of :math:`E_{q}(data term)` `pytensor.scan`
-        is not needed and code can be optimized"""
+        """*Dev* - for single MC sample estimate of :math:`E_{q}(data term)` `pytensor.scan` is not needed and code can be optimized."""
         return self._single_symbolic_varlogp_and_datalogp[1]
 
     @node_property
     def single_symbolic_logp(self):
-        """*Dev* - for single MC sample estimate of :math:`E_{q}(logP)` `pytensor.scan`
-        is not needed and code can be optimized"""
+        """*Dev* - for single MC sample estimate of :math:`E_{q}(logP)` `pytensor.scan` is not needed and code can be optimized."""
         return self.single_symbolic_datalogp + self.single_symbolic_varlogp
 
     @node_property
     def logp_norm(self):
-        """*Dev* - normalized :math:`E_{q}(logP)`"""
+        """*Dev* - normalized :math:`E_{q}(logP)`."""
         return self.logp / self.symbolic_normalizing_constant
 
     @node_property
     def varlogp_norm(self):
-        """*Dev* - normalized :math:`E_{q}(prior term)`"""
+        """*Dev* - normalized :math:`E_{q}(prior term)`."""
         return self.varlogp / self.symbolic_normalizing_constant
 
     @node_property
     def datalogp_norm(self):
-        """*Dev* - normalized :math:`E_{q}(data term)`"""
+        """*Dev* - normalized :math:`E_{q}(data term)`."""
         return self.datalogp / self.symbolic_normalizing_constant
 
     @property
     def replacements(self):
-        """*Dev* - all replacements from groups to replace PyMC random variables with approximation"""
+        """*Dev* - all replacements from groups to replace PyMC random variables with approximation."""
         return collections.OrderedDict(
             itertools.chain.from_iterable(g.replacements.items() for g in self.groups)
         )
 
     def make_size_and_deterministic_replacements(self, s, d, more_replacements=None):
-        """*Dev* - creates correct replacements for initial depending on
-        sample size and deterministic flag
+        """*Dev* - create correct replacements for initial depending on sample size and deterministic flag.
 
         Parameters
         ----------
@@ -1389,10 +1451,8 @@ class Approximation(WithMemoization):
         flat2rand.update(more_replacements)
         return flat2rand
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def set_size_and_deterministic(self, node, s, d, more_replacements=None):
-        """*Dev* - after node is sampled via :func:`symbolic_sample_over_posterior` or
-        :func:`symbolic_single_sample` new random generator can be allocated and applied to node
+        """*Dev* - after node is sampled via :func:`symbolic_sample_over_posterior` or :func:`symbolic_single_sample` new random generator can be allocated and applied to node.
 
         Parameters
         ----------
@@ -1415,34 +1475,38 @@ class Approximation(WithMemoization):
         node = graph_replace(node, optimizations, strict=False)
         node = graph_replace(node, flat2rand, strict=False)
         assert not (set(self.symbolic_randoms) & set(pytensor.graph.graph_inputs(makeiter(node))))
-        try_to_set_test_value(_node, node, s)
         return node
 
     def to_flat_input(self, node, more_replacements=None):
-        """*Dev* - replace vars with flattened view stored in `self.inputs`"""
+        """*Dev* - replace vars with flattened view stored in `self.inputs`."""
         more_replacements = more_replacements or {}
         node = graph_replace(node, more_replacements, strict=False)
         return graph_replace(node, self.replacements, strict=False)
 
     def symbolic_sample_over_posterior(self, node, more_replacements=None):
-        """*Dev* - performs sampling of node applying independent samples from posterior each time.
-        Note that it is done symbolically and this node needs :func:`set_size_and_deterministic` call
+        """*Dev* - perform sampling of node applying independent samples from posterior each time.
+
+        Note that it is done symbolically and this node needs :func:`set_size_and_deterministic` call.
         """
         node = self.to_flat_input(node)
 
         def sample(*post):
             return graph_replace(node, dict(zip(self.inputs, post)), strict=False)
 
-        nodes, _ = pytensor.scan(
-            sample, self.symbolic_randoms, non_sequences=_known_scan_ignored_inputs(makeiter(node))
+        nodes = pytensor.scan(
+            sample,
+            self.symbolic_randoms,
+            non_sequences=_known_scan_ignored_inputs(makeiter(node)),
+            return_updates=False,
         )
         assert not (set(self.inputs) & set(pytensor.graph.graph_inputs(makeiter(nodes))))
         return nodes
 
     def symbolic_single_sample(self, node, more_replacements=None):
-        """*Dev* - performs sampling of node applying single sample from posterior.
+        """*Dev* - perform sampling of node applying single sample from posterior.
+
         Note that it is done symbolically and this node needs
-        :func:`set_size_and_deterministic` call with `size=1`
+        :func:`set_size_and_deterministic` call with `size=1`.
         """
         node = self.to_flat_input(node, more_replacements=more_replacements)
         post = [v[0] for v in self.symbolic_randoms]
@@ -1450,19 +1514,20 @@ class Approximation(WithMemoization):
         return graph_replace(node, dict(zip(inp, post)), strict=False)
 
     def get_optimization_replacements(self, s, d):
-        """*Dev* - optimizations for logP. If sample size is static and equal to 1:
-        then `pytensor.scan` MC estimate is replaced with single sample without call to `pytensor.scan`.
+        """*Dev* - optimizations for logP.
+
+        If sample size is static and equal to 1, then `pytensor.scan` MC
+        estimate is replaced with single sample without call to `pytensor.scan`.
         """
         repl = collections.OrderedDict()
         # avoid scan if size is constant and equal to one
-        if isinstance(s, int) and (s == 1) or s is None:
+        if (isinstance(s, int) and (s == 1)) or s is None:
             repl[self.varlogp] = self.single_symbolic_varlogp
             repl[self.datalogp] = self.single_symbolic_datalogp
         return repl
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def sample_node(self, node, size=None, deterministic=False, more_replacements=None):
-        """Samples given node or nodes over shared posterior
+        """Sample given node or nodes over shared posterior.
 
         Parameters
         ----------
@@ -1492,36 +1557,30 @@ class Approximation(WithMemoization):
         else:
             node_out = self.symbolic_sample_over_posterior(node)
         node_out = self.set_size_and_deterministic(node_out, size, deterministic)
-        try_to_set_test_value(node_in, node_out, size)
         return node_out
 
     def rslice(self, name):
         """*Dev* - vectorized sampling for named random variable without call to `pytensor.scan`.
-        This node still needs :func:`set_size_and_deterministic` to be evaluated
+
+        This node still needs :func:`set_size_and_deterministic` to be evaluated.
         """
-
-        def vars_names(vs):
-            return {self.model.rvs_to_values[v].name for v in vs}
-
-        for vars_, random, ordering in zip(
-            self.collect("group"), self.symbolic_randoms, self.collect("ordering")
-        ):
-            if name in vars_names(vars_):
+        for random, ordering in zip(self.symbolic_randoms, self.collect("ordering")):
+            if name in ordering:
                 name_, slc, shape, dtype = ordering[name]
                 found = random[..., slc].reshape((random.shape[0], *shape)).astype(dtype)
                 found.name = name + "_vi_random_slice"
                 break
         else:
-            raise KeyError("%r not found" % name)
+            raise KeyError(f"{name!r} not found")
         return found
 
     @node_property
     def sample_dict_fn(self):
         s = pt.iscalar()
-        names = [self.model.rvs_to_values[v].name for v in self.model.free_RVs]
+        names = [name for ordering in self.collect("ordering") for name in ordering]
         sampled = [self.rslice(name) for name in names]
         sampled = self.set_size_and_deterministic(sampled, s, 0)
-        sample_fn = compile_pymc([s], sampled)
+        sample_fn = compile([s], sampled)
         rng_nodes = find_rng_nodes(sampled)
 
         def inner(draws=100, *, random_seed: SeedSequenceSeed = None):
@@ -1529,7 +1588,7 @@ class Approximation(WithMemoization):
                 reseed_rngs(rng_nodes, random_seed)
             _samples = sample_fn(draws)
 
-            return {v_: s_ for v_, s_ in zip(names, _samples)}
+            return dict(zip(names, _samples))
 
         return inner
 
@@ -1558,16 +1617,21 @@ class Approximation(WithMemoization):
         if random_seed is not None:
             (random_seed,) = _get_seeds_per_chain(random_seed, 1)
         samples: dict = self.sample_dict_fn(draws, random_seed=random_seed)
-        points = ({name: records[i] for name, records in samples.items()} for i in range(draws))
+        points = (
+            {name: np.asarray(records[i]) for name, records in samples.items()}
+            for i in range(draws)
+        )
+
+        model = pm.Model.get_context(error_if_none=False) or self.model
 
         trace = NDArray(
-            model=self.model,
-            test_point={name: records[0] for name, records in samples.items()},
+            model=model,
+            test_point={name: np.asarray(records[0]) for name, records in samples.items()},
         )
         try:
             trace.setup(draws=draws, chain=0)
             for point in points:
-                trace.record(point)
+                trace.record(point, in_warmup=False)
         finally:
             trace.close()
 
@@ -1575,7 +1639,7 @@ class Approximation(WithMemoization):
         if not return_inferencedata:
             return multi_trace
         else:
-            return pm.to_inference_data(multi_trace, model=self.model, **kwargs)
+            return pm.to_inference_data(multi_trace, model=model, **kwargs)
 
     @property
     def ndim(self):
@@ -1590,6 +1654,7 @@ class Approximation(WithMemoization):
         return pt.concatenate(self.collect("symbolic_random"), axis=-1)
 
     def __str__(self):
+        """Return a string representation of the object."""
         if len(self.groups) < 5:
             return "Approximation{" + " & ".join(map(str, self.groups)) + "}"
         else:
@@ -1598,11 +1663,15 @@ class Approximation(WithMemoization):
 
     @property
     def all_histograms(self):
-        return all(isinstance(g, pm.approximations.EmpiricalGroup) for g in self.groups)
+        from pymc.variational.approximations import EmpiricalGroup
+
+        return all(isinstance(g, EmpiricalGroup) for g in self.groups)
 
     @property
     def any_histograms(self):
-        return any(isinstance(g, pm.approximations.EmpiricalGroup) for g in self.groups)
+        from pymc.variational.approximations import EmpiricalGroup
+
+        return any(isinstance(g, EmpiricalGroup) for g in self.groups)
 
     @node_property
     def joint_histogram(self):

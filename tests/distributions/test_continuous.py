@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -43,8 +43,10 @@ from pymc.testing import (
     Unit,
     assert_support_point_is_expected,
     check_icdf,
+    check_logccdf,
     check_logcdf,
     check_logp,
+    check_selfconsistency_icdf,
     continuous_random_tester,
     seeded_numpy_distribution_builder,
     seeded_scipy_distribution_builder,
@@ -84,7 +86,7 @@ class TestBoundedContinuous:
         with pm.Model() as model:
             pm.TruncatedNormal(bounded_rv_name, mu=1, sigma=2, lower=None, upper=3)
         (
-            (_, _, _, _, _, lower, upper),
+            (_, _, _, _, lower, upper),
             lower_interval,
             upper_interval,
         ) = self.get_dist_params_and_interval_bounds(model, bounded_rv_name)
@@ -98,7 +100,7 @@ class TestBoundedContinuous:
         with pm.Model() as model:
             pm.TruncatedNormal(bounded_rv_name, mu=1, sigma=2, lower=-2, upper=None)
         (
-            (_, _, _, _, _, lower, upper),
+            (_, _, _, _, lower, upper),
             lower_interval,
             upper_interval,
         ) = self.get_dist_params_and_interval_bounds(model, bounded_rv_name)
@@ -118,14 +120,14 @@ class TestBoundedContinuous:
                 upper=None,
             )
         (
-            (_, _, _, _, _, lower, upper),
+            (_, _, _, _, lower, upper),
             lower_interval,
             upper_interval,
         ) = self.get_dist_params_and_interval_bounds(model, bounded_rv_name)
 
-        assert np.array_equal(lower.value, [-1, 0])
-        assert upper.value == np.inf
-        assert np.array_equal(lower_interval.value, [-1, 0])
+        assert np.array_equal(lower.eval(), [-1, 0])
+        assert np.array_equal(upper.eval(), [np.inf])
+        assert np.array_equal(lower_interval.eval(), [-1, 0])
         assert upper_interval is None
 
     def test_lower_bounded_broadcasted(self):
@@ -139,14 +141,14 @@ class TestBoundedContinuous:
                 upper=np.array([np.inf, np.inf]),
             )
         (
-            (_, _, _, _, _, lower, upper),
+            (_, _, _, _, lower, upper),
             lower_interval,
             upper_interval,
         ) = self.get_dist_params_and_interval_bounds(model, bounded_rv_name)
 
-        assert lower.value == -1
-        assert np.array_equal(upper.value, [np.inf, np.inf])
-        assert lower_interval.value == -1
+        assert np.array_equal(lower.eval(), [-1])
+        assert np.array_equal(upper.eval(), [np.inf, np.inf])
+        assert np.array_equal(lower_interval.eval(), [-1])
         assert upper_interval is None
 
 
@@ -370,7 +372,7 @@ class TestMatchesScipy:
         # See e.g., doi: 10.1111/j.1467-9876.2005.00510.x, or
         # http://www.gamlss.org/.
         with pm.Model() as model:
-            pm.Wald("wald", mu=mu, lam=lam, phi=phi, alpha=alpha, transform=None)
+            pm.Wald("wald", mu=mu, lam=lam, phi=phi, alpha=alpha, default_transform=None)
         point = {"wald": value}
         decimals = select_by_precision(float64=6, float32=1)
         npt.assert_almost_equal(
@@ -441,6 +443,10 @@ class TestMatchesScipy:
             {"a": Rplus, "b": Rplus},
             scipy_log_cdf,
         )
+        check_selfconsistency_icdf(
+            pm.Kumaraswamy,
+            {"a": Rplusbig, "b": Rplusbig},
+        )
 
     def test_exponential(self):
         check_logp(
@@ -460,15 +466,6 @@ class TestMatchesScipy:
             {"lam": Rplus},
             lambda q, lam: st.expon.ppf(q, loc=0, scale=1 / lam),
         )
-
-    def test_exponential_wrong_arguments(self):
-        msg = "Incompatible parametrization. Can't specify both lam and scale"
-        with pytest.raises(ValueError, match=msg):
-            pm.Exponential.dist(lam=0.5, scale=5)
-
-        msg = "Incompatible parametrization. Must specify either lam or scale"
-        with pytest.raises(ValueError, match=msg):
-            pm.Exponential.dist()
 
     def test_laplace(self):
         check_logp(
@@ -535,6 +532,14 @@ class TestMatchesScipy:
             decimal=select_by_precision(float64=4, float32=3),
         )
 
+    def test_lognormal_logccdf(self):
+        check_logccdf(
+            pm.LogNormal,
+            Rplus,
+            {"mu": R, "sigma": Rplusbig},
+            lambda value, mu, sigma: st.lognorm.logsf(value, sigma, 0, np.exp(mu)),
+        )
+
     def test_studentt_logp(self):
         check_logp(
             pm.StudentT,
@@ -584,6 +589,13 @@ class TestMatchesScipy:
             lambda q, nu, mu, sigma: st.t.ppf(q, nu, mu, sigma),
         )
 
+    def test_halfstudentt_icdf(self):
+        check_icdf(
+            pm.HalfStudentT,
+            {"nu": Rplusbig, "sigma": Rplusbig},
+            lambda q, nu, sigma: st.t.ppf(0.5 * (q + 1.0), nu, 0.0, sigma),
+        )
+
     @pytest.mark.skipif(
         condition=(pytensor.config.floatX == "float32"),
         reason="Fails on float32 due to numerical issues",
@@ -592,7 +604,7 @@ class TestMatchesScipy:
         check_logcdf(
             pm.SkewStudentT,
             R,
-            {"a": Rplus, "b": Rplus, "mu": R, "sigma": Rplus},
+            {"a": Rplus, "b": Rplus, "mu": R, "sigma": Rplusbig},
             lambda value, a, b, mu, sigma: st.jf_skew_t.logcdf(value, a, b, mu, sigma),
         )
 
@@ -696,13 +708,21 @@ class TestMatchesScipy:
             lambda value, alpha, beta: st.invgamma.logcdf(value, alpha, scale=beta),
         )
 
+    def test_inverse_gamma_icdf(self):
+        check_icdf(
+            pm.InverseGamma,
+            {"alpha": Rplusbig, "beta": Rplusbig},
+            lambda q, alpha, beta: st.invgamma.ppf(q, alpha, scale=beta),
+        )
+
     @pytest.mark.skipif(
         condition=(pytensor.config.floatX == "float32"),
         reason="Fails on float32 due to scaling issues",
     )
     def test_inverse_gamma_alt_params(self):
         def test_fun(value, mu, sigma):
-            alpha, beta = pm.InverseGamma._get_alpha_beta(None, None, mu, sigma)
+            alpha = (2 * sigma**2 + mu**2) / sigma**2
+            beta = mu * (mu**2 + sigma**2) / sigma**2
             return st.invgamma.logpdf(value, alpha, scale=beta)
 
         check_logp(
@@ -880,6 +900,12 @@ class TestMatchesScipy:
             ),
             decimal=select_by_precision(float64=6, float32=1),
         )
+        check_icdf(
+            pm.LogitNormal,
+            {"mu": R, "sigma": Rplus},
+            lambda q, mu, sigma: sp.expit(mu + sigma * st.norm.ppf(q)),
+            decimal=select_by_precision(float64=12, float32=5),
+        )
 
     @pytest.mark.skipif(
         condition=(pytensor.config.floatX == "float32"),
@@ -1040,6 +1066,30 @@ class TestMatchesScipy:
             decimal=select_by_precision(float64=6, float32=1),
             skip_paramdomain_outside_edge_test=True,
         )
+
+        def scipy_icdf(q, mu, sigma, lower, upper):
+            return st.truncnorm.ppf(
+                q, (lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma
+            )
+
+        check_icdf(
+            pm.TruncatedNormal,
+            {"mu": R, "sigma": Rplusbig, "lower": -Rplusbig, "upper": Rplusbig},
+            scipy_icdf,
+            decimal=select_by_precision(float64=6, float32=1),
+            skip_paramdomain_outside_edge_test=True,
+        )
+
+        # Far-tail truncation, where exp(logcdf) underflows
+        if pytensor.config.floatX == "float64":
+            q = np.array([1e-12, 0.3, 0.9, 1 - 1e-12])
+            for lower, upper in [(39, np.inf), (39, 42), (100, np.inf)]:
+                dist = pm.TruncatedNormal.dist(mu=0, sigma=1, lower=lower, upper=upper)
+                npt.assert_allclose(
+                    icdf(dist, q).eval(),
+                    scipy_icdf(q, 0, 1, lower, upper),
+                    rtol=1e-6,
+                )
 
         # This is a regression test for #6128: Check that having one out-of-bound value
         # in an input array does not set all logp values to -inf
@@ -1844,9 +1894,7 @@ class TestAsymmetricLaplace(BaseTestDistributionRandom):
         return draws
 
     def seeded_asymmetriclaplace_rng_fn(self):
-        uniform_rng_fct = ft.partial(
-            getattr(np.random.RandomState, "uniform"), self.get_random_state()
-        )
+        uniform_rng_fct = self.get_random_state().uniform
         return ft.partial(self.asymmetriclaplace_rng_fn, uniform_rng_fct=uniform_rng_fct)
 
     pymc_dist = pm.AsymmetricLaplace
@@ -1880,12 +1928,8 @@ class TestExGaussian(BaseTestDistributionRandom):
         return normal_rng_fct(mu, sigma, size=size) + exponential_rng_fct(scale=nu, size=size)
 
     def seeded_exgaussian_rng_fn(self):
-        normal_rng_fct = ft.partial(
-            getattr(np.random.RandomState, "normal"), self.get_random_state()
-        )
-        exponential_rng_fct = ft.partial(
-            getattr(np.random.RandomState, "exponential"), self.get_random_state()
-        )
+        normal_rng_fct = self.get_random_state().normal
+        exponential_rng_fct = self.get_random_state().exponential
         return ft.partial(
             self.exgaussian_rng_fn,
             normal_rng_fct=normal_rng_fct,
@@ -1913,7 +1957,7 @@ class TestGumbel(BaseTestDistributionRandom):
     reference_dist = seeded_scipy_distribution_builder("gumbel_r")
     checks_to_run = [
         "check_pymc_params_match_rv_op",
-        "check_pymc_draws_match_reference",
+        "check_pymc_draws_match_reference_not_numba",
     ]
 
 
@@ -1938,7 +1982,7 @@ class TestHalfStudentT(BaseTestDistributionRandom):
     pymc_dist_params = {"nu": 5.0, "sigma": 2.0}
     expected_rv_op_params = {"nu": 5.0, "sigma": 2.0}
     reference_dist_params = {"df": 5.0, "loc": 0, "scale": 2.0}
-    reference_dist = lambda self: ft.partial(self.halfstudentt_rng_fn, rng=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(self.halfstudentt_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -1977,9 +2021,7 @@ class TestKumaraswamy(BaseTestDistributionRandom):
         return (1 - (1 - uniform_rng_fct(size=size)) ** (1 / b)) ** (1 / a)
 
     def seeded_kumaraswamy_rng_fn(self):
-        uniform_rng_fct = ft.partial(
-            getattr(np.random.RandomState, "uniform"), self.get_random_state()
-        )
+        uniform_rng_fct = self.get_random_state().uniform
         return ft.partial(self.kumaraswamy_rng_fn, uniform_rng_fct=uniform_rng_fct)
 
     pymc_dist = pm.Kumaraswamy
@@ -2049,7 +2091,7 @@ class TestTruncatedNormalUpperTau(BaseTestDistributionRandom):
 class TestTruncatedNormalUpperArray(BaseTestDistributionRandom):
     pymc_dist = pm.TruncatedNormal
     lower, upper, mu, tau = (
-        np.array([-np.inf, -np.inf]),
+        np.array([-np.inf]),
         np.array([3, 2]),
         np.array([0, 0]),
         np.array(
@@ -2174,7 +2216,7 @@ class TestLogitNormal(BaseTestDistributionRandom):
     pymc_dist_params = {"mu": 5.0, "sigma": 10.0}
     expected_rv_op_params = {"mu": 5.0, "sigma": 10.0}
     reference_dist_params = {"loc": 5.0, "scale": 10.0}
-    reference_dist = lambda self: ft.partial(self.logit_normal_rng_fn, rng=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(self.logit_normal_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -2245,7 +2287,7 @@ class TestBeta(BaseTestDistributionRandom):
     expected_rv_op_params = {"alpha": 2.0, "beta": 5.0}
     reference_dist_params = {"a": 2.0, "b": 5.0}
     size = 15
-    reference_dist = lambda self: ft.partial(clipped_beta_rvs, random_state=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(clipped_beta_rvs, random_state=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -2282,7 +2324,19 @@ class TestExponential(BaseTestDistributionRandom):
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
+        "check_both_lam_scale_raises",
+        "check_default_scale",
     ]
+
+    def check_both_lam_scale_raises(self):
+        msg = "Incompatible parametrization. Can't specify both lam and scale"
+        with pytest.raises(ValueError, match=msg):
+            pm.Exponential.dist(lam=0.5, scale=5)
+
+    def check_default_scale(self):
+        rv = self.pymc_dist.dist()
+        [scale] = rv.owner.op.dist_params(rv.owner)
+        assert scale.data == 1.0
 
 
 class TestExponentialScale(BaseTestDistributionRandom):
@@ -2300,19 +2354,22 @@ class TestCauchy(BaseTestDistributionRandom):
     reference_dist = seeded_scipy_distribution_builder("cauchy")
     checks_to_run = [
         "check_pymc_params_match_rv_op",
-        "check_pymc_draws_match_reference",
+        "check_pymc_draws_match_reference_not_numba",
     ]
 
 
 class TestHalfCauchy(BaseTestDistributionRandom):
+    def halfcauchy_rng_fn(self, scale, size, rng):
+        return np.abs(st.cauchy.rvs(scale=scale, size=size, random_state=rng))
+
     pymc_dist = pm.HalfCauchy
     pymc_dist_params = {"beta": 5.0}
-    expected_rv_op_params = {"alpha": 0.0, "beta": 5.0}
-    reference_dist_params = {"loc": 0.0, "scale": 5.0}
-    reference_dist = seeded_scipy_distribution_builder("halfcauchy")
+    expected_rv_op_params = {"beta": 5.0}
+    reference_dist_params = {"scale": 5.0}
+    reference_dist = lambda self: ft.partial(self.halfcauchy_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_params_match_rv_op",
-        "check_pymc_draws_match_reference",
+        "check_pymc_draws_match_reference_not_numba",
     ]
 
 
@@ -2343,10 +2400,8 @@ class TestInverseGamma(BaseTestDistributionRandom):
     pymc_dist_params = {"alpha": 2.0, "beta": 5.0}
     expected_rv_op_params = {"alpha": 2.0, "beta": 5.0}
     reference_dist_params = {"a": 2.0, "scale": 5.0}
-    reference_dist = seeded_scipy_distribution_builder("invgamma")
     checks_to_run = [
         "check_pymc_params_match_rv_op",
-        "check_pymc_draws_match_reference",
     ]
 
 
@@ -2416,9 +2471,7 @@ class TestWeibull(BaseTestDistributionRandom):
         return beta * std_weibull_rng_fct(alpha, size=size)
 
     def seeded_weibul_rng_fn(self):
-        std_weibull_rng_fct = ft.partial(
-            getattr(np.random.RandomState, "weibull"), self.get_random_state()
-        )
+        std_weibull_rng_fct = self.get_random_state().weibull
         return ft.partial(self.weibull_rng_fn, std_weibull_rng_fct=std_weibull_rng_fct)
 
     pymc_dist = pm.Weibull
@@ -2447,13 +2500,15 @@ class TestWeibull(BaseTestDistributionRandom):
 )
 class TestPolyaGamma(BaseTestDistributionRandom):
     def polyagamma_rng_fn(self, size, h, z, rng):
-        return random_polyagamma(h, z, size=size, random_state=rng._bit_generator)
+        # Polyagamma returns different values if inputs have explicit broadcasted dims
+        # Which PyTensor RVs always do when size is not None.
+        return random_polyagamma(np.atleast_1d(h), np.atleast_1d(z), size=size, random_state=rng)
 
     pymc_dist = pm.PolyaGamma
     pymc_dist_params = {"h": 1.0, "z": 0.0}
     expected_rv_op_params = {"h": 1.0, "z": 0.0}
     reference_dist_params = {"h": 1.0, "z": 0.0}
-    reference_dist = lambda self: ft.partial(self.polyagamma_rng_fn, rng=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(self.polyagamma_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -2474,7 +2529,7 @@ class TestInterpolated(BaseTestDistributionRandom):
     pymc_dist_params = {"x_points": x_points, "pdf_points": pdf_points}
     reference_dist_params = {"mu": mu, "sigma": sigma}
 
-    reference_dist = lambda self: ft.partial(self.interpolated_rng_fn, rng=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(self.interpolated_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_rv_size",
         "check_draws",

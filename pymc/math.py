@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,28 +12,35 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-import sys
 import warnings
 
 from functools import partial, reduce
 
 import numpy as np
 import pytensor
-import pytensor.sparse
 import pytensor.tensor as pt
-import pytensor.tensor.slinalg
 
 from pytensor.graph.basic import Apply
 from pytensor.graph.op import Op
 from pytensor.tensor import (
     abs,
+    all,
     and_,
+    any,
+    arange,
     arccos,
     arccosh,
     arcsin,
     arcsinh,
     arctan,
+    arctan2,
     arctanh,
+    argmax,
+    argmin,
+    argsort,
+    as_tensor,
+    betainc,
+    broadcast_arrays,
     broadcast_to,
     ceil,
     clip,
@@ -43,6 +50,9 @@ from pytensor.tensor import (
     cosh,
     cumprod,
     cumsum,
+    diag,
+    diff,
+    digamma,
     dot,
     eq,
     erf,
@@ -50,15 +60,30 @@ from pytensor.tensor import (
     erfcinv,
     erfinv,
     exp,
+    expand_dims,
+    expm1,
+    eye,
     flatten,
     floor,
     full,
     full_like,
+    gamma,
+    gammainc,
+    gammaincc,
+    gammaln,
     ge,
     gt,
+    i0,
+    i1,
+    iv,
+    kv,
     le,
+    linspace,
     log,
+    log1p,
     log1pexp,
+    log2,
+    log10,
     logaddexp,
     logsumexp,
     lt,
@@ -68,44 +93,86 @@ from pytensor.tensor import (
     mean,
     min,
     minimum,
+    moveaxis,
     neq,
     ones,
     ones_like,
     or_,
+    polygamma,
     prod,
+    repeat,
+    reshape,
     round,
     sgn,
     sigmoid,
     sin,
     sinh,
+    softplus,
+    sort,
     sqr,
     sqrt,
+    squeeze,
     stack,
+    std,
     sum,
+    swapaxes,
     switch,
+    take,
     tan,
     tanh,
+    tile,
+    trace,
+    transpose,
+    tril,
+    triu,
+    unique,
+    var,
     where,
     zeros,
     zeros_like,
 )
-from pytensor.tensor.linalg import solve_triangular
-from pytensor.tensor.nlinalg import matrix_inverse
+from pytensor.tensor.linalg import (
+    block_diag,
+    cho_solve,
+    cholesky,
+    det,
+    eigh,
+    norm,
+    slogdet,
+    solve,
+    solve_triangular,
+)
+from pytensor.tensor.linalg import inv as matrix_inverse
 from pytensor.tensor.special import log_softmax, softmax
 
 from pymc.pytensorf import floatX
 
 __all__ = [
     "abs",
+    "all",
     "and_",
+    "any",
+    "arange",
     "arccos",
     "arccosh",
     "arcsin",
     "arcsinh",
     "arctan",
+    "arctan2",
     "arctanh",
+    "argmax",
+    "argmin",
+    "argsort",
+    "as_tensor",
+    "batched_diag",
+    "betainc",
+    "block_diag",
+    "broadcast_arrays",
     "broadcast_to",
+    "cartesian",
     "ceil",
+    "cho_solve",
+    "cholesky",
     "clip",
     "concatenate",
     "constant",
@@ -113,79 +180,121 @@ __all__ = [
     "cosh",
     "cumprod",
     "cumsum",
+    "det",
+    "diag",
+    "diff",
+    "digamma",
     "dot",
+    "eigh",
     "eq",
     "erf",
     "erfc",
     "erfcinv",
     "erfinv",
     "exp",
+    "expand_dims",
+    "expand_packed_triangular",
+    "expm1",
+    "eye",
+    "flat_outer",
+    "flatten",
+    "flatten_list",
+    "floor",
     "full",
     "full_like",
-    "flatten",
-    "floor",
+    "gamma",
+    "gammainc",
+    "gammaincc",
+    "gammaln",
     "ge",
     "gt",
+    "i0",
+    "i1",
+    "invlogit",
+    "invprobit",
+    "iv",
+    "kron",
+    "kron_diag",
+    "kron_dot",
+    "kron_solve_lower",
+    "kron_solve_upper",
+    "kronecker",
+    "kv",
     "le",
+    "linspace",
     "log",
+    "log1mexp",
+    "log1p",
     "log1pexp",
+    "log2",
+    "log10",
+    "log_softmax",
     "logaddexp",
+    "logbern",
+    "logdet",
+    "logdiffexp",
+    "logit",
     "logsumexp",
     "lt",
     "matmul",
+    "matrix_inverse",
     "max",
     "maximum",
     "mean",
     "min",
     "minimum",
+    "moveaxis",
     "neq",
+    "norm",
     "ones",
     "ones_like",
     "or_",
+    "polygamma",
+    "probit",
     "prod",
+    "repeat",
+    "reshape",
     "round",
     "sgn",
     "sigmoid",
     "sin",
     "sinh",
+    "slogdet",
+    "softmax",
+    "softplus",
+    "solve",
+    "solve_triangular",
+    "sort",
     "sqr",
     "sqrt",
+    "squeeze",
     "stack",
+    "std",
     "sum",
+    "swapaxes",
     "switch",
+    "take",
     "tan",
     "tanh",
+    "tile",
+    "trace",
+    "transpose",
+    "tril",
+    "triu",
+    "unique",
+    "var",
     "where",
     "zeros",
     "zeros_like",
-    "kronecker",
-    "cartesian",
-    "kron_dot",
-    "kron_solve_lower",
-    "kron_solve_upper",
-    "kron_diag",
-    "flat_outer",
-    "logdiffexp",
-    "invlogit",
-    "softmax",
-    "log_softmax",
-    "logbern",
-    "logit",
-    "log1mexp",
-    "flatten_list",
-    "logdet",
-    "probit",
-    "invprobit",
-    "expand_packed_triangular",
-    "batched_diag",
-    "block_diagonal",
-    "round",
 ]
+
+from pymc.util import UNSET
 
 
 def kronecker(*Ks):
-    r"""Return the Kronecker product of arguments:
-          :math:`K_1 \otimes K_2 \otimes ... \otimes K_D`
+    r"""Return the Kronecker product of arguments.
+
+    math:`K_1 \otimes K_2 \otimes ... \otimes K_D`
 
     Parameters
     ----------
@@ -197,11 +306,14 @@ def kronecker(*Ks):
     np.ndarray :
         Block matrix Kroncker product of the argument matrices.
     """
-    return reduce(pt.slinalg.kron, Ks)
+    return reduce(pt.linalg.kron, Ks)
+
+
+kron = kronecker
 
 
 def cartesian(*arrays):
-    """Makes the Cartesian product of arrays.
+    """Make the Cartesian product of arrays.
 
     Parameters
     ----------
@@ -219,7 +331,7 @@ def cartesian(*arrays):
 
 
 def kron_matrix_op(krons, m, op):
-    r"""Apply op to krons and m in a way that reproduces ``op(kronecker(*krons), m)``
+    r"""Apply op to krons and m in a way that reproduces ``op(kronecker(*krons), m)``.
 
     Parameters
     ----------
@@ -264,7 +376,7 @@ def flat_outer(a, b):
 
 
 def kron_diag(*diags):
-    """Returns diagonal of a kronecker product.
+    """Return diagonal of a kronecker product.
 
     Parameters
     ----------
@@ -275,34 +387,29 @@ def kron_diag(*diags):
 
 
 def logdiffexp(a, b):
-    """log(exp(a) - exp(b))"""
-    return a + pt.log1mexp(b - a)
-
-
-def logdiffexp_numpy(a, b):
-    """log(exp(a) - exp(b))"""
-    warnings.warn(
-        "pymc.math.logdiffexp_numpy is being deprecated.",
-        FutureWarning,
-        stacklevel=2,
+    """Return log(exp(a) - exp(b))."""
+    # Handle cases of -inf, -inf safely
+    return pt.switch(
+        pt.isneginf(b),
+        a,
+        a + pt.log1mexp(b - a),
     )
-    return a + log1mexp_numpy(b - a, negative_input=True)
 
 
 invlogit = sigmoid
 
 
-def logbern(log_p):
+def logbern(log_p, rng=None):
     if np.isnan(log_p):
         raise FloatingPointError("log_p can't be nan.")
-    return np.log(np.random.uniform()) < log_p
+    return np.log((rng or np.random).uniform()) < log_p
 
 
 def logit(p):
     return pt.log(p / (floatX(1) - p))
 
 
-def log1mexp(x, *, negative_input=False):
+def log1mexp(x, *, negative_input=UNSET):
     r"""Return log(1 - exp(-x)).
 
     This function is numerically more stable than the naive approach.
@@ -316,89 +423,27 @@ def log1mexp(x, *, negative_input=False):
        "Accurately computing `\log(1-\exp(- \mid a \mid))` Assessed by the Rmpfr package"
 
     """
-    if not negative_input:
-        warnings.warn(
-            "pymc.math.log1mexp will expect a negative input in a future "
-            "version of PyMC.\n To suppress this warning set `negative_input=True`",
-            FutureWarning,
-            stacklevel=2,
-        )
-        x = -x
+    if negative_input is not UNSET:
+        if not negative_input:
+            raise ValueError(
+                "log1mexp with negative_input=False is no longer supported. Negate the input yourself before calling the function."
+            )
+        else:
+            warnings.warn(
+                "log1mexp with negative_input=True is now the default behavior. Specifying will fail in a future release of PyMC. Simply omit it",
+                FutureWarning,
+            )
 
     return pt.log1mexp(x)
-
-
-def log1mexp_numpy(x, *, negative_input=False):
-    """Return log(1 - exp(x)).
-    This function is numerically more stable than the naive approach.
-    For details, see
-    https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
-    """
-    warnings.warn(
-        "pymc.math.log1mexp_numpy is being deprecated.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    x = np.asarray(x, dtype="float")
-
-    if not negative_input:
-        warnings.warn(
-            "pymc.math.log1mexp_numpy will expect a negative input in a future "
-            "version of PyMC.\n To suppress this warning set `negative_input=True`",
-            FutureWarning,
-            stacklevel=2,
-        )
-        x = -x
-
-    out = np.empty_like(x)
-    mask = x < -0.6931471805599453  # log(1/2)
-    out[mask] = np.log1p(-np.exp(x[mask]))
-    mask = ~mask
-    out[mask] = np.log(-np.expm1(x[mask]))
-    return out
 
 
 def flatten_list(tensors):
     return pt.concatenate([var.ravel() for var in tensors])
 
 
-class LogDet(Op):
-    r"""Compute the logarithm of the absolute determinant of a square
-    matrix M, log(abs(det(M))) on the CPU. Avoids det(M) overflow/
-    underflow.
-
-    Notes
-    -----
-    Once PR #3959 (https://github.com/Theano/Theano/pull/3959/) by harpone is merged,
-    this must be removed.
-    """
-
-    def make_node(self, x):
-        x = pytensor.tensor.as_tensor_variable(x)
-        o = pytensor.tensor.scalar(dtype=x.dtype)
-        return Apply(self, [x], [o])
-
-    def perform(self, node, inputs, outputs, params=None):
-        try:
-            (x,) = inputs
-            (z,) = outputs
-            s = np.linalg.svd(x, compute_uv=False)
-            log_det = np.sum(np.log(np.abs(s)))
-            z[0] = np.asarray(log_det, dtype=x.dtype)
-        except Exception:
-            print(f"Failed to compute logdet of {x}.", file=sys.stdout)
-            raise
-
-    def grad(self, inputs, g_outputs):
-        [gz] = g_outputs
-        [x] = inputs
-        return [gz * matrix_inverse(x).T]
-
-    def __str__(self):
-        return "LogDet"
-
-
-logdet = LogDet()
+def logdet(x):
+    r"""Compute the logarithm of the absolute determinant of a square matrix M, log(abs(det(M)))."""
+    return slogdet(x)[1]
 
 
 def probit(p):
@@ -460,9 +505,7 @@ def expand_packed_triangular(n, packed, lower=True, diagonal_only=False):
 
 
 class BatchedDiag(Op):
-    """
-    Fast BatchedDiag allocation
-    """
+    """Fast BatchedDiag allocation."""
 
     __props__ = ()
 
@@ -490,7 +533,7 @@ class BatchedDiag(Op):
         idx = pt.arange(gz.shape[-1])
         return [gz[..., idx, idx]]
 
-    def infer_shape(self, fgraph, nodes, shapes):
+    def infer_shape(self, nodes, shapes):
         return [(shapes[0][0],) + (shapes[0][1],) * 2]
 
 
@@ -506,30 +549,3 @@ def batched_diag(C):
         return C[..., idx, idx]
     else:
         raise ValueError("Input should be 2 or 3 dimensional")
-
-
-def block_diagonal(matrices, sparse=False, format="csr"):
-    r"""See pt.slinalg.block_diag or
-    pytensor.sparse.basic.block_diag for reference
-
-    Parameters
-    ----------
-    matrices: tensors
-    format: str (default 'csr')
-        must be one of: 'csr', 'csc'
-    sparse: bool (default False)
-        if True return sparse format
-
-    Returns
-    -------
-    matrix
-    """
-    warnings.warn(
-        "pymc.math.block_diagonal is deprecated in favor of `pytensor.tensor.linalg.block_diag` and `pytensor.sparse.block_diag` functions. This function will be removed in a future release",
-    )
-    if len(matrices) == 1:  # graph optimization
-        return matrices[0]
-    if sparse:
-        return pytensor.sparse.basic.block_diag(*matrices, format=format)
-    else:
-        return pt.slinalg.block_diag(*matrices)

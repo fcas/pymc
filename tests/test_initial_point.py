@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,16 +13,16 @@
 #   limitations under the License.
 import cloudpickle
 import numpy as np
-import numpy.testing as npt
 import pytensor
 import pytensor.tensor as pt
 import pytest
 
+from pytensor.compile.builders import OpFromGraph
 from pytensor.tensor.random.op import RandomVariable
 
 import pymc as pm
 
-from pymc.distributions.distribution import support_point
+from pymc.distributions.distribution import _support_point, support_point
 from pymc.initial_point import make_initial_point_fn, make_initial_point_fns_per_chain
 
 
@@ -34,39 +34,11 @@ def transform_back(rv, transformed, model) -> np.ndarray:
     return model.rvs_to_transforms[rv].backward(transformed, *rv.owner.inputs).eval()
 
 
-class TestInitvalAssignment:
-    def test_dist_warnings_and_errors(self):
-        with pytest.warns(FutureWarning, match="argument is deprecated and has no effect"):
-            rv = pm.Exponential.dist(lam=1, testval=0.5)
-        assert not hasattr(rv.tag, "test_value")
-
-        with pytest.raises(TypeError, match="Unexpected keyword argument `initval`."):
-            pm.Normal.dist(1, 2, initval=None)
-        pass
-
-    def test_new_warnings(self):
-        with pm.Model() as pmodel:
-            with pytest.warns(FutureWarning, match="`testval` argument is deprecated"):
-                rv = pm.Uniform("u", 0, 1, testval=0.75)
-                initial_point = pmodel.initial_point(random_seed=0)
-                npt.assert_allclose(
-                    initial_point["u_interval__"], transform_fwd(rv, 0.75, model=pmodel)
-                )
-                assert not hasattr(rv.tag, "test_value")
-        pass
-
-    def test_valid_string_strategy(self):
-        with pm.Model() as pmodel:
-            pm.Uniform("x", 0, 1, size=2, initval="unknown")
-            with pytest.raises(ValueError, match="Invalid string strategy: unknown"):
-                pmodel.initial_point(random_seed=0)
-
-
 class TestInitvalEvaluation:
     def test_make_initial_point_fns_per_chain_checks_kwargs(self):
         with pm.Model() as pmodel:
             A = pm.Uniform("A", 0, 1, initval=0.5)
-            B = pm.Uniform("B", lower=A, upper=1.5, transform=None, initval="support_point")
+            B = pm.Uniform("B", lower=A, upper=1.5, default_transform=None, initval="support_point")
         with pytest.raises(ValueError, match="Number of initval dicts"):
             make_initial_point_fns_per_chain(
                 model=pmodel,
@@ -76,23 +48,37 @@ class TestInitvalEvaluation:
             )
         pass
 
-    def test_dependent_initvals(self):
+    @pytest.mark.parametrize("reverse_rvs", [False, True])
+    def test_dependent_initvals(self, reverse_rvs):
         with pm.Model() as pmodel:
             L = pm.Uniform("L", 0, 1, initval=0.5)
             U = pm.Uniform("U", lower=9, upper=10, initval=9.5)
             B1 = pm.Uniform("B1", lower=L, upper=U, initval=5)
-            B2 = pm.Uniform("B2", lower=L, upper=U, initval=(L + U) / 2)
+            B2 = pm.Uniform("B2", lower=L, upper=U, initval=(0.5 + 9.5) / 2)
+
+            if reverse_rvs:
+                pmodel.free_RVs = pmodel.free_RVs[::-1]
+
             ip = pmodel.initial_point(random_seed=0)
             assert ip["L_interval__"] == 0
             assert ip["U_interval__"] == 0
             assert ip["B1_interval__"] == 0
             assert ip["B2_interval__"] == 0
 
-            # Modify initval of L and re-evaluate
-            pmodel.rvs_to_initial_values[U] = 9.9
+            # Modify initval of U (through the public API) and re-evaluate
+            pmodel.set_initval(U, 9.9)
             ip = pmodel.initial_point(random_seed=0)
             assert ip["B1_interval__"] < 0
-            assert ip["B2_interval__"] == 0
+            assert ip["B2_interval__"] < 0
+
+    def test_symbolic_initval_not_supported(self):
+        with pm.Model() as pmodel:
+            L = pm.Uniform("L", 0, 1, initval=0.5)
+            U = pm.Uniform("U", lower=L, upper=1.5, initval=L * 2)
+            with pytest.raises(
+                ValueError, match="Initial value of U depends on other random variables"
+            ):
+                pmodel.initial_point(random_seed=0)
         pass
 
     def test_nested_initvals(self):
@@ -216,6 +202,40 @@ class TestInitvalEvaluation:
         assert np.isclose(iv["B_log__"], 0)
         assert iv["C_log__"] == 0
 
+    @pytest.mark.parametrize("reverse_rvs", [False, True])
+    def test_dependent_initval_from_OFG(self, reverse_rvs):
+        class MyTestOp(OpFromGraph):
+            pass
+
+        @_support_point.register(MyTestOp)
+        def my_test_op_support_point(op, out):
+            out1, out2 = out.owner.outputs
+            if out is out1:
+                return out1
+            else:
+                return out1 * 4
+
+        out1 = pt.zeros(())
+        out2 = out1 * 2
+        rv_op = MyTestOp([], [out1, out2])
+
+        with pm.Model() as model:
+            A, B = rv_op()
+            if reverse_rvs:
+                model.register_rv(B, "B")
+                model.register_rv(A, "A")
+            else:
+                model.register_rv(A, "A")
+                model.register_rv(B, "B")
+
+        assert model.initial_point() == {"A": 0, "B": 0}
+
+        model.set_initval(A, 1)
+        assert model.initial_point() == {"A": 1, "B": 4}
+
+        model.set_initval(B, 3)
+        assert model.initial_point() == {"A": 1, "B": 3}
+
 
 class TestSupportPoint:
     def test_basic(self):
@@ -263,8 +283,7 @@ class TestSupportPoint:
     def test_support_point_not_implemented_fallback(self):
         class MyNormalRV(RandomVariable):
             name = "my_normal"
-            ndim_supp = 0
-            ndims_params = [0, 0]
+            signature = "(),()->()"
             dtype = "floatX"
 
             @classmethod
@@ -278,20 +297,11 @@ class TestSupportPoint:
             x = MyNormalDistribution("x", 0, 1, initval="support_point")
 
         with pytest.warns(
-            UserWarning, match="Moment not defined for variable x of type MyNormalRV"
+            UserWarning, match="Support point not defined for variable x of type MyNormalRV"
         ):
             res = m.initial_point()
 
         assert np.isclose(res["x"], np.pi)
-
-    def test_future_warning_moment(self):
-        with pm.Model() as m:
-            pm.Normal("x", initval="moment")
-            with pytest.warns(
-                FutureWarning,
-                match="The 'moment' strategy is deprecated. Use 'support_point' instead.",
-            ):
-                ip = m.initial_point(random_seed=42)
 
 
 def test_pickling_issue_5090():

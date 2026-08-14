@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -29,10 +29,11 @@ from pytensor.tensor import TensorVariable
 
 import pymc as pm
 
-from pymc.distributions.discrete import _OrderedLogistic, _OrderedProbit
+from pymc.distributions.discrete import OrderedLogistic, OrderedProbit
+from pymc.exceptions import ImputationWarning
 from pymc.logprob.basic import icdf, logcdf, logp
 from pymc.logprob.utils import ParameterValueError
-from pymc.pytensorf import floatX
+from pymc.pytensorf import floatX, rewrite_pregrad
 from pymc.testing import (
     BaseTestDistributionRandom,
     Bool,
@@ -316,6 +317,11 @@ class TestMatchesScipy:
             Bool,
             {"p": Unit},
         )
+        check_icdf(
+            pm.Bernoulli,
+            {"p": Unit},
+            st.bernoulli.ppf,
+        )
 
     def test_bernoulli_wrong_arguments(self):
         m = pm.Model()
@@ -366,21 +372,65 @@ class TestMatchesScipy:
 
     @pytest.mark.parametrize("n", [2, 3, 4])
     def test_categorical(self, n):
+        domain = Domain(range(n), dtype="int64", edges=(0, n))
+        paramdomains = {"p": Simplex(n)}
+
         check_logp(
             pm.Categorical,
-            Domain(range(n), dtype="int64", edges=(0, n)),
-            {"p": Simplex(n)},
+            domain,
+            paramdomains,
             lambda value, p: categorical_logpdf(value, p),
         )
 
-    @pytensor.config.change_flags(compute_test_value="raise")
+        check_selfconsistency_discrete_logcdf(
+            pm.Categorical,
+            domain,
+            paramdomains,
+        )
+
+    @pytest.mark.parametrize("method", (logp, logcdf), ids=lambda x: x.__name__)
+    def test_categorical_logp_batch_dims(self, method):
+        # Core case
+        p = np.array([0.2, 0.3, 0.5])
+        value = np.array(2.0)
+        expr = method(pm.Categorical.dist(p=p, shape=value.shape), value)
+        assert expr.type.ndim == 0
+        expected_p = 0.5 if method is logp else 1.0
+        np.testing.assert_allclose(expr.exp().eval(), expected_p)
+
+        # Explicit batched value broadcasts p
+        bcast_p = p[None]  # shape (1, 3)
+        batch_value = np.array([0, 1])  # shape(3,)
+        expr = method(pm.Categorical.dist(p=bcast_p, shape=batch_value.shape), batch_value)
+        assert expr.type.ndim == 1
+        expected_p = [0.2, 0.3] if method is logp else [0.2, 0.5]
+        np.testing.assert_allclose(expr.exp().eval(), expected_p)
+
+        # Implicit batch value broadcasts p
+        expr = method(pm.Categorical.dist(p=p, shape=()), batch_value)
+        assert expr.type.ndim == 1
+        expected_p = [0.2, 0.3] if method is logp else [0.2, 0.5]
+        np.testing.assert_allclose(expr.exp().eval(), expected_p)
+
+        # Explicit batched value and batched p
+        batch_p = np.array([p[::-1], p])
+        expr = method(pm.Categorical.dist(p=batch_p, shape=batch_value.shape), batch_value)
+        assert expr.type.ndim == 1
+        expected_p = [0.5, 0.3] if method is logp else [0.5, 0.5]
+        np.testing.assert_allclose(expr.exp().eval(), expected_p)
+
+        # Implicit batch p broadcasts value
+        expr = method(pm.Categorical.dist(p=batch_p, shape=None), value)
+        assert expr.type.ndim == 1
+        expected_p = [0.2, 0.5] if method is logp else [1.0, 1.0]
+        np.testing.assert_allclose(expr.exp().eval(), expected_p)
+
     def test_categorical_bounds(self):
         with pm.Model():
             x = pm.Categorical("x", p=np.array([0.2, 0.3, 0.5]))
             assert np.isinf(logp(x, -1).eval())
             assert np.isinf(logp(x, 3).eval())
 
-    @pytensor.config.change_flags(compute_test_value="raise")
     @pytest.mark.parametrize(
         "p",
         [
@@ -406,7 +456,7 @@ class TestMatchesScipy:
         with pytest.warns(UserWarning, match="They will be automatically rescaled"):
             with pm.Model() as m:
                 x = pm.Categorical("x", p=[1, 1, 1, 1, 1])
-        assert np.isclose(m.x.owner.inputs[3].sum().eval(), 1.0)
+        assert np.isclose(m.x.owner.inputs[-1].sum().eval(), 1.0)
 
     def test_categorical_negative_p_symbolic(self):
         value = np.array([[1, 1, 1]])
@@ -451,7 +501,7 @@ class TestMatchesScipy:
 
 
 # TODO: Is this test working as expected / still relevant?
-@pytest.mark.parametrize("shape", [tuple(), (1,), (3, 1), (3, 2)], ids=str)
+@pytest.mark.parametrize("shape", [(), (1,), (3, 1), (3, 2)], ids=str)
 def test_orderedlogistic_dimensions(shape):
     # Test for issue #3535
     loge = np.log10(np.exp(1))
@@ -475,30 +525,10 @@ def test_orderedlogistic_dimensions(shape):
     clogp = pm.logp(c, np.ones_like(obs)).sum().eval() * loge
     expected = -np.prod((size, *shape))
 
-    assert c.owner.inputs[3].ndim == (len(shape) + 1)
+    assert c.owner.inputs[-1].type.shape == (1, *shape, 10)
     assert np.allclose(clogp, expected)
-    assert ol.owner.inputs[3].ndim == (len(shape) + 1)
+    assert ol.owner.inputs[-1].type.shape == (1, *shape, 10)
     assert np.allclose(ologp, expected)
-
-
-def test_ordered_logistic_probs():
-    with pm.Model() as m:
-        pm.OrderedLogistic("ol_p", cutpoints=np.array([-2, 0, 2]), eta=0)
-        pm.OrderedLogistic("ol_no_p", cutpoints=np.array([-2, 0, 2]), eta=0, compute_p=False)
-    assert len(m.deterministics) == 1
-
-    x = pm.OrderedLogistic.dist(cutpoints=np.array([-2, 0, 2]), eta=0)
-    assert isinstance(x, TensorVariable)
-
-
-def test_ordered_probit_probs():
-    with pm.Model() as m:
-        pm.OrderedProbit("op_p", cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1)
-        pm.OrderedProbit("op_no_p", cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1, compute_p=False)
-    assert len(m.deterministics) == 1
-
-    x = pm.OrderedProbit.dist(cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1)
-    assert isinstance(x, TensorVariable)
 
 
 class TestMoments:
@@ -673,9 +703,7 @@ class TestDiscreteWeibull(BaseTestDistributionRandom):
         return np.ceil(np.power(np.log(1 - uniform_rng_fct(size=size)) / np.log(q), 1.0 / beta)) - 1
 
     def seeded_discrete_weibul_rng_fn(self):
-        uniform_rng_fct = ft.partial(
-            getattr(np.random.RandomState, "uniform"), self.get_random_state()
-        )
+        uniform_rng_fct = self.get_random_state().uniform
         return ft.partial(self.discrete_weibul_rng_fn, uniform_rng_fct=uniform_rng_fct)
 
     pymc_dist = pm.DiscreteWeibull
@@ -723,6 +751,66 @@ class TestNegativeBinomial(BaseTestDistributionRandom):
     checks_to_run = ["check_pymc_params_match_rv_op"]
 
 
+def test_negative_binomial_logp_stable_when_p_underflows():
+    """log(p) and log(1 - p) are rewritten into softplus, so the logp stays finite."""
+    a = pt.dscalar("a")
+    logp_expr = pm.logp(pm.NegativeBinomial.dist(n=2.0, p=pt.sigmoid(a)), 3)
+
+    np.testing.assert_allclose(logp_expr.eval({a: -800.0}), -1598.6137056388802)
+    np.testing.assert_allclose(logp_expr.eval({a: 37.0}), -109.6137056388801)
+    np.testing.assert_allclose(logp_expr.eval({a: 5000.0}), -14998.61370563888)
+
+
+def test_negative_binomial_logp_large_n():
+    """binomln subtracts gammaln(value + n) - gammaln(n), whose difference falls below
+    their shared ulp once n is large, so the logp falls back on the Poisson(mu) limit.
+    """
+    mu, n = pt.dscalars("mu", "n")
+    logp_expr = pm.logp(pm.NegativeBinomial.dist(mu=mu, alpha=n), 3)
+
+    np.testing.assert_allclose(logp_expr.eval({mu: 5.0, n: 1e12}), -1.9634457319257537)
+    np.testing.assert_allclose(logp_expr.eval({mu: 5.0, n: 1e18}), -1.9634457319257537)
+    np.testing.assert_allclose(logp_expr.eval({mu: 5.0, n: 1e20}), -1.9634457319257537)
+
+    # a tiny mu saturates p = n / (mu + n) at 1.0, so the Poisson branch must recover
+    # log(mu) from the log-space terms for logp and dlogp to stay usable
+    a = pt.dscalar("a")
+    logp_expr = pm.logp(pm.NegativeBinomial.dist(mu=pt.exp(a), alpha=1e12), 3)
+    np.testing.assert_allclose(logp_expr.eval({a: -300.0}), -901.7917594692281)
+
+    dlogp_expr = pt.grad(rewrite_pregrad(logp_expr), a)
+    np.testing.assert_allclose(dlogp_expr.eval({a: -300.0}), 3.0)
+
+
+def test_negative_binomial_logp_stable_when_mu_overflows():
+    """get_n_p builds p = sigmoid(log(n) - log(mu)), so with mu = exp(a) the log
+    cancels and the logp reduces to softplus terms in a, keeping logp and dlogp
+    finite when exp(a) overflows.
+
+    A constant alpha and a log-transformed alpha (the shape a positive alpha RV takes
+    in the logp graph) are both checked.
+    """
+    a = pt.dscalar("a")
+    logp_expr = pm.logp(pm.NegativeBinomial.dist(mu=pt.exp(a), alpha=2.0), 3)
+
+    np.testing.assert_allclose(logp_expr.eval({a: 710.0}), -1417.2274112777604)
+    np.testing.assert_allclose(logp_expr.eval({a: 5000.0}), -9997.22741127776)
+
+    dlogp_expr = pt.grad(rewrite_pregrad(logp_expr), a)
+    np.testing.assert_allclose(dlogp_expr.eval({a: 710.0}), -2.0)
+    np.testing.assert_allclose(dlogp_expr.eval({a: 5000.0}), -2.0)
+
+    b = pt.dscalar("b")
+    logp_expr = pm.logp(pm.NegativeBinomial.dist(mu=pt.exp(a), alpha=pt.exp(b)), 3)
+
+    np.testing.assert_allclose(logp_expr.eval({a: 710.0, b: 0.7}), -1426.9536421881814)
+    np.testing.assert_allclose(logp_expr.eval({a: 5000.0, b: 0.7}), -10065.952757236526)
+
+    dlogp_expr = pt.grad(rewrite_pregrad(logp_expr), a)
+    np.testing.assert_allclose(dlogp_expr.eval({a: 710.0, b: 0.7}), -2.0137527074704766)
+    np.testing.assert_allclose(dlogp_expr.eval({a: 5000.0, b: 0.7}), -2.0137527074704766)
+
+
 class TestNegativeBinomialMuSigma(BaseTestDistributionRandom):
     pymc_dist = pm.NegativeBinomial
     pymc_dist_params = {"mu": 5.0, "alpha": 8.0}
@@ -744,7 +832,7 @@ class TestBernoulli(BaseTestDistributionRandom):
     reference_dist = seeded_scipy_distribution_builder("bernoulli")
     checks_to_run = [
         "check_pymc_params_match_rv_op",
-        "check_pymc_draws_match_reference",
+        "check_pymc_draws_match_reference_not_numba",
     ]
 
 
@@ -778,8 +866,8 @@ class TestLogitCategorical(BaseTestDistributionRandom):
     expected_rv_op_params = {
         "p": sp.softmax(np.array([[0.28, 0.62, 0.10], [0.28, 0.62, 0.10]]), axis=-1)
     }
-    sizes_to_check = [None, (), (2,), (4, 2), (1, 2)]
-    sizes_expected = [(2,), (2,), (2,), (4, 2), (1, 2)]
+    sizes_to_check = [None, (2,), (4, 2), (1, 2)]
+    sizes_expected = [(2,), (2,), (4, 2), (1, 2)]
 
     checks_to_run = [
         "check_pymc_params_match_rv_op",
@@ -843,7 +931,7 @@ class TestDiscreteUniform(BaseTestDistributionRandom):
     pymc_dist_params = {"lower": -1, "upper": 9}
     expected_rv_op_params = {"lower": -1, "upper": 9}
     reference_dist_params = {"lower": -1, "upper": 9}
-    reference_dist = lambda self: ft.partial(  # noqa E731
+    reference_dist = lambda self: ft.partial(  # noqa: E731
         self.discrete_uniform_rng_fn, rng=self.get_random_state()
     )
     checks_to_run = [
@@ -857,14 +945,12 @@ class TestDiscreteUniform(BaseTestDistributionRandom):
         assert x.eval().shape == (1,)
 
 
-class TestOrderedLogistic(BaseTestDistributionRandom):
-    pymc_dist = _OrderedLogistic
-    pymc_dist_params = {"eta": 0, "cutpoints": np.array([-2, 0, 2])}
-    expected_rv_op_params = {"p": np.array([0.11920292, 0.38079708, 0.38079708, 0.11920292])}
-    checks_to_run = [
-        "check_pymc_params_match_rv_op",
-        "check_rv_size",
-    ]
+class TestOrderedLogistic:
+    def test_expected_categorical(self):
+        categorical = OrderedLogistic.dist(eta=0, cutpoints=np.array([-2, 0, 2]))
+        p = categorical.owner.inputs[-1].eval()
+        expected_p = np.array([0.11920292, 0.38079708, 0.38079708, 0.11920292])
+        np.testing.assert_allclose(p, expected_p)
 
     @pytest.mark.parametrize(
         "eta, cutpoints, expected",
@@ -881,22 +967,43 @@ class TestOrderedLogistic(BaseTestDistributionRandom):
         """
         This test checks when providing different shapes for `eta` parameters.
         """
-        categorical = _OrderedLogistic.dist(
+        categorical = OrderedLogistic.dist(
             eta=eta,
             cutpoints=cutpoints,
         )
-        p = categorical.owner.inputs[3].eval()
-        assert p.shape == expected
+        p_shape = tuple(categorical.owner.inputs[-1].shape.eval())
+        assert p_shape == expected
+
+    def test_compute_p(self):
+        with pm.Model(coords={"test_dim": [0]}) as m:
+            pm.OrderedLogistic("ol_p", cutpoints=np.array([-2, 0, 2]), eta=0, dims="test_dim")
+            pm.OrderedLogistic(
+                "ol_no_p", cutpoints=np.array([-2, 0, 2]), eta=0, compute_p=False, dims="test_dim"
+            )
+        assert len(m.deterministics) == 1
+
+        x = pm.OrderedLogistic.dist(cutpoints=np.array([-2, 0, 2]), eta=0)
+        assert isinstance(x, TensorVariable)
+
+        # Test it works with auto-imputation
+        with pm.Model(coords={"test_dim": [0, 1, 2]}) as m:
+            with pytest.warns(ImputationWarning):
+                pm.OrderedLogistic(
+                    "ol",
+                    cutpoints=np.array([[-2, 0, 2]]),
+                    eta=0,
+                    observed=[0, np.nan, 1],
+                    dims=["test_dim"],
+                )
+        assert len(m.deterministics) == 2  # One from the auto-imputation, the other from compute_p
 
 
-class TestOrderedProbit(BaseTestDistributionRandom):
-    pymc_dist = _OrderedProbit
-    pymc_dist_params = {"eta": 0, "cutpoints": np.array([-2, 0, 2])}
-    expected_rv_op_params = {"p": np.array([0.02275013, 0.47724987, 0.47724987, 0.02275013])}
-    checks_to_run = [
-        "check_pymc_params_match_rv_op",
-        "check_rv_size",
-    ]
+class TestOrderedProbit:
+    def test_expected_categorical(self):
+        categorical = OrderedProbit.dist(eta=0, cutpoints=np.array([-2, 0, 2]))
+        p = categorical.owner.inputs[-1].eval()
+        expected_p = np.array([0.02275013, 0.47724987, 0.47724987, 0.02275013])
+        np.testing.assert_allclose(p, expected_p)
 
     @pytest.mark.parametrize(
         "eta, cutpoints, sigma, expected",
@@ -914,10 +1021,29 @@ class TestOrderedProbit(BaseTestDistributionRandom):
         """
         This test checks when providing different shapes for `eta` and `sigma` parameters.
         """
-        categorical = _OrderedProbit.dist(
+        categorical = OrderedProbit.dist(
             eta=eta,
             cutpoints=cutpoints,
             sigma=sigma,
         )
-        p = categorical.owner.inputs[3].eval()
-        assert p.shape == expected
+        p_shape = tuple(categorical.owner.inputs[-1].shape.eval())
+        assert p_shape == expected
+
+    def test_compute_p(self):
+        with pm.Model() as m:
+            pm.OrderedProbit("op_p", cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1)
+            pm.OrderedProbit(
+                "op_no_p", cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1, compute_p=False
+            )
+        assert len(m.deterministics) == 1
+
+        x = pm.OrderedProbit.dist(cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1)
+        assert isinstance(x, TensorVariable)
+
+        # Test it works with auto-imputation
+        with pm.Model() as m:
+            with pytest.warns(ImputationWarning):
+                pm.OrderedProbit(
+                    "op", cutpoints=np.array([-2, 0, 2]), eta=0, sigma=1, observed=[0, np.nan, 1]
+                )
+        assert len(m.deterministics) == 2  # One from the auto-imputation, the other from compute_p

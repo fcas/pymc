@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,7 +11,9 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+from __future__ import annotations
 
+import copy
 import functools
 import sys
 import threading
@@ -19,35 +21,31 @@ import types
 import warnings
 
 from collections.abc import Iterable, Sequence
-from sys import modules
 from typing import (
-    TYPE_CHECKING,
     Literal,
-    Optional,
-    TypeVar,
     cast,
     overload,
 )
 
 import numpy as np
 import pytensor
-import pytensor.sparse as sparse
 import pytensor.tensor as pt
-import scipy.sparse as sps
+import xarray as xr
 
-from pytensor.compile import DeepCopyOp, Function, get_mode
+from pytensor.compile import DeepCopyOp, Function, ProfileStats, get_mode, view_op
+from pytensor.compile.io import In, Out
 from pytensor.compile.sharedvalue import SharedVariable
-from pytensor.graph.basic import Constant, Variable, graph_inputs
-from pytensor.scalar import Cast
-from pytensor.tensor.elemwise import Elemwise
+from pytensor.graph.basic import Constant, Variable
+from pytensor.graph.traversal import ancestors, explicit_graph_inputs, graph_inputs
+from pytensor.tensor import as_tensor
+from pytensor.tensor.math import variadic_add
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.type import RandomType
 from pytensor.tensor.variable import TensorConstant, TensorVariable
-from typing_extensions import Self
+from pytensor.utils import lazy_scipy_module
 
 from pymc.blocking import DictToArrayBijection, RaveledVars
-from pymc.data import GenTensorVariable, is_minibatch
-from pymc.distributions.transforms import ChainedTransform, _default_transform
+from pymc.data import MinibatchOp, is_valid_observed
 from pymc.exceptions import (
     BlockModelAccessError,
     ImputationWarning,
@@ -55,173 +53,85 @@ from pymc.exceptions import (
     ShapeError,
     ShapeWarning,
 )
-from pymc.initial_point import make_initial_point_fn
+from pymc.initial_point import PointType, make_initial_point_fn
 from pymc.logprob.basic import transformed_conditional_logp
 from pymc.logprob.transforms import Transform
 from pymc.logprob.utils import ParameterValueError, replace_rvs_by_values
-from pymc.model_graph import model_to_graphviz
 from pymc.pytensorf import (
     PointFunc,
     SeedSequenceSeed,
-    compile_pymc,
+    collect_default_updates,
+    compile,
     convert_observed_data,
     gradient,
     hessian,
-    inputvars,
+    join_nonshared_inputs,
+    reseed_rngs,
+    resolve_backend_compile_kwargs,
     rewrite_pregrad,
 )
 from pymc.util import (
     UNSET,
-    VarName,
     WithMemoization,
-    _add_future_warning_tag,
+    _UnsetType,
     get_transformed_name,
     get_value_vars_from_user_vars,
     get_var_name,
+    locally_cachedmethod,
+    makeiter,
     treedict,
     treelist,
 )
 from pymc.vartypes import continuous_types, discrete_types, typefilter
 
+sparse = lazy_scipy_module("sparse")
+
 __all__ = [
-    "Model",
-    "modelcontext",
+    "BaseModel",
     "Deterministic",
-    "Potential",
-    "set_data",
+    "FrozenModel",
+    "Model",
     "Point",
+    "Potential",
     "compile_fn",
+    "modelcontext",
+    "set_data",
 ]
 
 
-T = TypeVar("T", bound="ContextMeta")
+class ModelManager(threading.local):
+    """Keeps track of currently active model contexts.
 
+    A global instance of this is created in this module on import.
+    Use that instance, `MODEL_MANAGER` to inspect current contexts.
 
-class ContextMeta(type):
-    """Functionality for objects that put themselves in a context using
-    the `with` statement.
+    It inherits from threading.local so is thread-safe, if models
+    can be entered/exited within individual threads.
     """
 
-    def __new__(cls, name, bases, dct, **kwargs):
-        """Add __enter__ and __exit__ methods to the class."""
+    def __init__(self):
+        self.active_contexts: list[BaseModel] = []
 
-        def __enter__(self):
-            self.__class__.context_class.get_contexts().append(self)
-            # self._pytensor_config is set in Model.__new__
-            self._config_context = None
-            if hasattr(self, "_pytensor_config"):
-                self._config_context = pytensor.config.change_flags(**self._pytensor_config)
-                self._config_context.__enter__()
-            return self
-
-        def __exit__(self, typ, value, traceback):
-            self.__class__.context_class.get_contexts().pop()
-            # self._pytensor_config is set in Model.__new__
-            if self._config_context:
-                self._config_context.__exit__(typ, value, traceback)
-
-        dct[__enter__.__name__] = __enter__
-        dct[__exit__.__name__] = __exit__
-
-        # We strip off keyword args, per the warning from
-        # StackExchange:
-        # DO NOT send "**kwargs" to "type.__new__".  It won't catch them and
-        # you'll get a "TypeError: type() takes 1 or 3 arguments" exception.
-        return super().__new__(cls, name, bases, dct)
-
-    # FIXME: is there a more elegant way to automatically add methods to the class that
-    # are instance methods instead of class methods?
-    def __init__(cls, name, bases, nmspc, context_class: type | None = None, **kwargs):
-        """Add ``__enter__`` and ``__exit__`` methods to the new class automatically."""
-        if context_class is not None:
-            cls._context_class = context_class
-        super().__init__(name, bases, nmspc)
-
-    def get_context(cls, error_if_none=True, allow_block_model_access=False) -> T | None:
-        """Return the most recently pushed context object of type ``cls``
-        on the stack, or ``None``. If ``error_if_none`` is True (default),
-        raise a ``TypeError`` instead of returning ``None``."""
-        try:
-            candidate: T | None = cls.get_contexts()[-1]
-        except IndexError:
-            # Calling code expects to get a TypeError if the entity
-            # is unfound, and there's too much to fix.
-            if error_if_none:
-                raise TypeError(f"No {cls} on context stack")
-            return None
-        if isinstance(candidate, BlockModelAccess) and not allow_block_model_access:
-            raise BlockModelAccessError(candidate.error_msg_on_access)
-        return candidate
-
-    def get_contexts(cls) -> list[T]:
-        """Return a stack of context instances for the ``context_class``
-        of ``cls``."""
-        # This lazily creates the context class's contexts
-        # thread-local object, as needed. This seems inelegant to me,
-        # but since the context class is not guaranteed to exist when
-        # the metaclass is being instantiated, I couldn't figure out a
-        # better way. [2019/10/11:rpg]
-
-        # no race-condition here, contexts is a thread-local object
-        # be sure not to override contexts in a subclass however!
-        context_class = cls.context_class
-        assert isinstance(
-            context_class, type
-        ), f"Name of context class, {context_class} was not resolvable to a class"
-        if not hasattr(context_class, "contexts"):
-            context_class.contexts = threading.local()
-
-        contexts = context_class.contexts
-
-        if not hasattr(contexts, "stack"):
-            contexts.stack = []
-        return contexts.stack
-
-    # the following complex property accessor is necessary because the
-    # context_class may not have been created at the point it is
-    # specified, so the context_class may be a class *name* rather
-    # than a class.
     @property
-    def context_class(cls) -> type:
-        def resolve_type(c: type | str) -> type:
-            if isinstance(c, str):
-                c = getattr(modules[cls.__module__], c)
-            if isinstance(c, type):
-                return c
-            raise ValueError(f"Cannot resolve context class {c}")
+    def current_context(self) -> BaseModel | None:
+        """Return the innermost context of any current contexts."""
+        return self.active_contexts[-1] if self.active_contexts else None
 
-        assert cls is not None
-        if isinstance(cls._context_class, str):
-            cls._context_class = resolve_type(cls._context_class)
-        if not isinstance(cls._context_class, str | type):
-            raise ValueError(
-                f"Context class for {cls.__name__}, {cls._context_class}, is not of the right type"
-            )
-        return cls._context_class
-
-    # Inherit context class from parent
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        cls.context_class = super().context_class
-
-    # Initialize object in its own context...
-    # Merged from InitContextMeta in the original.
-    def __call__(cls, *args, **kwargs):
-        # We type hint Model here so type checkers understand that Model is a context manager.
-        # This metaclass is only used for Model, so this is safe to do. See #6809 for more info.
-        instance: "Model" = cls.__new__(cls, *args, **kwargs)
-        with instance:  # appends context
-            instance.__init__(*args, **kwargs)
-        return instance
+    @property
+    def parent_context(self) -> BaseModel | None:
+        """Return the parent context to the active context, if any."""
+        return self.active_contexts[-2] if len(self.active_contexts) > 1 else None
 
 
-def modelcontext(model: Optional["Model"]) -> "Model":
-    """
-    Return the given model or, if none was supplied, try to find one in
-    the context stack.
-    """
+# MODEL_MANAGER is instantiated at import, and serves as a truth for
+# what any currently active model contexts are.
+MODEL_MANAGER = ModelManager()
+
+
+def modelcontext(model: BaseModel | None) -> BaseModel:
+    """Return the given model or, if None was supplied, try to find one in the context stack."""
     if model is None:
-        model = Model.get_context(error_if_none=False)
+        model = BaseModel.get_context(error_if_none=False)
 
         if model is None:
             # TODO: This should be a ValueError, but that breaks
@@ -231,7 +141,7 @@ def modelcontext(model: Optional["Model"]) -> "Model":
 
 
 class ValueGradFunction:
-    """Create an PyTensor function that computes a value and its gradient.
+    """Create a PyTensor function that computes a value and its gradient.
 
     Parameters
     ----------
@@ -273,6 +183,9 @@ class ValueGradFunction:
         dtype=None,
         casting="no",
         compute_grads=True,
+        model=None,
+        initial_point: PointType | None = None,
+        ravel_inputs: bool | None = None,
         **kwargs,
     ):
         if extra_vars_and_values is None:
@@ -320,9 +233,7 @@ class ValueGradFunction:
         givens = []
         self._extra_vars_shared = {}
         for var, value in extra_vars_and_values.items():
-            shared = pytensor.shared(
-                value, var.name + "_shared__", shape=[1 if s == 1 else None for s in value.shape]
-            )
+            shared = pytensor.shared(value, var.name + "_shared__", shape=value.shape)
             self._extra_vars_shared[var.name] = shared
             givens.append((var, shared))
 
@@ -332,13 +243,30 @@ class ValueGradFunction:
             grads = pytensor.grad(cost, grad_vars, disconnected_inputs="ignore")
             for grad_wrt, var in zip(grads, grad_vars):
                 grad_wrt.name = f"{var.name}_grad"
-            outputs = [cost, *grads]
+            grads = pt.join(
+                0, *[as_tensor(grad, allow_xtensor_conversion=True).ravel() for grad in grads]
+            )
+            outputs = [cost, grads]
         else:
             outputs = [cost]
 
-        inputs = grad_vars
+        if ravel_inputs:
+            if initial_point is None:
+                initial_point = modelcontext(model).initial_point()
+            outputs, raveled_grad_vars = join_nonshared_inputs(
+                point=initial_point, inputs=grad_vars, outputs=outputs, make_inputs_shared=False
+            )
+            inputs = [raveled_grad_vars]
+        else:
+            if ravel_inputs is None:
+                warnings.warn(
+                    "ValueGradFunction will become a function of raveled inputs.\n"
+                    "Specify `ravel_inputs` to suppress this warning. Note that setting `ravel_inputs=False` will be forbidden in a future release."
+                )
+            inputs = grad_vars
 
-        self._pytensor_function = compile_pymc(inputs, outputs, givens=givens, **kwargs)
+        self._pytensor_function = compile(inputs, outputs, givens=givens, **kwargs)
+        self._raveled_inputs = ravel_inputs
 
     def set_weights(self, values):
         if values.shape != (self._n_costs - 1,):
@@ -348,7 +276,7 @@ class ValueGradFunction:
     def set_extra_values(self, extra_vars):
         self._extra_are_set = True
         for var in self._extra_vars:
-            self._extra_vars_shared[var.name].set_value(extra_vars[var.name])
+            self._extra_vars_shared[var.name].set_value(extra_vars[var.name], borrow=True)
 
     def get_extra_values(self):
         if not self._extra_are_set:
@@ -356,30 +284,48 @@ class ValueGradFunction:
 
         return {var.name: self._extra_vars_shared[var.name].get_value() for var in self._extra_vars}
 
-    def __call__(self, grad_vars, grad_out=None, extra_vars=None):
+    def __call__(self, grad_vars, *, extra_vars=None):
         if extra_vars is not None:
             self.set_extra_values(extra_vars)
-
-        if not self._extra_are_set:
+        elif not self._extra_are_set:
             raise ValueError("Extra values are not set.")
 
         if isinstance(grad_vars, RaveledVars):
-            grad_vars = list(DictToArrayBijection.rmap(grad_vars).values())
-
-        cost, *grads = self._pytensor_function(*grad_vars)
-
-        if grads:
-            grads_raveled = DictToArrayBijection.map(
-                {v.name: gv for v, gv in zip(self._grad_vars, grads)}
-            )
-
-            if grad_out is None:
-                return cost, grads_raveled.data
+            if self._raveled_inputs:
+                grad_vars = (grad_vars.data,)
             else:
-                np.copyto(grad_out, grads_raveled.data)
-                return cost
-        else:
-            return cost
+                grad_vars = DictToArrayBijection.rmap(grad_vars).values()
+        elif self._raveled_inputs and not isinstance(grad_vars, Sequence):
+            grad_vars = (grad_vars,)
+
+        return self._pytensor_function(*grad_vars)
+
+    def copy(self):
+        """Return a function that reuses the compiled graph but owns its shared variables.
+
+        The shared variables holding the extra values and the cost weights are runtime state
+        of a single caller, so a shared instance cannot be handed out twice. Copying them is
+        orders of magnitude cheaper than compiling the graph again.
+        """
+        new = copy.copy(self)
+        # The static shape must be preserved, or the swapped variables won't have the type
+        # the compiled function expects.
+        new_shared = {
+            old: pytensor.shared(old.get_value(), old.name, shape=old.type.shape)
+            for old in (self._weights, *self._extra_vars_shared.values())
+        }
+        # An unused cost weight (a single cost) is not an input of the compiled function,
+        # and `Function.copy` rejects swaps for variables it doesn't have.
+        fn_inputs = {inp.variable for inp in self._pytensor_function.maker.inputs}
+        new._pytensor_function = self._pytensor_function.copy(
+            swap={old: shared for old, shared in new_shared.items() if old in fn_inputs}
+        )
+        new._weights = new_shared[self._weights]
+        new._extra_vars_shared = {
+            name: new_shared[old] for name, old in self._extra_vars_shared.items()
+        }
+        new._extra_are_set = False
+        return new
 
     @property
     def profile(self):
@@ -387,117 +333,75 @@ class ValueGradFunction:
         return self._pytensor_function.profile
 
 
-class Model(WithMemoization, metaclass=ContextMeta):
-    """Encapsulates the variables and likelihood factors of a model.
+class ContextMeta(type):
+    """A metaclass in order to apply a model's context during `Model.__init__``."""
 
-    Model class can be used for creating class based models. To create
-    a class based model you should inherit from :class:`~pymc.Model` and
-    override the `__init__` method with arbitrary definitions (do not
-    forget to call base class :meth:`pymc.Model.__init__` first).
+    # We want the Model's context to be active during __init__. In order for this
+    # to apply to subclasses of Model as well, we need to use a metaclass.
+    def __call__(cls: type[Model], *args, **kwargs):
+        instance = cls.__new__(cls, *args, **kwargs)
+        with instance:  # applies context
+            instance.__init__(*args, **kwargs)
+        return instance
 
-    Parameters
-    ----------
-    name : str
-        name that will be used as prefix for names of all random
-        variables defined within model
-    check_bounds : bool
-        Ensure that input parameters to distributions are in a valid
-        range. If your model is built in a way where you know your
-        parameters can only take on valid values you can set this to
-        False for increased speed. This should not be used if your model
-        contains discrete variables.
 
-    Examples
-    --------
-    How to define a custom model
+def _rng_detaching_linker(mode) -> bool:
+    """Whether ``mode``'s linker copies RNG shared variables at compile time.
 
-    .. code-block:: python
+    Such compiled functions cannot be reseeded afterwards, so functions with RNGs must be
+    seeded before compilation and are not served from the compilation cache.
+    """
+    from pytensor.compile.mode import get_mode
+    from pytensor.link.jax.linker import JAXLinker
+    from pytensor.link.mlx.linker import MLXLinker
+    from pytensor.link.pytorch.linker import PytorchLinker
 
-        class CustomModel(Model):
-            # 1) override init
-            def __init__(self, mean=0, sigma=1, name=''):
-                # 2) call super's init first, passing model and name
-                # to it name will be prefix for all variables here if
-                # no name specified for model there will be no prefix
-                super().__init__(name, model)
-                # now you are in the context of instance,
-                # `modelcontext` will return self you can define
-                # variables in several ways note, that all variables
-                # will get model's name prefix
+    return isinstance(get_mode(mode).linker, JAXLinker | MLXLinker | PytorchLinker)
 
-                # 3) you can create variables with the register_rv method
-                self.register_rv(Normal.dist(mu=mean, sigma=sigma), 'v1', initval=1)
-                # this will create variable named like '{name::}v1'
-                # and assign attribute 'v1' to instance created
-                # variable can be accessed with self.v1 or self['v1']
 
-                # 4) this syntax will also work as we are in the
-                # context of instance itself, names are given as usual
-                Normal('v2', mu=mean, sigma=sigma)
+class BaseModel(WithMemoization, metaclass=ContextMeta):
+    """Functionality shared by mutable and frozen models.
 
-                # something more complex is allowed, too
-                half_cauchy = HalfCauchy('sigma', beta=10, initval=1.)
-                Normal('v3', mu=mean, sigma=half_cauchy)
-
-                # Deterministic variables can be used in usual way
-                Deterministic('v3_sq', self.v3 ** 2)
-
-                # Potentials too
-                Potential('p1', pt.constant(1))
-
-        # After defining a class CustomModel you can use it in several
-        # ways
-
-        # I:
-        #   state the model within a context
-        with Model() as model:
-            CustomModel()
-            # arbitrary actions
-
-        # II:
-        #   use new class as entering point in context
-        with CustomModel() as model:
-            Normal('new_normal_var', mu=1, sigma=0)
-
-        # III:
-        #   just get model instance with all that was defined in it
-        model = CustomModel()
-
-        # IV:
-        #   use many custom models within one context
-        with Model() as model:
-            CustomModel(mean=1, name='first')
-            CustomModel(mean=2, name='second')
-
-        # variables inside both scopes will be named like `first::*`, `second::*`
+    Abstract: instantiate :class:`~pymc.Model` (mutable), or create a
+    :class:`~pymc.FrozenModel` with
+    :func:`pymc.model.transform.optimization.freeze_model`.
     """
 
-    if TYPE_CHECKING:
+    def __enter__(self):
+        """Enter the context manager."""
+        MODEL_MANAGER.active_contexts.append(self)
+        return self
 
-        def __enter__(self: Self) -> Self: ...
+    def __exit__(self, exc_type: None, exc_val: None, exc_tb: None) -> None:
+        """Exit the context manager."""
+        _ = MODEL_MANAGER.active_contexts.pop()
 
-        def __exit__(self, exc_type: None, exc_val: None, exc_tb: None) -> None: ...
+    def _display_(self):
+        import marimo as mo
 
-    def __new__(cls, *args, **kwargs):
-        # resolves the parent instance
-        instance = super().__new__(cls)
-        if kwargs.get("model") is not None:
-            instance._parent = kwargs.get("model")
-        else:
-            instance._parent = cls.get_context(error_if_none=False)
-        pytensor_config = kwargs.get("pytensor_config", {})
-        if pytensor_config:
-            warnings.warn(
-                "pytensor_config is deprecated. Use pytensor.config or pytensor.config.change_flags context manager instead.",
-                FutureWarning,
+        from pymc.model_graph import model_to_mermaid
+
+        diagram = model_to_mermaid(self)
+        try:
+            return mo.mermaid(
+                diagram,
+                theme_variables={
+                    "primaryColor": "#12698A",
+                    "primaryTextColor": "#FFFFFF",
+                    "primaryBorderColor": "#0E5A7A",
+                    "lineColor": "#504A4E",
+                    "tertiaryColor": "#F0F5F8",
+                },
             )
-        instance._pytensor_config = pytensor_config
-        return instance
+        except TypeError:
+            return mo.mermaid(diagram)
 
     @staticmethod
     def _validate_name(name):
         if name.endswith(":"):
             raise KeyError("name should not end with `:`")
+        if "/" in name:
+            raise ValueError(f"Variable name '{name}' cannot contain '/'.")
         return name
 
     def __init__(
@@ -506,18 +410,20 @@ class Model(WithMemoization, metaclass=ContextMeta):
         coords=None,
         check_bounds=True,
         *,
-        coords_mutable=None,
-        pytensor_config=None,
-        model=None,
+        model: _UnsetType | None | Model = UNSET,
     ):
-        del pytensor_config, model  # used in __new__
+        if type(self) is BaseModel:
+            raise TypeError("BaseModel is abstract; instantiate Model instead.")
         self.name = self._validate_name(name)
         self.check_bounds = check_bounds
+        self._parent = model if not isinstance(model, _UnsetType) else MODEL_MANAGER.parent_context
 
-        if coords_mutable is not None:
-            warnings.warn(
-                "All coords are now mutable by default. coords_mutable will be removed in a future release.",
-                FutureWarning,
+        if isinstance(self._parent, FrozenModel):
+            # A sub-model shares its parent's variable containers, so registering variables
+            # in it would mutate the frozen parent and stale its cached functions.
+            raise RuntimeError(
+                "Cannot create a sub-model of a FrozenModel. Create it in the original "
+                "model and freeze that with freeze_model."
             )
 
         if self.parent is not None:
@@ -549,9 +455,6 @@ class Model(WithMemoization, metaclass=ContextMeta):
             self._coords = {}
             self._dim_lengths = {}
         self.add_coords(coords)
-        if coords_mutable is not None:
-            for name, values in coords_mutable.items():
-                self.add_coord(name, values, mutable=True)
 
         from pymc.printing import str_for_model
 
@@ -560,10 +463,16 @@ class Model(WithMemoization, metaclass=ContextMeta):
             functools.partial(str_for_model, formatting="latex"), self
         )
 
-    @property
-    def model(self):
-        warnings.warn("Model.model property is deprecated. Just use Model.", FutureWarning)
-        return self
+    @classmethod
+    def get_context(
+        cls, error_if_none: bool = True, allow_block_model_access: bool = False
+    ) -> BaseModel | None:
+        model = MODEL_MANAGER.current_context
+        if isinstance(model, BlockModelAccess) and not allow_block_model_access:
+            raise BlockModelAccessError(model.error_msg_on_access)
+        if model is None and error_if_none:
+            raise TypeError("No model on context stack")
+        return model
 
     @property
     def parent(self):
@@ -580,8 +489,15 @@ class Model(WithMemoization, metaclass=ContextMeta):
     def isroot(self):
         return self.parent is None
 
-    def logp_dlogp_function(self, grad_vars=None, tempered=False, **kwargs):
-        """Compile an PyTensor function that computes logp and gradient.
+    def logp_dlogp_function(
+        self,
+        grad_vars=None,
+        tempered=False,
+        initial_point: PointType | None = None,
+        ravel_inputs: bool | None = None,
+        **kwargs,
+    ):
+        """Compile a PyTensor function that computes logp and gradient.
 
         Parameters
         ----------
@@ -600,19 +516,45 @@ class Model(WithMemoization, metaclass=ContextMeta):
                 if var.dtype not in continuous_types:
                     raise ValueError(f"Can only compute the gradient of continuous types: {var}")
 
+        if initial_point is None:
+            initial_point = self.initial_point(0)
+
+        # The compiled function does not depend on the initial_point values (those only seed
+        # the runtime-settable extra variables), so it is cached across calls with any point.
+        fn = self._logp_dlogp_function(
+            tuple(grad_vars),
+            tempered=tempered,
+            ravel_inputs=ravel_inputs,
+            initial_point=initial_point,
+            **kwargs,
+        )
+        fn.set_extra_values(initial_point)
+        return fn
+
+    def _logp_dlogp_function(
+        self, grad_vars, *, tempered=False, ravel_inputs=None, initial_point, **kwargs
+    ):
+        grad_vars = list(grad_vars)
         if tempered:
             costs = [self.varlogp, self.datalogp]
         else:
             costs = [self.logp()]
 
         input_vars = {i for i in graph_inputs(costs) if not isinstance(i, Constant)}
-        ip = self.initial_point(0)
         extra_vars_and_values = {
-            var: ip[var.name]
+            var: initial_point[var.name]
             for var in self.value_vars
             if var in input_vars and var not in grad_vars
         }
-        return ValueGradFunction(costs, grad_vars, extra_vars_and_values, **kwargs)
+        return ValueGradFunction(
+            costs,
+            grad_vars,
+            extra_vars_and_values,
+            model=self,
+            initial_point=initial_point,
+            ravel_inputs=ravel_inputs,
+            **kwargs,
+        )
 
     def compile_logp(
         self,
@@ -622,6 +564,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
         **compile_kwargs,
     ) -> PointFunc:
         """Compiled log probability density function.
+
+        The function expects as input a dictionary with the same structure as self.initial_point()
 
         Parameters
         ----------
@@ -634,7 +578,12 @@ class Model(WithMemoization, metaclass=ContextMeta):
             Whether to sum all logp terms or return elemwise logp for each variable.
             Defaults to True.
         """
-        return self.compile_fn(self.logp(vars=vars, jacobian=jacobian, sum=sum), **compile_kwargs)
+        compile_kwargs.setdefault("on_unused_input", "ignore")
+        return self.compile_fn(
+            inputs=self.value_vars,
+            outs=self.logp(vars=vars, jacobian=jacobian, sum=sum),
+            **compile_kwargs,
+        )
 
     def compile_dlogp(
         self,
@@ -644,6 +593,9 @@ class Model(WithMemoization, metaclass=ContextMeta):
     ) -> PointFunc:
         """Compiled log probability density gradient function.
 
+        The function expects as input a dictionary with the same structure as self.initial_point()
+
+
         Parameters
         ----------
         vars : list of random variables or potential terms, optional
@@ -652,7 +604,12 @@ class Model(WithMemoization, metaclass=ContextMeta):
         jacobian : bool
             Whether to include jacobian terms in logprob graph. Defaults to True.
         """
-        return self.compile_fn(self.dlogp(vars=vars, jacobian=jacobian), **compile_kwargs)
+        compile_kwargs.setdefault("on_unused_input", "ignore")
+        return self.compile_fn(
+            inputs=self.value_vars,
+            outs=self.dlogp(vars=vars, jacobian=jacobian),
+            **compile_kwargs,
+        )
 
     def compile_d2logp(
         self,
@@ -663,6 +620,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
     ) -> PointFunc:
         """Compiled log probability density hessian function.
 
+        The function expects as input a dictionary with the same structure as self.initial_point()
+
         Parameters
         ----------
         vars : list of random variables or potential terms, optional
@@ -671,8 +630,10 @@ class Model(WithMemoization, metaclass=ContextMeta):
         jacobian : bool
             Whether to include jacobian terms in logprob graph. Defaults to True.
         """
-        return self.model.compile_fn(
-            self.d2logp(vars=vars, jacobian=jacobian, negate_output=negate_output),
+        compile_kwargs.setdefault("on_unused_input", "ignore")
+        return self.compile_fn(
+            inputs=self.value_vars,
+            outs=self.d2logp(vars=vars, jacobian=jacobian, negate_output=negate_output),
             **compile_kwargs,
         )
 
@@ -683,6 +644,10 @@ class Model(WithMemoization, metaclass=ContextMeta):
         sum: bool = True,
     ) -> Variable | list[Variable]:
         """Elemwise log-probability of the model.
+
+        On frozen models the returned graph is memoized (keyed on the arguments), so
+        repeated calls return the same object and ``compile_fn`` can reuse a compiled
+        function. Do not mutate it in place.
 
         Parameters
         ----------
@@ -748,7 +713,9 @@ class Model(WithMemoization, metaclass=ContextMeta):
         if not sum:
             return logp_factors
 
-        logp_scalar = pt.sum([pt.sum(factor) for factor in logp_factors])
+        logp_scalar = variadic_add(
+            *(as_tensor(factor, allow_xtensor_conversion=True).sum() for factor in logp_factors)
+        )
         logp_scalar_name = "__logp" if jacobian else "__logp_nojac"
         if self.name:
             logp_scalar_name = f"{logp_scalar_name}_{self.name}"
@@ -775,7 +742,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
         dlogp graph
         """
         if vars is None:
-            value_vars = None
+            value_vars = self.continuous_value_vars
         else:
             if not isinstance(vars, list | tuple):
                 vars = [vars]
@@ -815,7 +782,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
         d²logp graph
         """
         if vars is None:
-            value_vars = None
+            value_vars = self.continuous_value_vars
         else:
             if not isinstance(vars, list | tuple):
                 vars = [vars]
@@ -836,30 +803,27 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
     @property
     def datalogp(self) -> Variable:
-        """PyTensor scalar of log-probability of the observed variables and
-        potential terms"""
+        """PyTensor scalar of log-probability of the observed variables and potential terms."""
         return self.observedlogp + self.potentiallogp
 
     @property
     def varlogp(self) -> Variable:
-        """PyTensor scalar of log-probability of the unobserved random variables
-        (excluding deterministic)."""
+        """PyTensor scalar of log-probability of the unobserved random variables (excluding deterministic)."""
         return self.logp(vars=self.free_RVs)
 
     @property
     def varlogp_nojac(self) -> Variable:
-        """PyTensor scalar of log-probability of the unobserved random variables
-        (excluding deterministic) without jacobian term."""
+        """PyTensor scalar of log-probability of the unobserved random variables (excluding deterministic) without jacobian term."""
         return self.logp(vars=self.free_RVs, jacobian=False)
 
     @property
     def observedlogp(self) -> Variable:
-        """PyTensor scalar of log-probability of the observed variables"""
+        """PyTensor scalar of log-probability of the observed variables."""
         return self.logp(vars=self.observed_RVs)
 
     @property
     def potentiallogp(self) -> Variable:
-        """PyTensor scalar of log-probability of the Potential terms"""
+        """PyTensor scalar of log-probability of the Potential terms."""
         # Convert random variables in Potential expression into their log-likelihood
         # inputs and apply their transforms, if any
         potentials = self.replace_rvs_by_values(self.potentials)
@@ -870,17 +834,12 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
     @property
     def value_vars(self):
-        """List of unobserved random variables used as inputs to the model's
-        log-likelihood (which excludes deterministics).
-        """
+        """List of unobserved random variables used as inputs to the model's log-likelihood (which excludes deterministics)."""
         return [self.rvs_to_values[v] for v in self.free_RVs]
 
     @property
     def unobserved_value_vars(self):
-        """List of all random variables (including untransformed projections),
-        as well as deterministics used as inputs and outputs of the model's
-        log-likelihood graph
-        """
+        """List of all random variables (including untransformed projections), as well as deterministics used as inputs and outputs of the model's log-likelihood graph."""
         vars = []
         transformed_rvs = []
         for rv in self.free_RVs:
@@ -900,18 +859,19 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
     @property
     def discrete_value_vars(self):
-        """All the discrete value variables in the model"""
+        """All the discrete value variables in the model."""
         return list(typefilter(self.value_vars, discrete_types))
 
     @property
     def continuous_value_vars(self):
-        """All the continuous value variables in the model"""
+        """All the continuous value variables in the model."""
         return list(typefilter(self.value_vars, continuous_types))
 
     @property
     def basic_RVs(self):
-        """List of random variables the model is defined in terms of
-        (which excludes deterministics).
+        """List of random variables the model is defined in terms of.
+
+        This excludes deterministics.
 
         These are the actual random variable terms that make up the
         "sample-space" graph (i.e. you can sample these graphs by compiling them
@@ -937,7 +897,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
         return self._coords
 
     @property
-    def dim_lengths(self) -> dict[str, Variable]:
+    def dim_lengths(self) -> dict[str, TensorVariable]:
         """The symbolic lengths of dimensions in the model.
 
         The values are typically instances of ``TensorVariable`` or ``ScalarSharedVariable``.
@@ -958,79 +918,6 @@ class Model(WithMemoization, metaclass=ContextMeta):
                 )
             shape.extend(np.shape(self.coords[dim]))
         return tuple(shape)
-
-    def add_coord(
-        self,
-        name: str,
-        values: Sequence | None = None,
-        mutable: bool | None = None,
-        *,
-        length: int | Variable | None = None,
-    ):
-        """Registers a dimension coordinate with the model.
-
-        Parameters
-        ----------
-        name : str
-            Name of the dimension.
-            Forbidden: {"chain", "draw", "__sample__"}
-        values : optional, array_like
-            Coordinate values or ``None`` (for auto-numbering).
-            If ``None`` is passed, a ``length`` must be specified.
-        mutable : bool
-            Whether the created dimension should be resizable.
-            Default is False.
-        length : optional, scalar
-            A scalar of the dimensions length.
-            Defaults to ``pytensor.tensor.constant(len(values))``.
-        """
-        if mutable is not None:
-            warnings.warn(
-                "Coords are now always mutable. Specifying `mutable` will raise an error in a future release",
-                FutureWarning,
-            )
-
-        if name in {"draw", "chain", "__sample__"}:
-            raise ValueError(
-                "Dimensions can not be named `draw`, `chain` or `__sample__`, "
-                "as those are reserved for use in `InferenceData`."
-            )
-        if values is None and length is None:
-            raise ValueError(
-                f"Either `values` or `length` must be specified for the '{name}' dimension."
-            )
-        if values is not None:
-            # Conversion to a tuple ensures that the coordinate values are immutable.
-            # Also unlike numpy arrays the's tuple.index(...) which is handy to work with.
-            values = tuple(values)
-        if name in self.coords:
-            if not np.array_equal(values, self.coords[name]):
-                raise ValueError(f"Duplicate and incompatible coordinate: {name}.")
-        if length is not None and not isinstance(length, int | Variable):
-            raise ValueError(
-                f"The `length` passed for the '{name}' coord must be an int, PyTensor Variable or None."
-            )
-        if length is None:
-            length = len(values)
-        if not isinstance(length, Variable):
-            length = pytensor.shared(length, name=name)
-        assert length.type.ndim == 0
-        self._dim_lengths[name] = length
-        self._coords[name] = values
-
-    def add_coords(
-        self,
-        coords: dict[str, Sequence | None],
-        *,
-        lengths: dict[str, int | Variable | None] | None = None,
-    ):
-        """Vectorized version of ``Model.add_coord``."""
-        if coords is None:
-            return
-        lengths = lengths or {}
-
-        for name, values in coords.items():
-            self.add_coord(name, values, length=lengths.get(name, None))
 
     def set_dim(self, name: str, new_length: int, coord_values: Sequence | None = None):
         """Update a mutable dimension.
@@ -1068,7 +955,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
         return
 
     def initial_point(self, random_seed: SeedSequenceSeed = None) -> dict[str, np.ndarray]:
-        """Computes the initial point of the model.
+        """Compute the initial point of the model.
 
         Parameters
         ----------
@@ -1080,16 +967,17 @@ class Model(WithMemoization, metaclass=ContextMeta):
         ip : dict of {str : array_like}
             Maps names of transformed variables to numeric initial values in the transformed space.
         """
-        fn = make_initial_point_fn(model=self, return_transformed=True)
+        fn = self._make_initial_point()
         return Point(fn(random_seed), model=self)
 
-    def set_initval(self, rv_var, initval):
-        """Sets an initial value (strategy) for a random variable."""
-        if initval is not None and not isinstance(initval, Variable | str):
-            # Convert scalars or array-like inputs to ndarrays
-            initval = rv_var.type.filter(initval)
-
-        self.rvs_to_initial_values[rv_var] = initval
+    def _make_initial_point(self, *, overrides=None, jitter_rvs=None, return_transformed=True):
+        # Compiled function takes the seed as an argument, so the cache is seed-independent.
+        return make_initial_point_fn(
+            model=self,
+            overrides=overrides,
+            jitter_rvs=jitter_rvs,
+            return_transformed=return_transformed,
+        )
 
     def set_data(
         self,
@@ -1097,7 +985,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
         values: Sequence | np.ndarray,
         coords: dict[str, Sequence] | None = None,
     ):
-        """Changes the values of a data variable in the model.
+        """Change the values of a data variable in the model.
 
         In contrast to pm.Data().set_value, this method can also
         update the corresponding coordinates.
@@ -1115,10 +1003,15 @@ class Model(WithMemoization, metaclass=ContextMeta):
         """
         shared_object = self[name]
         if not isinstance(shared_object, SharedVariable):
+            frozen_hint = (
+                " The model is frozen and only data that no free variable depends on can be set."
+                if isinstance(self, FrozenModel)
+                else ""
+            )
             raise TypeError(
                 f"The variable `{name}` must be a `SharedVariable` "
                 "(created through `pm.Data()` to allow updating.) "
-                f"The current type is: {type(shared_object)}"
+                f"The current type is: {type(shared_object)}.{frozen_hint}"
             )
 
         if isinstance(values, list):
@@ -1159,9 +1052,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
                     raise ShapeError(
                         f"Resizing dimension '{dname}' is impossible, because "
                         "a `TensorConstant` stores its length. To be able "
-                        "to change the dimension length, pass `mutable=True` when "
-                        "registering the dimension via `model.add_coord`, "
-                        "or define it via a `pm.MutableData` variable."
+                        "to change the dimension length, create data with "
+                        "pm.Data() instead."
                     )
                 elif length_tensor.owner is not None:
                     # The dimension was created from another variable:
@@ -1227,306 +1119,6 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
         shared_object.set_value(values)
 
-    def register_rv(
-        self,
-        rv_var,
-        name,
-        *,
-        observed=None,
-        total_size=None,
-        dims=None,
-        default_transform=UNSET,
-        transform=UNSET,
-        initval=None,
-    ):
-        """Register an (un)observed random variable with the model.
-
-        Parameters
-        ----------
-        rv_var : TensorVariable
-        name : str
-            Intended name for the model variable.
-        observed : array_like, optional
-            Data values for observed variables.
-        total_size : scalar
-            upscales logp of variable with ``coef = total_size/var.shape[0]``
-        dims : tuple
-            Dimension names for the variable.
-        default_transform
-            A default transform for the random variable in log-likelihood space.
-        transform
-            Additional transform which may be applied after default transform.
-        initval
-            The initial value of the random variable.
-
-        Returns
-        -------
-        TensorVariable
-        """
-        name = self.name_for(name)
-        rv_var.name = name
-        _add_future_warning_tag(rv_var)
-
-        # Associate previously unknown dimension names with
-        # the length of the corresponding RV dimension.
-        if dims is not None:
-            for d, dname in enumerate(dims):
-                if not isinstance(dname, str):
-                    raise TypeError(f"Dims must be string. Got {dname} of type {type(dname)}")
-                if dname not in self.dim_lengths:
-                    self.add_coord(dname, values=None, length=rv_var.shape[d])
-
-        if observed is None:
-            if total_size is not None:
-                raise ValueError("total_size can only be passed to observed RVs")
-            self.free_RVs.append(rv_var)
-            self.create_value_var(rv_var, transform=transform, default_transform=default_transform)
-            self.add_named_variable(rv_var, dims)
-            self.set_initval(rv_var, initval)
-        else:
-            if (
-                isinstance(observed, Variable)
-                and not isinstance(observed, GenTensorVariable)
-                and observed.owner is not None
-                # The only PyTensor operation we allow on observed data is type casting
-                # Although we could allow for any graph that does not depend on other RVs
-                and not (
-                    isinstance(observed.owner.op, Elemwise)
-                    and isinstance(observed.owner.op.scalar_op, Cast)
-                )
-                and not is_minibatch(observed)
-            ):
-                raise TypeError(
-                    "Variables that depend on other nodes cannot be used for observed data."
-                    f"The data variable was: {observed}"
-                )
-
-            # `rv_var` is potentially changed by `make_obs_var`,
-            # for example into a new graph for imputation of missing data.
-            rv_var = self.make_obs_var(
-                rv_var, observed, dims, default_transform, transform, total_size
-            )
-
-        return rv_var
-
-    def make_obs_var(
-        self,
-        rv_var: TensorVariable,
-        data: np.ndarray,
-        dims,
-        default_transform: Transform | None,
-        transform: Transform | None,
-        total_size: int | None,
-    ) -> TensorVariable:
-        """Create a `TensorVariable` for an observed random variable.
-
-        Parameters
-        ----------
-        rv_var : TensorVariable
-            The random variable that is observed.
-            Its dimensionality must be compatible with the data already.
-        data : array_like
-            The observed data.
-        dims : tuple
-            Dimension names for the variable.
-        default_transform
-            A transform for the random variable in log-likelihood space.
-        transform
-            Additional transform which may be applied after default transform.
-
-        Returns
-        -------
-        TensorVariable
-        """
-        name = rv_var.name
-        data = convert_observed_data(data).astype(rv_var.dtype)
-
-        if data.ndim != rv_var.ndim:
-            raise ShapeError(
-                "Dimensionality of data and RV don't match.", actual=data.ndim, expected=rv_var.ndim
-            )
-
-        mask = getattr(data, "mask", None)
-        if mask is not None:
-            impute_message = (
-                f"Data in {rv_var} contains missing values and"
-                " will be automatically imputed from the"
-                " sampling distribution."
-            )
-            warnings.warn(impute_message, ImputationWarning)
-
-            if total_size is not None:
-                raise ValueError("total_size is not compatible with imputed variables")
-
-            from pymc.distributions.distribution import create_partial_observed_rv
-
-            (
-                (observed_rv, observed_mask),
-                (unobserved_rv, _),
-                joined_rv,
-            ) = create_partial_observed_rv(rv_var, mask)
-            observed_data = pt.as_tensor(data.data[observed_mask])
-
-            # Register ObservedRV corresponding to observed component
-            observed_rv.name = f"{name}_observed"
-            self.create_value_var(
-                observed_rv, transform=transform, default_transform=None, value_var=observed_data
-            )
-            self.add_named_variable(observed_rv)
-            self.observed_RVs.append(observed_rv)
-
-            # Register FreeRV corresponding to unobserved components
-            self.register_rv(
-                unobserved_rv,
-                f"{name}_unobserved",
-                transform=transform,
-                default_transform=default_transform,
-            )
-
-            # Register Deterministic that combines observed and missing
-            # Note: This can widely increase memory consumption during sampling for large datasets
-            rv_var = Deterministic(name, joined_rv, self, dims)
-
-        else:
-            if sps.issparse(data):
-                data = sparse.basic.as_sparse(data, name=name)
-            else:
-                data = pt.as_tensor_variable(data, name=name)
-
-            if total_size:
-                from pymc.variational.minibatch_rv import create_minibatch_rv
-
-                rv_var = create_minibatch_rv(rv_var, total_size)
-                rv_var.name = name
-
-            rv_var.tag.observations = data
-            self.create_value_var(
-                rv_var, transform=transform, default_transform=None, value_var=data
-            )
-            self.add_named_variable(rv_var, dims)
-            self.observed_RVs.append(rv_var)
-
-        return rv_var
-
-    def create_value_var(
-        self,
-        rv_var: TensorVariable,
-        *,
-        default_transform: Transform,
-        transform: Transform,
-        value_var: Variable | None = None,
-    ) -> TensorVariable:
-        """Create a ``TensorVariable`` that will be used as the random
-        variable's "value" in log-likelihood graphs.
-
-        In general, we'll call this type of variable the "value" variable.
-
-        In all other cases, the role of the value variable is taken by
-        observed data. That's why value variables are only referenced in
-        this branch of the conditional.
-
-        Parameters
-        ----------
-        rv_var : TensorVariable
-
-        default_transform: Transform
-            A transform for the random variable in log-likelihood space.
-
-        transform: Transform
-            Additional transform which may be applied after default transform.
-
-        value_var : Variable, optional
-
-        Returns
-        -------
-        TensorVariable
-        """
-
-        # Make the value variable a transformed value variable,
-        # if there's an applicable transform
-        if transform is None and default_transform is UNSET:
-            default_transform = None
-            warnings.warn(
-                "To disable default transform, please use default_transform=None"
-                " instead of transform=None. Setting transform to None will"
-                " not have any effect in future.",
-                UserWarning,
-            )
-
-        if default_transform is UNSET:
-            if rv_var.owner is None:
-                default_transform = None
-            else:
-                default_transform = _default_transform(rv_var.owner.op, rv_var)
-
-        if transform is UNSET:
-            transform = default_transform
-        elif transform is not None and default_transform is not None:
-            transform = ChainedTransform([default_transform, transform])
-
-        if value_var is None:
-            if transform is None:
-                # Create value variable with the same type as the RV
-                value_var = rv_var.type()
-                value_var.name = rv_var.name
-                if pytensor.config.compute_test_value != "off":
-                    value_var.tag.test_value = rv_var.tag.test_value
-            else:
-                # Create value variable with the same type as the transformed RV
-                value_var = transform.forward(rv_var, *rv_var.owner.inputs).type()
-                value_var.name = f"{rv_var.name}_{transform.name}__"
-                value_var.tag.transform = transform
-                if pytensor.config.compute_test_value != "off":
-                    value_var.tag.test_value = transform.forward(
-                        rv_var, *rv_var.owner.inputs
-                    ).tag.test_value
-
-        _add_future_warning_tag(value_var)
-        rv_var.tag.value_var = value_var
-
-        self.rvs_to_transforms[rv_var] = transform
-        self.rvs_to_values[rv_var] = value_var
-        self.values_to_rvs[value_var] = rv_var
-
-        return value_var
-
-    def register_data_var(self, data, dims=None):
-        """Register a data variable with the model."""
-        self.data_vars.append(data)
-        self.add_named_variable(data, dims=dims)
-
-    def add_named_variable(self, var, dims: tuple[str | None, ...] | None = None):
-        """Add a random graph variable to the named variables of the model.
-
-        This can include several types of variables such basic_RVs, Data, Deterministics,
-        and Potentials.
-
-        Parameters
-        ----------
-        var
-
-        dims : tuple, optional
-
-        """
-        if var.name is None:
-            raise ValueError("Variable is unnamed.")
-        if self.named_vars.tree_contains(var.name):
-            raise ValueError(f"Variable name {var.name} already exists.")
-
-        if dims is not None:
-            if isinstance(dims, str):
-                dims = (dims,)
-            for dim in dims:
-                if dim not in self.coords and dim is not None:
-                    raise ValueError(f"Dimension {dim} is not specified in `coords`.")
-            if any(var.name == dim for dim in dims if dim is not None):
-                raise ValueError(f"Variable `{var.name}` has the same name as its dimension label.")
-            self.named_vars_to_dims[var.name] = dims
-
-        self.named_vars[var.name] = var
-        if not hasattr(self, self.name_of(var.name)):
-            setattr(self, self.name_of(var.name), var)
-
     @property
     def prefix(self) -> str:
         if self.isroot or not self.parent.prefix:
@@ -1536,7 +1128,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
         return name
 
     def name_for(self, name):
-        """Checks if name has prefix and adds if needed"""
+        """Check if name has prefix and adds if needed."""
         name = self._validate_name(name)
         if self.prefix:
             if not name.startswith(self.prefix + "::"):
@@ -1547,7 +1139,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
             return name
 
     def name_of(self, name):
-        """Checks if name has prefix and deletes if needed"""
+        """Check if name has prefix and deletes if needed."""
         name = self._validate_name(name)
         if not self.prefix or not name:
             return name
@@ -1557,6 +1149,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
             return name
 
     def __getitem__(self, key):
+        """Get the variable named `key`."""
         try:
             return self.named_vars[key]
         except KeyError as e:
@@ -1566,7 +1159,45 @@ class Model(WithMemoization, metaclass=ContextMeta):
                 raise e
 
     def __contains__(self, key):
+        """Check if the model contains a variable named `key`."""
         return key in self.named_vars or self.name_for(key) in self.named_vars
+
+    def __copy__(self):
+        """Clone the model."""
+        return self.copy()
+
+    def __deepcopy__(self, _):
+        """Clone the model."""
+        return self.copy()
+
+    def copy(self):
+        """
+        Clone the model.
+
+        To access variables in the cloned model use `cloned_model["var_name"]`.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            import pymc as pm
+            import copy
+
+            with pm.Model() as m:
+                p = pm.Beta("p", 1, 1)
+                x = pm.Bernoulli("x", p=p, shape=(3,))
+
+            clone_m = copy.copy(m)
+
+            # Access cloned variables by name
+            clone_x = clone_m["x"]
+
+            # z will be part of clone_m but not m
+            z = pm.Deterministic("z", clone_x + 1)
+        """
+        from pymc.model.fgraph import clone_model
+
+        return clone_model(self)
 
     def replace_rvs_by_values(
         self,
@@ -1623,44 +1254,39 @@ class Model(WithMemoization, metaclass=ContextMeta):
         point_fn: bool = True,
         **kwargs,
     ) -> PointFunc | Function:
-        """Compiles an PyTensor function
+        """Compiles a PyTensor function.
 
         Parameters
         ----------
         outs : Variable or sequence of Variables
             PyTensor variable or iterable of PyTensor variables.
         inputs : sequence of Variables, optional
-            PyTensor input variables, defaults to pytensorf.inputvars(outs).
+            PyTensor input variables, Required if there is more than one input.
         mode
             PyTensor compilation mode, default=None.
         point_fn : bool
             Whether to wrap the compiled function in a PointFunc, which takes a Point
             dictionary with model variable names and values as input.
+        Other keyword arguments :
+            Any other keyword argument is sent to :py:func:`pymc.pytensorf.compile`.
 
         Returns
         -------
         Compiled PyTensor function
         """
-        if inputs is None:
-            inputs = inputvars(outs)
+        raise NotImplementedError
 
-        with self:
-            fn = compile_pymc(
-                inputs,
-                outs,
-                allow_input_downcast=True,
-                accept_inplace=True,
-                mode=mode,
-                **kwargs,
-            )
-
-        if point_fn:
-            return PointFunc(fn)
-        return fn
-
-    def profile(self, outs, *, n=1000, point=None, profile=True, **kwargs):
-        """Compiles and profiles an PyTensor function which returns ``outs`` and
-        takes values of model vars as a dict as an argument.
+    def profile(
+        self,
+        outs,
+        *,
+        n=1000,
+        point=None,
+        profile=True,
+        backend=None,
+        **compile_fn_kwargs,
+    ) -> ProfileStats:
+        """Compile and profile a PyTensor function which returns ``outs`` and takes values of model vars as a dict as an argument.
 
         Parameters
         ----------
@@ -1670,16 +1296,25 @@ class Model(WithMemoization, metaclass=ContextMeta):
         point : Point
             Point to pass to the function
         profile : True or ProfileStats
-        args, kwargs
-            Compilation args
+        backend : str, optional
+            Which computational backend to use. Recommended to be one of "numba", "c", and "jax".
+        compile_fn_kwargs
+            Compilation kwargs for :func:`pymc.model.core.Model.compile_fn`
 
         Returns
         -------
-        ProfileStats
+        pytensor.compile.profiling.ProfileStats
             Use .summary() to print stats.
         """
-        kwargs.setdefault("on_unused_input", "ignore")
-        f = self.compile_fn(outs, inputs=self.value_vars, point_fn=False, profile=profile, **kwargs)
+        compile_fn_kwargs.setdefault("on_unused_input", "ignore")
+        compile_fn_kwargs = resolve_backend_compile_kwargs(backend, compile_fn_kwargs)
+        f = self.compile_fn(
+            outs,
+            inputs=self.value_vars,
+            point_fn=False,
+            profile=profile,
+            **compile_fn_kwargs,
+        )
         if point is None:
             point = self.initial_point()
 
@@ -1688,25 +1323,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
         return f.profile
 
-    def update_start_vals(self, a: dict[str, np.ndarray], b: dict[str, np.ndarray]):
-        r"""Update point `a` with `b`, without overwriting existing keys.
-
-        Values specified for transformed variables in `a` will be recomputed
-        conditional on the values of `b` and stored in `b`.
-
-        Parameters
-        ----------
-        a : dict
-
-        b : dict
-        """
-        raise FutureWarning(
-            "The `Model.update_start_vals` method was removed."
-            " To change initial values you may set the items of `Model.initial_values` directly."
-        )
-
     def eval_rv_shapes(self) -> dict[str, tuple[int, ...]]:
-        """Evaluates shapes of untransformed AND transformed free variables.
+        """Evaluate shapes of untransformed AND transformed free variables.
 
         Returns
         -------
@@ -1719,9 +1337,9 @@ class Model(WithMemoization, metaclass=ContextMeta):
             transform = self.rvs_to_transforms[rv]
             if transform is not None:
                 names.append(get_transformed_name(rv.name, transform))
-                outputs.append(transform.forward(rv, *rv.owner.inputs).shape)
+                outputs.append(pt.as_tensor(transform.forward(rv, *rv.owner.inputs).shape))
             names.append(rv.name)
-            outputs.append(rv.shape)
+            outputs.append(pt.as_tensor(rv.shape))
         f = pytensor.function(
             inputs=[],
             outputs=outputs,
@@ -1731,9 +1349,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
         )
         return {name: tuple(shape) for name, shape in zip(names, f())}
 
-    def check_start_vals(self, start):
-        r"""Check that the starting values for MCMC do not cause the relevant log probability
-        to evaluate to something invalid (e.g. Inf or NaN)
+    def check_start_vals(self, start, **kwargs):
+        r"""Check that the logp is defined and finite at the starting point.
 
         Parameters
         ----------
@@ -1742,6 +1359,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
             Defaults to ``trace.point(-1))`` if there is a trace provided and
             ``model.initial_point`` if not (defaults to empty dict). Initialization
             methods for NUTS (see ``init`` keyword) can overwrite the default.
+        Other keyword arguments :
+            Any other keyword argument is sent to :py:meth:`~pymc.model.core.Model.point_logps`.
 
         Raises
         ------
@@ -1771,7 +1390,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
                     f"Valid keys are: {valid_keys}, but {extra_keys} was supplied"
                 )
 
-            initial_eval = self.point_logps(point=elem)
+            initial_eval = self.point_logps(point=elem, **kwargs)
 
             if not all(np.isfinite(v) for v in initial_eval.values()):
                 raise SamplingError(
@@ -1781,8 +1400,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
                     "You can call `model.debug()` for more details."
                 )
 
-    def point_logps(self, point=None, round_vals=2):
-        """Computes the log probability of `point` for all random variables in the model.
+    def point_logps(self, point=None, round_vals=2, **kwargs):
+        """Compute the log probability of `point` for all random variables in the model.
 
         Parameters
         ----------
@@ -1791,6 +1410,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
             is used.
         round_vals : int, default 2
             Number of decimals to round log-probabilities.
+        Other keyword arguments :
+            Any other keyword argument are sent provided to :py:meth:`~pymc.model.core.Model.compile_fn`
 
         Returns
         -------
@@ -1801,12 +1422,12 @@ class Model(WithMemoization, metaclass=ContextMeta):
             point = self.initial_point()
 
         factors = self.basic_RVs + self.potentials
-        factor_logps_fn = [pt.sum(factor) for factor in self.logp(factors, sum=False)]
+        factor_logps_fn = [factor.sum() for factor in self.logp(factors, sum=False)]
         return {
             factor.name: np.round(np.asarray(factor_logp), round_vals)
             for factor, factor_logp in zip(
                 factors,
-                self.compile_fn(factor_logps_fn)(point),
+                self.compile_fn(inputs=self.value_vars, outs=factor_logps_fn, **kwargs)(point),
             )
         }
 
@@ -1820,9 +1441,10 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
         The method will evaluate the `fn` for each variable at a time.
         When an evaluation fails or produces a non-finite value we print:
-         1. The graph of the parameters
-         2. The value of the parameters (if those can be evaluated)
-         3. The output of `fn` (if it can be evaluated)
+
+        1. The graph of the parameters
+        2. The value of the parameters (if those can be evaluated)
+        3. The output of `fn` (if it can be evaluated)
 
         This function should help to quickly narrow down invalid parametrizations.
 
@@ -1842,7 +1464,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
 
         def debug_parameters(rv):
             if isinstance(rv.owner.op, RandomVariable):
-                inputs = rv.owner.inputs[3:]
+                inputs = rv.owner.op.dist_params(rv.owner)
             else:
                 inputs = [inp for inp in rv.owner.inputs if not isinstance(inp.type, RandomType)]
             rv_inputs = pytensor.function(
@@ -1959,7 +1581,7 @@ class Model(WithMemoization, metaclass=ContextMeta):
     def to_graphviz(
         self,
         *,
-        var_names: Iterable[VarName] | None = None,
+        var_names: Iterable[str] | None = None,
         formatting: str = "plain",
         save: str | None = None,
         figsize: tuple[int, int] | None = None,
@@ -2004,7 +1626,6 @@ class Model(WithMemoization, metaclass=ContextMeta):
             sigma = np.array([15, 10, 16, 11, 9, 11, 10, 18])
 
             with Model() as schools:
-
                 eta = Normal("eta", 0, 1, shape=J)
                 mu = Normal("mu", 0, sigma=1e6)
                 tau = HalfCauchy("tau", 25)
@@ -2024,6 +1645,8 @@ class Model(WithMemoization, metaclass=ContextMeta):
             # creates the file `schools.pdf`
             schools.to_graphviz().render("schools")
         """
+        from pymc.model_graph import model_to_graphviz
+
         return model_to_graphviz(
             model=self,
             var_names=var_names,
@@ -2033,14 +1656,701 @@ class Model(WithMemoization, metaclass=ContextMeta):
             dpi=dpi,
         )
 
+    def table(
+        self,
+        *,
+        split_groups: bool = True,
+        truncate_deterministic: int | None = None,
+        parameter_count: bool = True,
+    ):
+        """Create a rich table summarizing the model's variables and their expressions.
 
-# this is really disgusting, but it breaks a self-loop: I can't pass Model
-# itself as context class init arg.
-Model._context_class = Model
+        See :func:`pymc.model_table` for details.
+        """
+        from pymc.printing import model_table
+
+        return model_table(
+            self,
+            split_groups=split_groups,
+            truncate_deterministic=truncate_deterministic,
+            parameter_count=parameter_count,
+        )
+
+
+class Model(BaseModel):
+    """Encapsulates the variables and likelihood factors of a model.
+
+    Model class can be used for creating class based models. To create
+    a class based model you should inherit from :class:`~pymc.Model` and
+    override the `__init__` method with arbitrary definitions (do not
+    forget to call base class :meth:`pymc.Model.__init__` first).
+
+    Parameters
+    ----------
+    name : str
+        name that will be used as prefix for names of all random
+        variables defined within model
+    coords : dict
+        Xarray-like coordinate keys and values. These coordinates can be used
+        to specify the shape of random variables and to label (but not specify)
+        the shape of Determinsitic, Potential and Data objects.
+        Other than specifying the shape of random variables, coordinates have no
+        effect on the model. They can't be used for label-based broadcasting or indexing.
+        You must use numpy-like operations for those behaviors.
+    check_bounds : bool
+        Ensure that input parameters to distributions are in a valid
+        range. If your model is built in a way where you know your
+        parameters can only take on valid values you can set this to
+        False for increased speed. This should not be used if your model
+        contains discrete variables.
+    model : PyMC model, optional
+        A parent model that this model belongs to. If not specified and the current model
+        is created inside another model's context, the parent model will be set to that model.
+        If `None` the model will not have a parent.
+
+    Examples
+    --------
+    Use context manager to define model and respective variables
+
+    .. code-block:: python
+
+        import pymc as pm
+
+        with pm.Model() as model:
+            x = pm.Normal("x")
+
+
+    Use object API to define model and respective variables
+
+    .. code-block:: python
+
+        import pymc as pm
+
+        model = pm.Model()
+        x = pm.Normal("x", model=model)
+
+
+    Use coords for defining the shape of random variables and labeling other model variables
+
+    .. code-block:: python
+
+        import pymc as pm
+        import numpy as np
+
+        coords = {
+            "feature": ["A", "B", "C"],
+            "trial": [1, 2, 3, 4, 5],
+        }
+
+        with pm.Model(coords=coords) as model:
+            # Variable will have default dim label `intercept__dim_0`
+            intercept = pm.Normal("intercept", shape=(3,))
+            # Variable will have shape (3,) and dim label `feature`
+            beta = pm.Normal("beta", dims=("feature",))
+
+            # Dims below are only used for labeling, they have no effect on shape
+            # Variable will have default dim label `idx__dim_0`
+            idx = pm.Data("idx", np.array([0, 1, 1, 2, 2]))
+            x = pm.Data("x", np.random.normal(size=(5, 3)), dims=("trial", "feature"))
+            # single dim can be passed as string
+            mu = pm.Deterministic("mu", intercept[idx] + beta @ x, dims="trial")
+
+            # Dims controls the shape of the variable
+            # If not specified, it would be inferred from the shape of the observations
+            y = pm.Normal("y", mu=mu, observed=[-1, 0, 0, 1, 1], dims=("trial",))
+
+
+    Define nested models, and provide name for variable name prefixing
+
+    .. code-block:: python
+
+        import pymc as pm
+
+        with pm.Model(name="root") as root:
+            x = pm.Normal("x")  # Variable wil be named "root::x"
+
+            with pm.Model(name="first") as first:
+                # Variable will belong to root and first
+                y = pm.Normal("y", mu=x)  # Variable wil be named "root::first::y"
+
+            # Can pass parent model explicitly
+            with pm.Model(name="second", model=root) as second:
+                # Variable will belong to root and second
+                z = pm.Normal("z", mu=y)  # Variable wil be named "root::second::z"
+
+            # Set None for standalone model
+            with pm.Model(name="third", model=None) as third:
+                # Variable will belong to third only
+                w = pm.Normal("w")  # Variable wil be named "third::w"
+
+
+    Set `check_bounds` to False for models with only continuous variables and default transformers
+    PyMC will remove the bounds check from the model logp which can speed up sampling
+
+    .. code-block:: python
+
+        import pymc as pm
+
+        with pm.Model(check_bounds=False) as model:
+            sigma = pm.HalfNormal("sigma")
+            x = pm.Normal("x", sigma=sigma)  # No bounds check will be performed on `sigma`
+
+
+    Notes
+    -----
+    A mutable model recompiles its functions on every call. To reuse compiled functions
+    across calls — e.g. batched posterior predictive over changing ``pm.set_data`` values,
+    or repeated ``pm.sample`` — freeze the model with
+    :func:`pymc.model.transform.optimization.freeze_model`. The frozen copy caches the
+    graphs and compiled functions it builds (``logp``, ``compile_fn``,
+    ``logp_dlogp_function``, ``initial_point``, and the forward-sampling function) and
+    forbids the mutations that would make them stale.
+
+    """
+
+    @overload
+    def compile_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        point_fn: Literal[True] = True,
+        **kwargs,
+    ) -> PointFunc: ...
+
+    @overload
+    def compile_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        point_fn: Literal[False],
+        **kwargs,
+    ) -> Function: ...
+
+    def compile_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        point_fn: bool = True,
+        **kwargs,
+    ) -> PointFunc | Function:
+        if inputs is None:
+            inputs = list(explicit_graph_inputs(outs))
+            if (not point_fn) and len(inputs) > 1:
+                raise ValueError(
+                    "compile_fn requires inputs to be specified when there is more than one input and point_fn is disabled."
+                )
+
+        kwargs.setdefault("allow_input_downcast", True)
+        kwargs.setdefault("accept_inplace", True)
+        with self:
+            fn = compile(inputs, outs, mode=mode, **kwargs)
+
+        if point_fn:
+            return PointFunc(fn)
+        return fn
+
+    def add_coord(
+        self,
+        name: str,
+        values: Sequence | np.ndarray | None = None,
+        *,
+        length: int | Variable | None = None,
+    ):
+        """Register a dimension coordinate with the model.
+
+        Parameters
+        ----------
+        name : str
+            Name of the dimension.
+            Forbidden: {"chain", "draw", "__sample__"}
+        values : optional, array_like
+            Coordinate values or ``None`` (for auto-numbering).
+            If ``None`` is passed, a ``length`` must be specified.
+        length : optional, scalar
+            A scalar of the dimensions length.
+            Defaults to ``pytensor.tensor.constant(len(values))``.
+        """
+        if name in {"draw", "chain", "__sample__"}:
+            raise ValueError(
+                "Dimensions can not be named `draw`, `chain` or `__sample__`, "
+                "as those are reserved for use in `InferenceData`."
+            )
+        if self.named_vars.tree_contains(name):
+            raise ValueError(
+                f"Dimension name '{name}' conflicts with an existing model variable name."
+            )
+        if values is None and length is None:
+            raise ValueError(
+                f"Either `values` or `length` must be specified for the '{name}' dimension."
+            )
+        if values is not None:
+            # xarray DataArrays passed as coord values must be unwrapped.
+            # tuple(DataArray) iterates yielding 0-d DataArrays instead of plain values,
+            # which breaks np.array_equal comparisons and DataTree export.
+            if isinstance(values, xr.DataArray):
+                values = values.values
+
+            # Conversion to a tuple ensures that the coordinate values are immutable.
+            # Also unlike numpy arrays the's tuple.index(...) which is handy to work with.
+            values = tuple(values)
+        if name in self.coords:
+            if not np.array_equal(values, self.coords[name]):
+                raise ValueError(f"Duplicate and incompatible coordinate: {name}.")
+            return
+        if length is not None and not isinstance(length, int | Variable):
+            raise ValueError(
+                f"The `length` passed for the '{name}' coord must be an int, PyTensor Variable or None."
+            )
+        if length is None:
+            length = len(values)
+        if not isinstance(length, Variable):
+            length = pytensor.shared(length, name=name)
+        assert length.type.ndim == 0
+        self._dim_lengths[name] = length
+        self._coords[name] = values
+
+    def add_coords(
+        self,
+        coords: dict[str, Sequence | None],
+        *,
+        lengths: dict[str, int | Variable | None] | None = None,
+    ):
+        """Vectorized version of ``Model.add_coord``."""
+        if coords is None:
+            return
+        lengths = lengths or {}
+
+        for name, values in coords.items():
+            self.add_coord(name, values, length=lengths.get(name, None))
+
+    def set_initval(self, rv_var, initval):
+        """Set an initial value (strategy) for a random variable."""
+        if initval is not None and not isinstance(initval, Variable | str):
+            # Convert scalars or array-like inputs to ndarrays
+            initval = rv_var.type.filter(initval)
+
+        self.rvs_to_initial_values[rv_var] = initval
+
+    def register_rv(
+        self,
+        rv_var: RandomVariable,
+        name: str,
+        *,
+        observed=None,
+        total_size=None,
+        dims=None,
+        default_transform=UNSET,
+        transform=UNSET,
+        initval=None,
+    ) -> TensorVariable:
+        """Register an (un)observed random variable with the model.
+
+        Parameters
+        ----------
+        rv_var : TensorVariable
+        name : str
+            Intended name for the model variable.
+        observed : array_like, optional
+            Data values for observed variables.
+        total_size : scalar
+            upscales logp of variable with ``coef = total_size/var.shape[0]``
+        dims : tuple
+            Dimension names for the variable.
+        default_transform
+            A default transform for the random variable in log-likelihood space.
+        transform
+            Additional transform which may be applied after default transform.
+        initval
+            The initial value of the random variable.
+
+        Returns
+        -------
+        TensorVariable
+        """
+        name = self.name_for(name)
+        rv_var.name = name
+
+        # Associate previously unknown dimension names with
+        # the length of the corresponding RV dimension.
+        if dims is not None:
+            for d, dname in enumerate(dims):
+                if not isinstance(dname, str):
+                    raise TypeError(f"Dims must be string. Got {dname} of type {type(dname)}")
+                if dname not in self.dim_lengths:
+                    self.add_coord(dname, values=None, length=rv_var.shape[d])
+
+        if observed is None:
+            if total_size is not None:
+                raise ValueError("total_size can only be passed to observed RVs")
+            self.free_RVs.append(rv_var)
+            self.create_value_var(rv_var, transform=transform, default_transform=default_transform)
+            self.add_named_variable(rv_var, dims)
+            self.set_initval(rv_var, initval)
+        else:
+            if total_size is None and isinstance(observed, TensorVariable):
+                for node in ancestors([observed]):
+                    if node.owner is not None and isinstance(node.owner.op, MinibatchOp):
+                        warnings.warn(
+                            f"total_size not provided for observed variable `{name}` that uses pm.Minibatch"
+                        )
+                        break
+            if not is_valid_observed(observed):
+                raise TypeError(
+                    "Variables that depend on other nodes cannot be used for observed data."
+                    f"The data variable was: {observed}"
+                )
+
+            # `rv_var` is potentially changed by `make_obs_var`,
+            # for example into a new graph for imputation of missing data.
+            rv_var = self.make_obs_var(
+                rv_var, observed, dims, default_transform, transform, total_size
+            )
+
+        return rv_var
+
+    def make_obs_var(
+        self,
+        rv_var: TensorVariable,
+        data: np.ndarray,
+        dims,
+        default_transform: Transform | None,
+        transform: Transform | None,
+        total_size: int | None,
+    ) -> TensorVariable:
+        """Create a `TensorVariable` for an observed random variable.
+
+        Parameters
+        ----------
+        rv_var : TensorVariable
+            The random variable that is observed.
+            Its dimensionality must be compatible with the data already.
+        data : array_like
+            The observed data.
+        dims : tuple
+            Dimension names for the variable.
+        default_transform
+            A transform for the random variable in log-likelihood space.
+        transform
+            Additional transform which may be applied after default transform.
+
+        Returns
+        -------
+        TensorVariable
+        """
+        name = rv_var.name
+        data = convert_observed_data(data).astype(rv_var.dtype)
+
+        if data.ndim != rv_var.ndim:
+            raise ShapeError(
+                "Dimensionality of data and RV don't match.", actual=data.ndim, expected=rv_var.ndim
+            )
+
+        mask = getattr(data, "mask", None)
+        if mask is not None:
+            impute_message = (
+                f"Data in {rv_var} contains missing values and"
+                " will be automatically imputed from the"
+                " sampling distribution."
+            )
+            warnings.warn(impute_message, ImputationWarning)
+
+            if total_size is not None:
+                raise ValueError("total_size is not compatible with imputed variables")
+
+            from pymc.distributions.distribution import create_partial_observed_rv
+
+            (
+                (observed_rv, observed_mask),
+                (unobserved_rv, _),
+                joined_rv,
+            ) = create_partial_observed_rv(rv_var, mask)
+            observed_data = pt.as_tensor(data.data[observed_mask])
+
+            # Register ObservedRV corresponding to observed component
+            observed_rv.name = f"{name}_observed"
+            self.create_value_var(
+                observed_rv, transform=transform, default_transform=None, value_var=observed_data
+            )
+            self.add_named_variable(observed_rv)
+            self.observed_RVs.append(observed_rv)
+
+            # Register FreeRV corresponding to unobserved components
+            self.register_rv(
+                unobserved_rv,
+                f"{name}_unobserved",
+                transform=transform,
+                default_transform=default_transform,
+            )
+
+            # Register Deterministic that combines observed and missing
+            # Note: This can widely increase memory consumption during sampling for large datasets
+            rv_var = Deterministic(name, joined_rv, self, dims)
+
+        else:
+            if sparse.issparse(data):
+                import pytensor.sparse as pt_sparse
+
+                data = pt_sparse.basic.as_sparse(data, name=name)
+            elif not isinstance(data, Variable):
+                data = pt.as_tensor_variable(data, name=name)
+
+            if total_size:
+                from pymc.variational.minibatch_rv import create_minibatch_rv
+
+                rv_var = create_minibatch_rv(rv_var, total_size)
+                rv_var.name = name
+
+            rv_var.tag.observations = data
+            self.create_value_var(
+                rv_var, transform=transform, default_transform=None, value_var=data
+            )
+            self.add_named_variable(rv_var, dims)
+            self.observed_RVs.append(rv_var)
+
+        return rv_var
+
+    def create_value_var(
+        self,
+        rv_var: TensorVariable,
+        *,
+        default_transform: Transform,
+        transform: Transform,
+        value_var: Variable | None = None,
+    ) -> TensorVariable:
+        """Create a ``TensorVariable`` that will be used as the random variable's "value" in log-likelihood graphs.
+
+        In general, we'll call this type of variable the "value" variable.
+
+        In all other cases, the role of the value variable is taken by
+        observed data. That's why value variables are only referenced in
+        this branch of the conditional.
+
+        Parameters
+        ----------
+        rv_var : TensorVariable
+
+        default_transform: Transform
+            A transform for the random variable in log-likelihood space.
+
+        transform: Transform
+            Additional transform which may be applied after default transform.
+
+        value_var : Variable, optional
+
+        Returns
+        -------
+        TensorVariable
+        """
+        from pymc.distributions.transforms import ChainedTransform, _default_transform
+
+        # Make the value variable a transformed value variable,
+        # if there's an applicable transform
+        if transform is None and default_transform is UNSET:
+            default_transform = None
+            warnings.warn(
+                "To disable default transform, please use default_transform=None"
+                " instead of transform=None. Setting transform to None will"
+                " not have any effect in future.",
+                UserWarning,
+            )
+
+        if default_transform is UNSET:
+            if rv_var.owner is None:
+                default_transform = None
+            else:
+                default_transform = _default_transform(rv_var.owner.op, rv_var)
+
+        if transform is UNSET:
+            transform = default_transform
+        elif transform is not None and default_transform is not None:
+            transform = ChainedTransform([default_transform, transform])
+
+        if value_var is None:
+            if transform is None:
+                # Create value variable with the same type as the RV
+                value_var = rv_var.type()
+                value_var.name = rv_var.name
+            else:
+                # Create value variable with the same type as the transformed RV
+                value_var = transform.forward(rv_var, *rv_var.owner.inputs).type()
+                value_var.name = f"{rv_var.name}_{transform.name}__"
+                value_var.tag.transform = transform
+
+        self.rvs_to_transforms[rv_var] = transform
+        self.rvs_to_values[rv_var] = value_var
+        self.values_to_rvs[value_var] = rv_var
+
+        return value_var
+
+    def register_data_var(self, data, dims=None):
+        """Register a data variable with the model."""
+        self.data_vars.append(data)
+        self.add_named_variable(data, dims=dims)
+
+    def add_named_variable(self, var, dims: tuple[str | None, ...] | None = None):
+        """Add a random graph variable to the named variables of the model.
+
+        This can include several types of variables such basic_RVs, Data, Deterministics,
+        and Potentials.
+
+        Parameters
+        ----------
+        var
+
+        dims : tuple, optional
+
+        """
+        if var.name is None:
+            raise ValueError("Variable is unnamed.")
+        if self.named_vars.tree_contains(var.name):
+            raise ValueError(f"Variable name {var.name} already exists.")
+        if var.name in self.coords:
+            raise ValueError(
+                f"Variable name '{var.name}' conflicts with an existing dimension name."
+            )
+
+        if dims is not None:
+            if isinstance(dims, str):
+                dims = (dims,)
+            for dim in dims:
+                if dim not in self.coords and dim is not None:
+                    raise ValueError(f"Dimension {dim} is not specified in `coords`.")
+            # This check implicitly states that only vars with .ndim attribute can have dims
+            if var.ndim != len(dims):
+                raise ValueError(
+                    f"{var} has {var.ndim} dims but {len(dims)} dim labels were provided."
+                )
+            self.named_vars_to_dims[var.name] = dims
+
+        self.named_vars[var.name] = var
+        if not hasattr(self, self.name_of(var.name)):
+            setattr(self, self.name_of(var.name), var)
+
+
+class FrozenModel(BaseModel):
+    """A model whose graph is immutable and whose compiled functions are cached.
+
+    Create one with :func:`pymc.model.transform.optimization.freeze_model`; this class
+    cannot be instantiated directly. Graph-mutating methods do not exist on it, which is
+    what makes caching safe without any invalidation. ``set_data`` remains available for
+    data that no free variable depends on — values and shapes are runtime inputs of the
+    cached functions.
+    """
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError(
+            "FrozenModel cannot be instantiated directly. "
+            "Create one from an existing model with freeze_model."
+        )
+
+    # Cached graphs and compiled functions. Seeding happens outside the cached calls, so
+    # every entry is seed-independent.
+    logp = locally_cachedmethod(BaseModel.logp)
+    dlogp = locally_cachedmethod(BaseModel.dlogp)
+    d2logp = locally_cachedmethod(BaseModel.d2logp)
+    # The initial point only seeds the runtime-settable extra variables, so it is not part
+    # of the cache key (it is re-applied by `logp_dlogp_function` on every call).
+    _cached_logp_dlogp_function = locally_cachedmethod(
+        BaseModel._logp_dlogp_function, ignore=("initial_point",)
+    )
+
+    def _logp_dlogp_function(self, *args, **kwargs):
+        # Unlike the graphs and functions cached above, a `ValueGradFunction` owns mutable
+        # state, so callers get their own shared variables on top of the cached graph.
+        return self._cached_logp_dlogp_function(*args, **kwargs).copy()
+
+    _make_initial_point = locally_cachedmethod(BaseModel._make_initial_point)
+
+    @overload
+    def compile_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        point_fn: Literal[True] = True,
+        **kwargs,
+    ) -> PointFunc: ...
+
+    @overload
+    def compile_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        point_fn: Literal[False],
+        **kwargs,
+    ) -> Function: ...
+
+    def compile_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        point_fn: bool = True,
+        **kwargs,
+    ) -> PointFunc | Function:
+        if inputs is None:
+            inputs = list(explicit_graph_inputs(outs))
+            if (not point_fn) and len(inputs) > 1:
+                raise ValueError(
+                    "compile_fn requires inputs to be specified when there is more than one input and point_fn is disabled."
+                )
+
+        random_seed = kwargs.pop("random_seed", None)
+
+        if _rng_detaching_linker(mode) and collect_default_updates(
+            inputs=[inp.variable if isinstance(inp, In) else inp for inp in inputs],
+            outputs=[out.variable if isinstance(out, Out) else out for out in makeiter(outs)],
+        ):
+            # These linkers detach RNGs at compile time, so a compiled function cannot be
+            # reseeded, and one compiled for a given seed cannot be reused for another.
+            kwargs.setdefault("allow_input_downcast", True)
+            kwargs.setdefault("accept_inplace", True)
+            with self:
+                fn = compile(inputs, outs, mode=mode, random_seed=random_seed, **kwargs)
+        else:
+            fn, rng_updates = self._compiled_fn(outs, inputs=tuple(inputs), mode=mode, **kwargs)
+            if rng_updates:
+                reseed_rngs(rng_updates, random_seed)
+
+        if point_fn:
+            return PointFunc(fn)
+        return fn
+
+    @locally_cachedmethod
+    def _compiled_fn(
+        self,
+        outs: Variable | Sequence[Variable],
+        *,
+        inputs: Sequence[Variable] | None = None,
+        mode=None,
+        **kwargs,
+    ) -> tuple[Function, list[SharedVariable]]:
+        # Compiling with random_seed=False leaves the function seed-independent, so it can be
+        # cached and reseeded by `compile_fn` on every call. The RNGs come back from
+        # `compile`, which had to collect them anyway, in the order it would have seeded
+        # them: `reseed_rngs` hands out sub-seeds by position, so a different order gives
+        # every variable a different stream.
+        kwargs.setdefault("allow_input_downcast", True)
+        kwargs.setdefault("accept_inplace", True)
+        with self:
+            fn, rng_updates = compile(
+                inputs, outs, mode=mode, random_seed=False, return_updates=True, **kwargs
+            )
+        return fn, list(rng_updates)
 
 
 class BlockModelAccess(Model):
-    """Can be used to prevent user access to Model contexts"""
+    """Can be used to prevent user access to Model contexts."""
 
     def __init__(self, *args, error_msg_on_access="Model access is blocked", **kwargs):
         self.error_msg_on_access = error_msg_on_access
@@ -2055,9 +2365,11 @@ def new_or_existing_block_model_access(*args, **kwargs):
 
 
 def set_data(new_data, model=None, *, coords=None):
-    """Sets the value of one or more data container variables.  Note that the shape is also
-    dynamic, it is updated when the value is changed.  See the examples below for two common
-    use-cases that take advantage of this behavior.
+    """Set the value of one or more data container variables.
+
+    Note that the shape is also dynamic, it is updated when the value is
+    changed.  See the examples below for two common use-cases that take
+    advantage of this behavior.
 
     Parameters
     ----------
@@ -2077,10 +2389,10 @@ def set_data(new_data, model=None, *, coords=None):
         import pymc as pm
 
         with pm.Model() as model:
-            x = pm.Data('x', [1., 2., 3.])
-            y = pm.Data('y', [1., 2., 3.])
-            beta = pm.Normal('beta', 0, 1)
-            obs = pm.Normal('obs', x * beta, 1, observed=y, shape=x.shape)
+            x = pm.Data("x", [1.0, 2.0, 3.0])
+            y = pm.Data("y", [1.0, 2.0, 3.0])
+            beta = pm.Normal("beta", 0, 1)
+            obs = pm.Normal("obs", x * beta, 1, observed=y, shape=x.shape)
             idata = pm.sample()
 
     Then change the value of `x` to predict on new data.
@@ -2107,9 +2419,9 @@ def set_data(new_data, model=None, *, coords=None):
         data = rng.normal(loc=1.0, scale=2.0, size=100)
 
         with pm.Model() as model:
-            y = pm.Data('y', data)
-            theta = pm.Normal('theta', mu=0.0, sigma=10.0)
-            obs = pm.Normal('obs', theta, 2.0, observed=y, shape=y.shape)
+            y = pm.Data("y", data)
+            theta = pm.Normal("theta", mu=0.0, sigma=10.0)
+            obs = pm.Normal("obs", theta, 2.0, observed=y, shape=y.shape)
             idata = pm.sample()
 
     Now update the model with a new data set.
@@ -2117,7 +2429,7 @@ def set_data(new_data, model=None, *, coords=None):
     .. code-block:: python
 
         with model:
-            pm.set_data({'y': rng.normal(loc=1.0, scale=2.0, size=200)})
+            pm.set_data({"y": rng.normal(loc=1.0, scale=2.0, size=200)})
             idata = pm.sample()
     """
     model = modelcontext(model)
@@ -2135,14 +2447,14 @@ def compile_fn(
     model: Model | None = None,
     **kwargs,
 ) -> PointFunc | Function:
-    """Compiles an PyTensor function
+    """Compiles a PyTensor function.
 
     Parameters
     ----------
     outs
         PyTensor variable or iterable of PyTensor variables.
-    inputs
-        PyTensor input variables, defaults to pytensorf.inputvars(outs).
+    inputs, optional
+        PyTensor input variables. Required if there is more than one input.
     mode
         PyTensor compilation mode, default=None.
     point_fn : bool
@@ -2155,7 +2467,6 @@ def compile_fn(
     -------
     Compiled PyTensor function
     """
-
     model = modelcontext(model)
     return model.compile_fn(
         outs,
@@ -2166,8 +2477,10 @@ def compile_fn(
     )
 
 
-def Point(*args, filter_model_vars=False, **kwargs) -> dict[VarName, np.ndarray]:
-    """Build a point. Uses same args as dict() does.
+def Point(*args, filter_model_vars=False, **kwargs) -> dict[str, np.ndarray]:
+    """Build a point.
+
+    Uses same args as dict() does.
     Filters out variables not in the model. All keys are strings.
 
     Parameters
@@ -2219,7 +2532,7 @@ def Deterministic(name, var, model=None, dims=None):
     Indeed, PyMC allows for arbitrary combinations of random variables, for
     example in the case of a logistic regression
 
-    .. code:: python
+    .. code-block:: python
 
         with pm.Model():
             alpha = pm.Normal("alpha", 0, 1)
@@ -2233,7 +2546,7 @@ def Deterministic(name, var, model=None, dims=None):
     ``p`` is important and one would like to track its value in the sampling
     trace, then one can use a deterministic node:
 
-    .. code:: python
+    .. code-block:: python
 
         with pm.Model():
             alpha = pm.Normal("alpha", 0, 1)
@@ -2258,7 +2571,7 @@ def Deterministic(name, var, model=None, dims=None):
     random variables.
     """
     model = modelcontext(model)
-    var = var.copy(model.name_for(name))
+    var = view_op(var, name=model.name_for(name))
     model.deterministics.append(var)
     model.add_named_variable(var, dims)
 
@@ -2309,7 +2622,7 @@ def Potential(name, var: TensorVariable, model=None, dims=None) -> TensorVariabl
     The statement ``pm.math.log(pm.math.switch(constraint, 0, 1))`` adds either 0 or -inf to the model logp,
     depending on whether the constraint is met. During sampling, any proposals where ``x`` is negative will be rejected.
 
-    .. code:: python
+    .. code-block:: python
 
         import pymc as pm
 
@@ -2323,7 +2636,7 @@ def Potential(name, var: TensorVariable, model=None, dims=None) -> TensorVariabl
     Instead, with a soft constraint like ``pm.math.log(pm.math.switch(constraint, 1, 0.5))``,
     the sampler will be less likely, but not forbidden, from accepting negative values for `x`.
 
-    .. code:: python
+    .. code-block:: python
 
         import pymc as pm
 
@@ -2331,33 +2644,35 @@ def Potential(name, var: TensorVariable, model=None, dims=None) -> TensorVariabl
             x = pm.Normal("x", mu=0, sigma=1)
 
             constraint = x >= 0
-            potential = pm.Potential("x_constraint", pm.math.log(pm.math.switch(constraint, 1.0, 0.5)))
+            potential = pm.Potential(
+                "x_constraint", pm.math.log(pm.math.switch(constraint, 1.0, 0.5))
+            )
 
     A Potential term can depend on multiple variables.
     In the following example, the ``soft_sum_constraint`` potential encourages ``x`` and ``y`` to have a small sum.
     The more the sum deviates from zero, the more negative the penalty value of ``(-((x + y)**2))``.
 
-    .. code:: python
+    .. code-block:: python
 
         import pymc as pm
 
         with pm.Model() as model:
             x = pm.Normal("x", mu=0, sigma=10)
             y = pm.Normal("y", mu=0, sigma=10)
-            soft_sum_constraint = pm.Potential("soft_sum_constraint", -((x + y)**2))
+            soft_sum_constraint = pm.Potential("soft_sum_constraint", -((x + y) ** 2))
 
     A Potential can be used to define a specific prior term.
     The following example imposes a power law prior on `max_items`, under the form ``log(1/max_items)``,
     which penalizes very large values of `max_items`.
 
-    .. code:: python
+    .. code-block:: python
 
         import pymc as pm
 
         with pm.Model() as model:
             # p(max_items) = 1 / max_items
             max_items = pm.Uniform("max_items", lower=1, upper=100)
-            pm.Potential("power_prior", pm.math.log(1/max_items))
+            pm.Potential("power_prior", pm.math.log(1 / max_items))
 
             n_items = pm.Uniform("n_items", lower=1, upper=max_items, observed=60)
 
@@ -2365,12 +2680,14 @@ def Potential(name, var: TensorVariable, model=None, dims=None) -> TensorVariabl
     In the following example, a normal likelihood term is added to fixed data.
     The same result would be obtained by using an observed `Normal` variable.
 
-    .. code:: python
+    .. code-block:: python
 
         import pymc as pm
 
+
         def normal_logp(value, mu, sigma):
             return -0.5 * ((value - mu) / sigma) ** 2 - pm.math.log(sigma)
+
 
         with pm.Model() as model:
             mu = pm.Normal("x")

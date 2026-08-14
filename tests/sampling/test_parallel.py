@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ import pymc as pm
 import pymc.sampling.parallel as ps
 
 from pymc.pytensorf import floatX
+from pymc.step_methods import CompoundStep
 
 
 def test_context():
@@ -39,6 +40,42 @@ def test_context():
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
             pm.sample(tune=2, draws=2, chains=2, cores=2, mp_ctx=ctx)
+
+
+class TestMpCtxJaxSwitch:
+    def test_switches_default_away_from_fork_under_jax(self):
+        if ps._initialize_multiprocessing_context(None).get_start_method() != "fork":
+            pytest.skip("platform default is not fork")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            ctx = ps._initialize_multiprocessing_context(None, mode="JAX")
+        assert ctx.get_start_method() != "fork"
+        assert not any("JAX backend" in str(x.message) for x in w)
+
+    def test_warns_when_user_explicitly_picks_fork_under_jax(self):
+        if "fork" not in multiprocessing.get_all_start_methods():
+            pytest.skip("fork start method not available on this platform")
+        with pytest.warns(UserWarning, match="JAX backend"):
+            ctx = ps._initialize_multiprocessing_context("fork", mode="JAX")
+        assert ctx.get_start_method() == "fork"
+
+    def test_leaves_non_jax_default_alone(self):
+        expected = ps._initialize_multiprocessing_context(None).get_start_method()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            ctx = ps._initialize_multiprocessing_context(None, mode="NUMBA")
+        assert ctx.get_start_method() == expected
+        assert not any("JAX backend" in str(x.message) for x in w)
+
+    @pytest.mark.parametrize("explicit", ["spawn", "forkserver"])
+    def test_no_warn_when_user_picks_safe_method(self, explicit):
+        if explicit not in multiprocessing.get_all_start_methods():
+            pytest.skip(f"{explicit} start method not available on this platform")
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            ctx = ps._initialize_multiprocessing_context(explicit, mode="JAX")
+        assert ctx.get_start_method() == explicit
+        assert not any("JAX backend" in str(x.message) for x in w)
 
 
 class NoUnpickle:
@@ -100,7 +137,7 @@ def test_abort(mp_start_method):
         step1 = pm.NUTS([model.rvs_to_values[a]])
         step2 = pm.Metropolis([model.rvs_to_values[b]])
 
-    step = pm.CompoundStep([step1, step2])
+    step = CompoundStep([step1, step2])
 
     # on Windows we cannot fork
     if platform.system() == "Windows" and mp_start_method == "fork":
@@ -141,7 +178,7 @@ def test_explicit_sample(mp_start_method):
         step1 = pm.NUTS([model.rvs_to_values[a]])
         step2 = pm.Metropolis([model.rvs_to_values[b]])
 
-    step = pm.CompoundStep([step1, step2])
+    step = CompoundStep([step1, step2])
 
     # on Windows we cannot fork
     if platform.system() == "Windows" and mp_start_method == "fork":
@@ -157,7 +194,7 @@ def test_explicit_sample(mp_start_method):
         10,
         step,
         chain=3,
-        seed=1,
+        rng=np.random.default_rng(1),
         mp_ctx=ctx,
         start={"a": floatX(np.array([1.0])), "b_log__": floatX(np.array(2.0))},
         step_method_pickled=step_method_pickled,
@@ -182,7 +219,7 @@ def test_iterator():
         step1 = pm.NUTS([model.rvs_to_values[a]])
         step2 = pm.Metropolis([model.rvs_to_values[b]])
 
-    step = pm.CompoundStep([step1, step2])
+    step = CompoundStep([step1, step2])
 
     start = {"a": floatX(np.array([1.0])), "b_log__": floatX(np.array(2.0))}
     sampler = ps.ParallelSampler(
@@ -190,7 +227,7 @@ def test_iterator():
         tune=10,
         chains=3,
         cores=2,
-        seeds=[2, 3, 4],
+        rngs=np.random.default_rng(1).spawn(3),
         start_points=[start] * 3,
         step_method=step,
         progressbar=False,
@@ -228,3 +265,23 @@ def test_spawn_densitydist_bound_method():
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
             pm.sample(draws=10, tune=10, step=pm.Metropolis(), cores=2, mp_ctx="spawn")
+
+
+@pytest.mark.parametrize("cores", (1, 2))
+def test_sampling_with_random_generator_matches(cores):
+    # Regression test for https://github.com/pymc-devs/pymc/issues/7612
+    kwargs = {
+        "chains": 2,
+        "cores": cores,
+        "tune": 10,
+        "draws": 10,
+        "compute_convergence_checks": False,
+        "progress_bar": False,
+    }
+    with pm.Model() as m:
+        x = pm.Normal("x")
+
+        post1 = pm.sample(random_seed=np.random.default_rng(42), **kwargs).posterior
+        post2 = pm.sample(random_seed=np.random.default_rng(42), **kwargs).posterior
+
+    assert post1.equals(post2), (post1["x"].mean().item(), post2["x"].mean().item())

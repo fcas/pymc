@@ -5,6 +5,8 @@ Model creation and inspection
 .. autosummary::
    :toctree: generated/
 
+   BaseModel
+   FrozenModel
    Model
    modelcontext
 
@@ -29,5 +31,6 @@ Graph visualization
 .. autosummary::
    :toctree: generated/
 
-   model_to_networkx
    model_to_graphviz
+   model_to_mermaid
+   model_to_networkx

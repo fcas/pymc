@@ -34,7 +34,7 @@ $$
 z \sim \text{Normal}(0, 5)
 $$
 
-A call to a {class}`~pymc.Distribution` constructor as shown above returns an PyTensor {class}`~pytensor.tensor.TensorVariable`, which is a symbolic representation of the model variable and the graph of inputs it depends on.
+A call to a {class}`~pymc.Distribution` constructor as shown above returns a PyTensor {class}`~pytensor.tensor.TensorVariable`, which is a symbolic representation of the model variable and the graph of inputs it depends on.
 Under the hood, the variables are created through the {meth}`~pymc.Distribution.dist` API, which calls the {class}`~pytensor.tensor.random.basic.RandomVariable` {class}`~pytensor.graph.op.Op` corresponding to the distribution.
 
 At a high level of abstraction, the idea behind ``RandomVariable`` ``Op``s is to create symbolic variables (``TensorVariable``s) that can be associated with the properties of a probability distribution.
@@ -134,7 +134,7 @@ model_logp                                       # ==> -6.6973152
 
 ## Behind the scenes of the ``logp`` function
 
-The ``logp`` function is straightforward - it is an PyTensor function within each distribution.
+The ``logp`` function is straightforward - it is a PyTensor function within each distribution.
 It has the following signature:
 
 :::{warning}
@@ -173,7 +173,7 @@ self.logp_nojac_unscaledt = distribution.logp_nojac(data)
 
 ### Model context and Random Variable
 
-I like to think that the ``with pm.Model() ...`` is a key syntax feature and *the* signature of PyMC model language, and in general a great out-of-the-box thinking/usage of the context manager in Python (with [some critics](https://twitter.com/_szhang/status/890793373740617729), of course).
+I like to think that the ``with pm.Model() ...`` is a key syntax feature and *the* signature of PyMC model language, and in general a great out-of-the-box thinking/usage of the context manager in Python (with some critics, of course).
 
 Essentially [what a context manager does](https://www.python.org/dev/peps/pep-0343/) is:
 
@@ -245,7 +245,7 @@ usually created in order to optimise performance. But getting a
 possible (see also in
 {ref}`doc <pymc_overview##Transformed-distributions-and-changes-of-variables>`):
 
-.. code:: python
+.. code-block:: python
 
 
     lognorm = Exp().apply(pm.Normal.dist(0., 1.))
@@ -262,7 +262,7 @@ Now, back to ``model.RV(...)`` - things returned from ``model.RV(...)``
 are PyTensor tensor variables, and it is clear from looking at
 ``TransformedRV``:
 
-.. code:: python
+.. code-block:: python
 
     class TransformedRV(TensorVariable):
         ...
@@ -270,20 +270,20 @@ are PyTensor tensor variables, and it is clear from looking at
 as for ``FreeRV`` and ``ObservedRV``, they are ``TensorVariable``\s with
 ``Factor`` as mixin:
 
-.. code:: python
+.. code-block:: python
 
     class FreeRV(Factor, TensorVariable):
         ...
 
 ``Factor`` basically `enable and assign the
 logp <https://github.com/pymc-devs/pymc/blob/6d07591962a6c135640a3c31903eba66b34e71d8/pymc/model.py#L195-L276>`__
-(represented as a tensor also) property to an PyTensor tensor (thus
+(represented as a tensor also) property to a PyTensor tensor (thus
 making it a random variable). For a ``TransformedRV``, it transforms the
 distribution into a ``TransformedDistribution``, and then ``model.Var`` is
 called again to added the RV associated with the
 ``TransformedDistribution`` as a ``FreeRV``:
 
-.. code:: python
+.. code-block:: python
 
         ...
         self.transformed = model.Var(
@@ -295,13 +295,13 @@ only add one ``FreeRV``. In another word, you *cannot* do chain
 transformation by nested applying multiple transforms to a Distribution
 (however, you can use ``Chain`` transformation.
 
-.. code:: python
+.. code-block:: python
 
     z = pm.LogNormal.dist(mu=0., sigma=1., transform=tr.Log)
     z.transform           # ==> pymc.distributions.transforms.Log
 
 
-.. code:: python
+.. code-block:: python
 
     z2 = Exp().apply(z)
     z2.transform is None  # ==> True
@@ -373,7 +373,7 @@ def logpt(self):
         return logp
 ```
 
-which returns an PyTensor tensor that its value depends on the free parameters in the model (i.e., its parent nodes from the PyTensor graph).
+which returns a PyTensor tensor that its value depends on the free parameters in the model (i.e., its parent nodes from the PyTensor graph).
 You can evaluate or compile into a python callable (that you can pass numpy as input args).
 Note that the logp tensor depends on its input in the PyTensor graph, thus you cannot pass new tensor to generate a logp function.
 For similar reason, in PyMC we do graph copying a lot using pytensor.clone_replace to replace the inputs to a tensor.
@@ -387,10 +387,10 @@ with pm.Model() as m:
 print(m.basic_RVs)    # ==> [z, x, y]
 print(m.free_RVs)     # ==> [z, x]
 
-type(m.logpt)
+type(m.logp)
 # pytensor.tensor.var.TensorVariable
 
-m.logpt.eval({x: np.random.randn(*x.tag.test_value.shape) for x in m.free_RVs})
+m.logpt.eval(m.initial_point())
 # array(-51.25369126)
 ```
 
@@ -419,11 +419,9 @@ On a high level, it allows us to build conditional logp function and its gradien
 Here is a taste of how it works in action:
 
 ```python
-inputlist = [np.random.randn(*x.tag.test_value.shape) for x in m.free_RVs]
-
 func = m.logp_dlogp_function()
 func.set_extra_values({})
-input_dict = {x.name: y for x, y in zip(m.free_RVs, inputlist)}
+input_dict = m.initial_point()
 print(input_dict)
 input_array = func.dict_to_array(input_dict)
 print(input_array)
@@ -527,7 +525,7 @@ Moreover, if we are limiting to the problem that we can solved most confidently 
 ## Inference
 
 ### MCMC
-The ability for model instance to generate conditional logp and dlogp function enable one of the unique feature of PyMC - {class}`~pymc.CompoundStep` method.
+The ability for model instance to generate conditional logp and dlogp function enable one of the unique feature of PyMC - {class}`~pymc.step_methods.CompoundStep` method.
 On a conceptual level it is a Metropolis-within-Gibbs sampler.
 Users can specify different sampler for different RVs.
 Alternatively, it is implemented as yet another interceptor:
@@ -546,7 +544,7 @@ And the transition kernel (i.e., ``.astep()``) takes an array as input and outpu
 For example, see the [MH sampler](https://github.com/pymc-devs/pymc/blob/89f6fcf751774fb50016561dc448a87fba7ed3aa/pymc/step_methods/metropolis.py#L235-L289).
 
 This is of course very different compared to the transition kernel in e.g. TFP, which is a tenor in tensor out function.
-Moreover, transition kernels in TFP do not flatten the tensors, see eg docstring of [tensorflow\_probability/python/mcmc/random\_walk\_metropolis.py](https://github.com/tensorflow/probability/blob/master/tensorflow_probability/python/mcmc/random_walk_metropolis.py):
+Moreover, transition kernels in TFP do not flatten the tensors, see eg docstring of [tensorflow\_probability/python/mcmc/random\_walk\_metropolis.py](https://github.com/tensorflow/probability/blob/main/tensorflow_probability/python/mcmc/random_walk_metropolis.py):
 
 ```python
         new_state_fn: Python callable which takes a list of state parts and a
@@ -561,7 +559,7 @@ Moreover, transition kernels in TFP do not flatten the tensors, see eg docstring
 We love NUTS, or to be more precise Dynamic HMC with complex stopping rules.
 This part is actually all done outside of PyTensor, for NUTS, it includes:
 The leapfrog, dual averaging, tuning of mass matrix and step size, the tree building, sampler related statistics like divergence and energy checking.
-We actually have an PyTensor version of HMC, but it has never been used, and has been removed from the main repository.
+We actually have a PyTensor version of HMC, but it has never been used, and has been removed from the main repository.
 It can still be found in the [git history](https://github.com/pymc-devs/pymc/pull/3734/commits/0fdae8207fd14f66635f3673ef267b2b8817aa68), though.
 
 #### Variational Inference (VI)
@@ -648,7 +646,7 @@ As in the batch random generation, we want to generate (n\_sample, ) + RV.shape 
 In some cases, where we broadcast RV1 and RV2 to create a RV3 that has one more batch shape, we get error (even worse, wrong answer with silent error).
 
 The good news is, we are fixing these errors with the amazing works from [lucianopaz](https://github.com/lucianopaz) and others.
-The challenge and some summary of the solution could be found in Luciano's [blog post](https://lucianopaz.github.io/2019/08/19/pymc-shape-handling/)
+The challenge and some summary of the solution could be found in Luciano's [blog post](https://lucianopaz.github.io/2019/08/19/pymc3-shape-handling/)
 
 ```python
 with pm.Model() as m:
@@ -666,8 +664,8 @@ There are also other error related random sample generation (e.g., [Mixture is c
 
 ### Extending PyMC
 -  Custom Inference method
-    -  [Inferencing Linear Mixed Model with EM.ipynb](https://github.com/junpenglao/Planet_Sakaar_Data_Science/blob/master/Ports/Inferencing%20Linear%20Mixed%20Model%20with%20EM.ipynb)
-    -  [Laplace approximation in  pymc.ipynb](https://github.com/junpenglao/Planet_Sakaar_Data_Science/blob/master/Ports/Laplace%20approximation%20in%20pymc.ipynb)
+    -  [Inferencing Linear Mixed Model with EM.ipynb](https://github.com/junpenglao/Planet_Sakaar_Data_Science/blob/main/Ports/Inferencing%20Linear%20Mixed%20Model%20with%20EM.ipynb)
+    -  [Laplace approximation in  pymc.ipynb](https://github.com/junpenglao/Planet_Sakaar_Data_Science/blob/main/Ports/Laplace%20approximation%20in%20pymc3.ipynb)
 -  Connecting it to other library within a model
     -  Using "black box" likelihood function by creating a custom PyTensor Op.
     -  Using emcee

@@ -6,7 +6,7 @@ PyTensor utils
 .. autosummary::
    :toctree: generated/
 
-   compile_pymc
+   compile
    gradient
    hessian
    hessian_diag
@@ -15,10 +15,8 @@ PyTensor utils
    cont_inputs
    floatX
    intX
-   smartfloatX
    constant_fold
    CallableTensor
    join_nonshared_inputs
    make_shared_replacements
-   generator
-   convert_observed_data
+   convert_data

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
 from functools import singledispatch
 
 import numpy as np
-import pytensor
 import pytensor.tensor as pt
 
-from pytensor import config, graph_replace, scan
+from pytensor import config, scan
 from pytensor.graph import Op
-from pytensor.graph.basic import Node
+from pytensor.graph.basic import Apply
+from pytensor.graph.replace import graph_replace
 from pytensor.raise_op import CheckAndRaise
 from pytensor.scan import until
 from pytensor.tensor import TensorConstant, TensorVariable
@@ -30,7 +30,6 @@ from pytensor.tensor.random.type import RandomType
 from pymc.distributions.continuous import TruncatedNormal, bounded_cont_transform
 from pymc.distributions.dist_math import check_parameters
 from pymc.distributions.distribution import (
-    CustomSymbolicDistRV,
     Distribution,
     SymbolicRandomVariable,
     _support_point,
@@ -45,17 +44,14 @@ from pymc.distributions.shape_utils import (
 from pymc.distributions.transforms import _default_transform
 from pymc.exceptions import TruncationError
 from pymc.logprob.abstract import _logcdf, _logprob
-from pymc.logprob.basic import icdf, logcdf, logp
+from pymc.logprob.basic import icdf, logccdf, logcdf, logp
 from pymc.math import logdiffexp
 from pymc.pytensorf import collect_default_updates
 from pymc.util import check_dist_not_registered
 
 
 class TruncatedRV(SymbolicRandomVariable):
-    """
-    An `Op` constructed from an PyTensor graph
-    that represents a truncated univariate random variable.
-    """
+    """An `Op` constructed from a PyTensor graph that represents a truncated univariate random variable."""
 
     default_output: int = 0
     base_rv_op: Op
@@ -99,35 +95,40 @@ class TruncatedRV(SymbolicRandomVariable):
         dist = change_dist_size(dist, new_size=size)
 
         rv_inputs = [
-            inp
-            if not isinstance(inp.type, RandomType)
-            else pytensor.shared(np.random.default_rng())
+            inp if not isinstance(inp.type, RandomType) else pt.random.shared_rng(seed=None)
             for inp in dist.owner.inputs
         ]
         graph_inputs = [*rv_inputs, lower, upper]
 
-        rv = dist.owner.op.make_node(*rv_inputs).default_output()
+        # Variables with `_` suffix identify dummy inputs for the OpFromGraph
+        graph_inputs_ = [
+            inp.type() if not isinstance(inp.type, RandomType) else inp for inp in graph_inputs
+        ]
+        *rv_inputs_, lower_, upper_ = graph_inputs_
+
+        rv_ = dist.owner.op.make_node(*rv_inputs_).default_output()
 
         # Try to use inverted cdf sampling
         # truncated_rv = icdf(rv, draw(uniform(cdf(lower), cdf(upper))))
         try:
-            logcdf_lower, logcdf_upper = cls._create_logcdf_exprs(rv, rv, lower, upper)
+            logcdf_lower_, logcdf_upper_ = TruncatedRV._create_logcdf_exprs(
+                rv_, rv_, lower_, upper_
+            )
             # We use the first RNG from the base RV, so we don't have to introduce a new one
             # This is not problematic because the RNG won't be used in the RV logcdf graph
-            uniform_rng = next(inp for inp in rv_inputs if isinstance(inp.type, RandomType))
-            uniform_next_rng, uniform = pt.random.uniform(
-                pt.exp(logcdf_lower),
-                pt.exp(logcdf_upper),
-                rng=uniform_rng,
-                size=rv.shape,
-            ).owner.outputs
-            # So icdf does not see the random graph of uniform
-            uniform_type = uniform.type()
-            truncated_rv = graph_replace(icdf(rv, uniform_type), {uniform_type: uniform})
+            uniform_rng_ = next(inp_ for inp_ in rv_inputs_ if isinstance(inp_.type, RandomType))
+            uniform_next_rng_, uniform_ = pt.random.uniform(
+                pt.exp(logcdf_lower_),
+                pt.exp(logcdf_upper_),
+                rng=uniform_rng_,
+                size=rv_.shape,
+                return_next_rng=True,
+            )
+            truncated_rv_ = icdf(rv_, uniform_, warn_rvs=False)
             return TruncatedRV(
                 base_rv_op=dist.owner.op,
-                inputs=graph_inputs,
-                outputs=[truncated_rv, uniform_next_rng],
+                inputs=graph_inputs_,
+                outputs=[truncated_rv_, uniform_next_rng_],
                 ndim_supp=0,
                 max_n_steps=max_n_steps,
             )(*graph_inputs)
@@ -140,8 +141,26 @@ class TruncatedRV(SymbolicRandomVariable):
         # while any(reject_draws):
         #    truncated_rv[reject_draws] = draw(rv)[reject_draws]
         #    reject_draws = (truncated_rv < lower) | (truncated_rv > upper)
-        def loop_fn(truncated_rv, reject_draws, lower, upper, *rv_inputs):
-            new_truncated_rv = dist.owner.op.make_node(*rv_inputs).default_output()
+
+        # We need to split the rv_inputs on whether they are rng or not, as rng must be updated inside the scan
+        # TODO: This will be simplified by https://github.com/pymc-devs/pytensor/pull/1968
+        is_rng_arg = tuple(isinstance(arg.type, RandomType) for arg in rv_inputs_)
+        len_rng = sum(is_rng_arg)
+
+        def loop_fn(truncated_rv, reject_draws, *truncated_args):
+            rngs = truncated_args[:len_rng]
+            lower, upper, *other_args = truncated_args[len_rng:]
+
+            step_rv_inputs = []
+            rngs_iter = iter(rngs)
+            other_args_iter = iter(other_args)
+            for is_rng in is_rng_arg:
+                if is_rng:
+                    step_rv_inputs.append(next(rngs_iter))
+                else:
+                    step_rv_inputs.append(next(other_args_iter))
+
+            new_truncated_rv = dist.owner.op.make_node(*step_rv_inputs).default_output()
             # Avoid scalar boolean indexing
             if truncated_rv.type.ndim == 0:
                 truncated_rv = new_truncated_rv
@@ -152,40 +171,41 @@ class TruncatedRV(SymbolicRandomVariable):
                 )
             reject_draws = pt.or_((truncated_rv < lower), (truncated_rv > upper))
 
+            rng_updates = collect_default_updates(new_truncated_rv, must_be_shared=False)
+            next_rngs = [rng_updates[rng] for rng in rngs]
+
             return (
-                (truncated_rv, reject_draws),
-                collect_default_updates(new_truncated_rv, inputs=rv_inputs),
+                (truncated_rv, reject_draws, *next_rngs),
                 until(~pt.any(reject_draws)),
             )
 
-        (truncated_rv, reject_draws_), updates = scan(
+        truncated_rv_, reject_draws_, *final_rngs = scan(
             loop_fn,
             outputs_info=[
-                pt.zeros_like(rv),
-                pt.ones_like(rv, dtype=bool),
+                pt.zeros_like(rv_),
+                pt.ones_like(rv_, dtype=bool),
+                *(arg for is_rng, arg in zip(is_rng_arg, rv_inputs_) if is_rng),
             ],
-            non_sequences=[lower, upper, *rv_inputs],
+            non_sequences=[
+                lower_,
+                upper_,
+                *(arg for is_rng, arg in zip(is_rng_arg, rv_inputs_) if not is_rng),
+            ],
             n_steps=max_n_steps,
             strict=True,
+            return_updates=False,
         )
 
-        truncated_rv = truncated_rv[-1]
-        convergence = ~pt.any(reject_draws_[-1])
-        truncated_rv = TruncationCheck(f"Truncation did not converge in {max_n_steps} steps")(
-            truncated_rv, convergence
+        truncated_rv_ = truncated_rv_[-1]
+        convergence_ = ~pt.any(reject_draws_[-1])
+        truncated_rv_ = TruncationCheck(f"Truncation did not converge in {max_n_steps} steps")(
+            truncated_rv_, convergence_
         )
-
-        # Sort updates of each RNG so that they show in the same order as the input RNGs
-        def sort_updates(update):
-            rng, next_rng = update
-            return graph_inputs.index(rng)
-
-        next_rngs = [next_rng for rng, next_rng in sorted(updates.items(), key=sort_updates)]
 
         return TruncatedRV(
             base_rv_op=dist.owner.op,
-            inputs=graph_inputs,
-            outputs=[truncated_rv, *next_rngs],
+            inputs=graph_inputs_,
+            outputs=[truncated_rv_, *final_rngs],
             ndim_supp=0,
             max_n_steps=max_n_steps,
         )(*graph_inputs)
@@ -209,7 +229,24 @@ class TruncatedRV(SymbolicRandomVariable):
         upper_logcdf = graph_replace(lower_logcdf, {lower_value: upper_value})
         return lower_logcdf, upper_logcdf
 
-    def update(self, node: Node):
+    @staticmethod
+    def _create_lower_logccdf_expr(
+        base_rv: TensorVariable,
+        value: TensorVariable,
+        lower: TensorVariable,
+    ) -> TensorVariable:
+        """Create logccdf expression at lower bound for base_rv.
+
+        Uses `value` as a template for broadcasting. This is numerically more
+        stable than computing log(1 - exp(logcdf)) for distributions that have
+        a registered logccdf method.
+        """
+        # For left truncated discrete RVs, we need to include the whole lower bound.
+        lower_value = lower - 1 if base_rv.type.dtype.startswith("int") else lower
+        lower_value = pt.full_like(value, lower_value, dtype=config.floatX)
+        return logccdf(base_rv, lower_value, warn_rvs=False)
+
+    def update(self, node: Apply):
         """Return the update mapping for the internal RNGs.
 
         TruncatedRVs are created in a way that the rng updates follow the same order as the input RNGs.
@@ -227,6 +264,7 @@ def _truncated(op: Op, lower, upper, size, *params):
 
 class TruncationCheck(CheckAndRaise):
     """Implements a check in truncated graphs.
+
     Raises `TruncationError` if the check is not True.
     """
 
@@ -234,12 +272,13 @@ class TruncationCheck(CheckAndRaise):
         super().__init__(TruncationError, msg)
 
     def __str__(self):
+        """Return a string representation of the object."""
         return f"TruncationCheck{{{self.msg}}}"
 
 
 class Truncated(Distribution):
     r"""
-    Truncated distribution
+    Truncated distribution.
 
     The pdf of a Truncated distribution is
 
@@ -296,16 +335,23 @@ class Truncated(Distribution):
     def dist(cls, dist, lower=None, upper=None, max_n_steps: int = 10_000, **kwargs):
         if not (
             isinstance(dist, TensorVariable)
-            and isinstance(dist.owner.op, RandomVariable | CustomSymbolicDistRV)
+            and dist.owner is not None
+            and isinstance(dist.owner.op, RandomVariable | SymbolicRandomVariable)
         ):
-            if isinstance(dist.owner.op, SymbolicRandomVariable):
-                raise NotImplementedError(
-                    f"Truncation not implemented for SymbolicRandomVariable {dist.owner.op}.\n"
-                    f"You can try wrapping the distribution inside a CustomDist instead."
-                )
             raise ValueError(
                 f"Truncation dist must be a distribution created via the `.dist()` API, got {type(dist)}"
             )
+
+        if (
+            isinstance(dist.owner.op, SymbolicRandomVariable)
+            and "[size]" not in dist.owner.op.extended_signature
+        ):
+            # Truncation needs to wrap the underlying dist, but not all SymbolicRandomVariables encapsulate the whole
+            # random graph and as such we don't know where the actual inputs begin. This happens mostly for
+            # distribution factories like `Censored` and `Mixture` which would have a very complex signature if they
+            # encapsulated the random components instead of taking them as inputs like they do now.
+            # SymbolicRandomVariables that encapsulate the whole random graph can be identified for having a size parameter.
+            raise NotImplementedError(f"Truncation not implemented for {dist.owner.op}")
 
         if dist.owner.op.ndim_supp > 0:
             raise NotImplementedError("Truncation not implemented for multivariate distributions")
@@ -390,7 +436,7 @@ def truncated_logprob(op, values, *inputs, **kwargs):
     if is_lower_bounded and is_upper_bounded:
         lognorm = logdiffexp(upper_logcdf, lower_logcdf)
     elif is_lower_bounded:
-        lognorm = pt.log1mexp(lower_logcdf)
+        lognorm = TruncatedRV._create_lower_logccdf_expr(base_rv, value, lower)
     elif is_upper_bounded:
         lognorm = upper_logcdf
 
@@ -413,7 +459,7 @@ def truncated_logprob(op, values, *inputs, **kwargs):
 
 
 @_logcdf.register(TruncatedRV)
-def truncated_logcdf(op: TruncatedRV, value, *inputs, **kwargs):
+def truncated_logcdf(op: TruncatedRV, value, *inputs):
     *rv_inputs, lower, upper = inputs
 
     base_rv = op.base_rv_op.make_node(*rv_inputs).default_output()
@@ -427,7 +473,7 @@ def truncated_logcdf(op: TruncatedRV, value, *inputs, **kwargs):
     if is_lower_bounded and is_upper_bounded:
         lognorm = logdiffexp(upper_logcdf, lower_logcdf)
     elif is_lower_bounded:
-        lognorm = pt.log1mexp(lower_logcdf)
+        lognorm = TruncatedRV._create_lower_logccdf_expr(base_rv, value, lower)
     elif is_upper_bounded:
         lognorm = upper_logcdf
 
@@ -451,7 +497,7 @@ def truncated_logcdf(op: TruncatedRV, value, *inputs, **kwargs):
 
 
 @_truncated.register(NormalRV)
-def _truncated_normal(op, lower, upper, size, rng, old_size, dtype, mu, sigma):
+def _truncated_normal(op, lower, upper, size, rng, old_size, mu, sigma):
     return TruncatedNormal.dist(
         mu=mu,
         sigma=sigma,
@@ -459,5 +505,5 @@ def _truncated_normal(op, lower, upper, size, rng, old_size, dtype, mu, sigma):
         upper=upper,
         rng=None,  # Do not reuse rng to avoid weird dependencies
         size=size,
-        dtype=dtype,
+        dtype=op.dtype,
     )

@@ -2,30 +2,31 @@
 name: pymc-docs
 channels:
 - conda-forge
-- defaults
+- nodefaults
 dependencies:
 # Base dependencies
-- arviz>=0.13.0
-- cachetools>=4.2.1
+- arviz>=1.1.0,<2.0
+- cachetools>=4.2.1,<7
 - cloudpickle
-- numpy>=1.15.0
+- numpy>=1.25.0
 - pandas>=0.24.0
 - pip
-- pytensor>=2.20,<2.21
+- pytensor>=3.2.2,<3.3
 - python-graphviz
 - rich>=13.7.1
 - scipy>=1.4.1
 - typing-extensions>=3.7.4
 - threadpoolctl>=3.1.0
+- zarr>=2.5.0,<3
 # Extra dependencies for docs build
 - ipython>=7.16
 - jax
 - jupyter-sphinx
-- myst-nb
+- myst-nb<=1.0.0
 - numpydoc
 - polyagamma
 - pre-commit>=2.8.0
-- pymc-sphinx-theme==0.14
+- pymc-sphinx-theme>=0.16
 - sphinx-copybutton
 - sphinx-design
 - sphinx-notfound-page

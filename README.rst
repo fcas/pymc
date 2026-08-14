@@ -3,7 +3,7 @@
     :alt: PyMC logo
     :align: center
 
-|Build Status| |Coverage| |NumFOCUS_badge| |Binder| |Dockerhub| |DOIzenodo|
+|Build Status| |Coverage| |NumFOCUS_badge| |Binder| |Dockerhub| |DOIzenodo| |Conda Downloads|
 
 PyMC (formerly PyMC3) is a Python package for Bayesian statistical modeling
 focusing on advanced Markov chain Monte Carlo (MCMC) and variational inference (VI)
@@ -33,6 +33,140 @@ Features
     *  Simple extensibility
 -  Transparent support for missing value imputation
 
+
+Linear Regression Example
+==========================
+
+
+Plant growth can be influenced by multiple factors, and understanding these relationships is crucial for optimizing agricultural practices.
+
+Imagine we conduct an experiment to predict the growth of a plant based on different environmental variables.
+
+.. code-block:: python
+
+   import pymc as pm
+
+   # Taking draws from a normal distribution
+   seed = 42
+   x_dist = pm.Normal.dist(shape=(100, 3))
+   x_data = pm.draw(x_dist, random_seed=seed)
+
+   # Independent Variables:
+   # Sunlight Hours: Number of hours the plant is exposed to sunlight daily.
+   # Water Amount: Daily water amount given to the plant (in milliliters).
+   # Soil Nitrogen Content: Percentage of nitrogen content in the soil.
+
+
+   # Dependent Variable:
+   # Plant Growth (y): Measured as the increase in plant height (in centimeters) over a certain period.
+
+
+   # Define coordinate values for all dimensions of the data
+   coords={
+    "trial": range(100),
+    "features": ["sunlight hours", "water amount", "soil nitrogen"],
+   }
+
+   # Define generative model
+   with pm.Model(coords=coords) as generative_model:
+      x = pm.Data("x", x_data, dims=["trial", "features"])
+
+      # Model parameters
+      betas = pm.Normal("betas", dims="features")
+      sigma = pm.HalfNormal("sigma")
+
+      # Linear model
+      mu = x @ betas
+
+      # Likelihood
+      # Assuming we measure deviation of each plant from baseline
+      plant_growth = pm.Normal("plant growth", mu, sigma, dims="trial")
+
+
+   # Generating data from model by fixing parameters
+   fixed_parameters = {
+    "betas": [5, 20, 2],
+    "sigma": 0.5,
+   }
+   with pm.do(generative_model, fixed_parameters) as synthetic_model:
+      idata = pm.sample_prior_predictive(random_seed=seed) # Sample from prior predictive distribution.
+      synthetic_y = idata.prior["plant growth"].sel(draw=0, chain=0)
+
+
+   # Infer parameters conditioned on observed data
+   with pm.observe(generative_model, {"plant growth": synthetic_y}) as inference_model:
+      idata = pm.sample(random_seed=seed)
+
+      summary = pm.stats.summary(idata, var_names=["betas", "sigma"])
+      print(summary)
+
+
+From the summary, we can see that the mean of the inferred parameters are very close to the fixed parameters
+
+=====================  ======  =====  ========  =========  ===========  =========  ==========  ==========  =======
+Params                  mean     sd    hdi_3%    hdi_97%    mcse_mean    mcse_sd    ess_bulk    ess_tail    r_hat
+=====================  ======  =====  ========  =========  ===========  =========  ==========  ==========  =======
+betas[sunlight hours]   4.972  0.054     4.866      5.066        0.001      0.001        3003        1257        1
+betas[water amount]    19.963  0.051    19.872     20.062        0.001      0.001        3112        1658        1
+betas[soil nitrogen]    1.994  0.055     1.899      2.107        0.001      0.001        3221        1559        1
+sigma                   0.511  0.037     0.438      0.575        0.001      0            2945        1522        1
+=====================  ======  =====  ========  =========  ===========  =========  ==========  ==========  =======
+
+.. code-block:: python
+
+   # Simulate new data conditioned on inferred parameters
+   new_x_data = pm.draw(
+      pm.Normal.dist(shape=(3, 3)),
+      random_seed=seed,
+   )
+   new_coords = coords | {"trial": [0, 1, 2]}
+
+   with inference_model:
+      pm.set_data({"x": new_x_data}, coords=new_coords)
+      pm.sample_posterior_predictive(
+         idata,
+         predictions=True,
+         extend_inferencedata=True,
+         random_seed=seed,
+      )
+
+   pm.stats.summary(idata.predictions, kind="stats")
+
+The new data conditioned on inferred parameters would look like:
+
+================ ======== ======= ======== =========
+Output            mean     sd      hdi_3%   hdi_97%
+================ ======== ======= ======== =========
+plant growth[0]   14.229   0.515   13.325   15.272
+plant growth[1]   24.418   0.511   23.428   25.326
+plant growth[2]   -6.747   0.511   -7.740   -5.797
+================ ======== ======= ======== =========
+
+.. code-block:: python
+
+   # Simulate new data, under a scenario where the first beta is zero
+   with pm.do(
+    inference_model,
+    {inference_model["betas"]: inference_model["betas"] * [0, 1, 1]},
+   ) as plant_growth_model:
+      new_predictions = pm.sample_posterior_predictive(
+         idata,
+         predictions=True,
+         random_seed=seed,
+      )
+
+   pm.stats.summary(new_predictions, kind="stats")
+
+The new data, under the above scenario would look like:
+
+================ ======== ======= ======== =========
+Output            mean     sd      hdi_3%   hdi_97%
+================ ======== ======= ======== =========
+plant growth[0]   12.149   0.515   11.193   13.135
+plant growth[1]   29.809   0.508   28.832   30.717
+plant growth[2]   -0.131   0.507   -1.121    0.791
+================ ======== ======= ======== =========
+
 Getting started
 ===============
 
@@ -52,6 +186,8 @@ Learn Bayesian statistics with a book together with PyMC
 -  `PyMC port of the book "Statistical Rethinking A Bayesian Course with Examples in R and Stan" by Richard McElreath <https://github.com/pymc-devs/resources/tree/master/Rethinking>`__
 -  `PyMC port of the book "Bayesian Cognitive Modeling" by Michael Lee and EJ Wagenmakers <https://github.com/pymc-devs/resources/tree/master/BCM>`__: Focused on using Bayesian statistics in cognitive modeling.
 
+See also the section on books using PyMC on `our website <https://www.pymc.io/projects/docs/en/stable/learn/books.html>`__.
+
 Audio & Video
 -------------
 
@@ -69,6 +205,21 @@ Citing PyMC
 Please choose from the following:
 
 - |DOIpaper| *PyMC: A Modern and Comprehensive Probabilistic Programming Framework in Python*, Abril-Pla O, Andreani V, Carroll C, Dong L, Fonnesbeck CJ, Kochurov M, Kumar R, Lao J, Luhmann CC, Martin OA, Osthege M, Vieira R, Wiecki T, Zinkov R. (2023)
+
+  - BibTex version
+
+    .. code:: bibtex
+
+       @article{pymc2023,
+         title = {{PyMC}: A Modern and Comprehensive Probabilistic Programming Framework in {P}ython},
+         author = {Oriol Abril-Pla and Virgile Andreani and Colin Carroll and Larry Dong and Christopher J. Fonnesbeck and Maxim Kochurov and Ravin Kumar and Junpeng Lao and Christian C. Luhmann and Osvaldo A. Martin and Michael Osthege and Ricardo Vieira and Thomas Wiecki and Robert Zinkov },
+         journal = {{PeerJ} Computer Science},
+         volume = {9},
+         number = {e1516},
+         doi = {10.7717/peerj-cs.1516},
+         year = {2023}
+       }
+
 - |DOIzenodo| A DOI for all versions.
 - DOIs for specific versions are shown on Zenodo and under `Releases <https://github.com/pymc-devs/pymc/releases>`_
 
@@ -83,17 +234,17 @@ Contact
 We are using `discourse.pymc.io <https://discourse.pymc.io/>`__ as our main communication channel.
 
 To ask a question regarding modeling or usage of PyMC we encourage posting to our Discourse forum under the `“Questions” Category <https://discourse.pymc.io/c/questions>`__. You can also suggest feature in the `“Development” Category <https://discourse.pymc.io/c/development>`__.
+Requests for non-technical information about the project are also welcome on Discourse,
+we also use Discourse internally for general announcements or governance related processes.
 
 You can also follow us on these social media platforms for updates and other announcements:
 
 - `LinkedIn @pymc <https://www.linkedin.com/company/pymc/>`__
 - `YouTube @PyMCDevelopers <https://www.youtube.com/c/PyMCDevelopers>`__
-- `Twitter @pymc_devs <https://twitter.com/pymc_devs>`__
+- `X @pymc_devs <https://x.com/pymc_devs>`__
 - `Mastodon @pymc@bayes.club <https://bayes.club/@pymc>`__
 
 To report an issue with PyMC please use the `issue tracker <https://github.com/pymc-devs/pymc/issues>`__.
-
-Finally, if you need to get in touch for non-technical information about the project, `send us an e-mail <info@pymc-devs.org>`__.
 
 License
 =======
@@ -119,9 +270,10 @@ Domain specific
 
 - `Exoplanet <https://github.com/dfm/exoplanet>`__: a toolkit for modeling of transit and/or radial velocity observations of exoplanets and other astronomical time series.
 - `beat <https://github.com/hvasbath/beat>`__: Bayesian Earthquake Analysis Tool.
-- `CausalPy <https://github.com/pymc-labs/CausalPy>`__: A package focussing on causal inference in quasi-experimental settings.
+- `CausalPy <https://github.com/pymc-labs/CausalPy>`__: A package focusing on causal inference in quasi-experimental settings.
+- `PyMC-Marketing <https://github.com/pymc-labs/pymc-marketing>`__: Bayesian marketing toolbox for marketing mix modeling, customer lifetime value, and more.
 
-Please contact us if your software is not listed here.
+See also the `ecosystem page <https://www.pymc.io/about/ecosystem.html>`__ on our website. Please contact us if your software is not listed here.
 
 Papers citing PyMC
 ==================
@@ -131,13 +283,18 @@ See Google Scholar `here <https://scholar.google.com/scholar?cites=6357998555684
 Contributors
 ============
 
-See the `GitHub contributor
-page <https://github.com/pymc-devs/pymc/graphs/contributors>`__. Also read our `Code of Conduct <https://github.com/pymc-devs/pymc/blob/main/CODE_OF_CONDUCT.md>`__ guidelines for a better contributing experience.
+The `GitHub contributor page <https://github.com/pymc-devs/pymc/graphs/contributors>`__ shows the people who have added content to this repo
+which includes a large portion of contributors to the PyMC project but not all of them. Other
+contributors have added content to other repos of the ``pymc-devs`` GitHub organization or have contributed
+through other project spaces outside of GitHub like `our Discourse forum <https://discourse.pymc.io/>`__.
+
+If you are interested in contributing yourself, read our `Code of Conduct <https://github.com/pymc-devs/pymc/blob/main/CODE_OF_CONDUCT.md>`__
+and `Contributing guide <https://www.pymc.io/projects/docs/en/latest/contributing/index.html>`__.
 
 Support
 =======
 
-PyMC is a non-profit project under NumFOCUS umbrella. If you want to support PyMC financially, you can donate `here <https://numfocus.salsalabs.org/donate-to-pymc3/index.html>`__.
+PyMC is a non-profit project under NumFOCUS umbrella. If you want to support PyMC financially, you can donate `here <https://numfocus.org/donate-to-pymc>`__.
 
 Professional Consulting Support
 ===============================
@@ -151,9 +308,7 @@ Sponsors
 
 |PyMCLabs|
 
-|Mistplay|
-
-|ODSC|
+|OpenWoundResearch|
 
 Thanks to our contributors
 ==========================
@@ -162,8 +317,8 @@ Thanks to our contributors
 
 .. |Binder| image:: https://mybinder.org/badge_logo.svg
    :target: https://mybinder.org/v2/gh/pymc-devs/pymc/main?filepath=%2Fdocs%2Fsource%2Fnotebooks
-.. |Build Status| image:: https://github.com/pymc-devs/pymc/workflows/pytest/badge.svg
-   :target: https://github.com/pymc-devs/pymc/actions
+.. |Build Status| image:: https://github.com/pymc-devs/pymc/workflows/tests/badge.svg
+   :target: https://github.com/pymc-devs/pymc/actions?query=workflow%3Atests+branch%3Amain
 .. |Coverage| image:: https://codecov.io/gh/pymc-devs/pymc/branch/main/graph/badge.svg
    :target: https://codecov.io/gh/pymc-devs/pymc
 .. |Dockerhub| image:: https://img.shields.io/docker/automated/pymc/pymc.svg
@@ -173,10 +328,10 @@ Thanks to our contributors
 .. |NumFOCUS| image:: https://github.com/pymc-devs/brand/blob/main/sponsors/sponsor_logos/sponsor_numfocus.png?raw=true
    :target: http://www.numfocus.org/
 .. |PyMCLabs| image:: https://github.com/pymc-devs/brand/blob/main/sponsors/sponsor_logos/sponsor_pymc_labs.png?raw=true
-   :target: https://pymc-labs.io
-.. |Mistplay| image:: https://github.com/pymc-devs/brand/blob/main/sponsors/sponsor_logos/sponsor_mistplay.png?raw=true
-   :target: https://www.mistplay.com/
-.. |ODSC| image:: https://github.com/pymc-devs/brand/blob/main/sponsors/sponsor_logos/odsc/sponsor_odsc.png?raw=true
-   :target: https://odsc.com/california/?utm_source=pymc&utm_medium=referral
+   :target: https://pymc-labs.com
+.. |OpenWoundResearch| image:: https://github.com/pymc-devs/brand/blob/main/sponsors/sponsor_logos/owr/sponsor_owr.png?raw=true
+   :target: https://www.openwoundresearch.com/
 .. |contributors| image:: https://contrib.rocks/image?repo=pymc-devs/pymc
    :target: https://github.com/pymc-devs/pymc/graphs/contributors
+.. |Conda Downloads| image:: https://anaconda.org/conda-forge/pymc/badges/downloads.svg
+   :target: https://anaconda.org/conda-forge/pymc

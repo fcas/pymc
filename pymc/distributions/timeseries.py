@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,12 +17,11 @@ import warnings
 from abc import ABCMeta
 from collections.abc import Callable
 
-import numpy as np
 import pytensor
 import pytensor.tensor as pt
 
-from pytensor.graph.basic import Node, ancestors
-from pytensor.graph.replace import clone_replace
+from pytensor.graph.basic import Apply
+from pytensor.graph.traversal import ancestors
 from pytensor.tensor import TensorVariable
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.utils import normalize_size_param
@@ -45,22 +44,22 @@ from pymc.distributions.shape_utils import (
 from pymc.exceptions import NotConstantValueError
 from pymc.logprob.abstract import _logprob
 from pymc.logprob.basic import logp
-from pymc.pytensorf import constant_fold, intX
+from pymc.pytensorf import constant_fold
 from pymc.util import check_dist_not_registered
 
 __all__ = [
-    "RandomWalk",
-    "GaussianRandomWalk",
-    "MvGaussianRandomWalk",
-    "MvStudentTRandomWalk",
     "AR",
     "GARCH11",
     "EulerMaruyama",
+    "GaussianRandomWalk",
+    "MvGaussianRandomWalk",
+    "MvStudentTRandomWalk",
+    "RandomWalk",
 ]
 
 
 class RandomWalkRV(SymbolicRandomVariable):
-    """RandomWalk Variable"""
+    """RandomWalk Variable."""
 
     _print_name = ("RandomWalk", "\\operatorname{RandomWalk}")
 
@@ -108,20 +107,58 @@ class RandomWalkRV(SymbolicRandomVariable):
         innov_supp_dims = [f"d{i}" for i in range(dist_ndim_supp)]
         innov_supp_str = ",".join(innov_supp_dims)
         out_supp_str = ",".join(["t", *innov_supp_dims])
-        signature = f"({innov_supp_str}),({innov_supp_str}),(s),[rng]->({out_supp_str}),[rng]"
+        extended_signature = (
+            f"({innov_supp_str}),({innov_supp_str}),(s),[rng]->({out_supp_str}),[rng]"
+        )
         return RandomWalkRV(
             [init_dist, innovation_dist, steps],
             # We pass steps_ through just so we can keep a reference to it, even though
             # it's no longer needed at this point
             [grw],
-            signature=signature,
+            extended_signature=extended_signature,
         )(init_dist, innovation_dist, steps)
 
 
 class RandomWalk(Distribution):
-    r"""RandomWalk Distribution
+    r"""RandomWalk Distribution.
 
-    TODO: Expand docstrings
+    Parameters
+    ----------
+    init_dist : unnamed_distribution
+        Unnamed univariate or multivariate distribution of the initial value.
+        Unnamed refers to distributions created with the ``.dist()`` API.
+
+        .. warning:: init_dist will be cloned, rendering it independent of the one passed as input.
+
+    innovation_dist : unnamed_distribution
+        Unnamed univariate or multivariate distribution of the innovation term for each step.
+        Unnamed refers to distributions created with the ``.dist()`` API.
+
+        .. warning:: innovation_dist will be cloned, rendering it independent of the one passed as input.
+
+    steps : int, optional
+        Number of steps in the Random Walk (steps > 0). Only needed if shape is not
+        provided.
+
+    Notes
+    -----
+    RandomWalk is a generic subclass, used to implement specific Random Walk distributions
+    such as GaussianRandomWalk, MvGaussianRandomWalk, and MvStudentTRandomWalk. It can also
+    be used directly to build custom Random Walks by passing arbitrary ``init_dist`` and
+    ``innovation_dist``.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        import pymc as pm
+
+        with pm.Model():
+            init_dist = pm.Normal.dist(0, 10)
+            innovation_dist = pm.Normal.dist(0, 1)
+            rw = pm.RandomWalk(
+                "rw", init_dist=init_dist, innovation_dist=innovation_dist, steps=100
+            )
     """
 
     rv_type = RandomWalkRV
@@ -174,7 +211,7 @@ class RandomWalk(Distribution):
         )
         if steps is None:
             raise ValueError("Must specify steps or shape parameter")
-        steps = pt.as_tensor_variable(intX(steps))
+        steps = pt.as_tensor_variable(steps, dtype=int)
 
         return super().dist([init_dist, innovation_dist, steps], **kwargs)
 
@@ -237,15 +274,13 @@ def random_walk_logp(op, values, *inputs, **kwargs):
     (value,) = values
     # Recreate RV and obtain inner graph
     rv_node = op.make_node(*inputs)
-    rv = clone_replace(
-        op.inner_outputs, replace={u: v for u, v in zip(op.inner_inputs, rv_node.inputs)}
-    )[op.default_output]
+    rv = op.fgraph.bind(rv_node.inputs)[op.default_output]
     # Obtain logp of the inner graph and collapse steps dimension
     return logp(rv, value).sum(axis=-1)
 
 
 class PredefinedRandomWalk(ABCMeta):
-    """Base class for predefined RandomWalk distributions"""
+    """Base class for predefined RandomWalk distributions."""
 
     def __new__(cls, name, *args, **kwargs):
         init_dist, innovation_dist, kwargs = cls.get_dists(*args, **kwargs)
@@ -284,13 +319,6 @@ class GaussianRandomWalk(PredefinedRandomWalk):
 
     @classmethod
     def get_dists(cls, mu=0.0, sigma=1.0, *, init_dist=None, **kwargs):
-        if "init" in kwargs:
-            warnings.warn(
-                "init parameter is now called init_dist. Using init will raise an error in a future release.",
-                FutureWarning,
-            )
-            init_dist = kwargs.pop("init")
-
         if init_dist is None:
             warnings.warn(
                 "Initial distribution not specified, defaulting to `Normal.dist(0, 100)`."
@@ -307,7 +335,7 @@ class GaussianRandomWalk(PredefinedRandomWalk):
 
 
 class MvGaussianRandomWalk(PredefinedRandomWalk):
-    r"""Random Walk with Multivariate Normal innovations
+    r"""Random Walk with Multivariate Normal innovations.
 
     Parameters
     ----------
@@ -338,14 +366,6 @@ class MvGaussianRandomWalk(PredefinedRandomWalk):
 
     @classmethod
     def get_dists(cls, mu, *, cov=None, tau=None, chol=None, lower=True, init_dist=None, **kwargs):
-        if "init" in kwargs:
-            warnings.warn(
-                "init parameter is now called init_dist. Using init will raise an error "
-                "in a future release.",
-                FutureWarning,
-            )
-            init_dist = kwargs.pop("init")
-
         if init_dist is None:
             warnings.warn(
                 "Initial distribution not specified, defaulting to `MvNormal.dist(0, I*100)`."
@@ -359,7 +379,7 @@ class MvGaussianRandomWalk(PredefinedRandomWalk):
 
 
 class MvStudentTRandomWalk(PredefinedRandomWalk):
-    r"""Multivariate Random Walk with StudentT innovations
+    r"""Multivariate Random Walk with StudentT innovations.
 
     Parameters
     ----------
@@ -394,14 +414,6 @@ class MvStudentTRandomWalk(PredefinedRandomWalk):
     def get_dists(
         cls, *, nu, mu, scale=None, tau=None, chol=None, lower=True, init_dist=None, **kwargs
     ):
-        if "init" in kwargs:
-            warnings.warn(
-                "init parameter is now called init_dist. Using init will raise an error "
-                "in a future release.",
-                FutureWarning,
-            )
-            init_dist = kwargs.pop("init")
-
         if init_dist is None:
             warnings.warn(
                 "Initial distribution not specified, defaulting to `MvNormal.dist(0, I*100)`."
@@ -417,9 +429,9 @@ class MvStudentTRandomWalk(PredefinedRandomWalk):
 
 
 class AutoRegressiveRV(SymbolicRandomVariable):
-    """A placeholder used to specify a log-likelihood for an AR sub-graph."""
+    """A placeholder used to specify a distribution for an AR sub-graph."""
 
-    signature = "(o),(),(o),(s),[rng]->[rng],(t)"
+    extended_signature = "(o),(),(o),(s),[rng]->[rng],(t)"
     ar_order: int
     constant_term: bool
     _print_name = ("AR", "\\operatorname{AR}")
@@ -432,7 +444,7 @@ class AutoRegressiveRV(SymbolicRandomVariable):
     @classmethod
     def rv_op(cls, rhos, sigma, init_dist, steps, ar_order, constant_term, size=None):
         # We don't allow passing `rng` because we don't fully control the rng of the components!
-        noise_rng = pytensor.shared(np.random.default_rng())
+        noise_rng = pt.random.shared_rng(seed=None)
         size = normalize_size_param(size)
 
         # Init dist should have shape (*size, ar_order)
@@ -462,23 +474,26 @@ class AutoRegressiveRV(SymbolicRandomVariable):
         rhos_bcast = pt.broadcast_to(rhos, rhos_bcast_shape)
 
         def step(*args):
-            *prev_xs, reversed_rhos, sigma, rng = args
+            *prev_xs, rng, reversed_rhos, sigma = args
             if constant_term:
                 mu = reversed_rhos[-1] + pt.sum(prev_xs * reversed_rhos[:-1], axis=0)
             else:
                 mu = pt.sum(prev_xs * reversed_rhos, axis=0)
-            next_rng, new_x = Normal.dist(mu=mu, sigma=sigma, rng=rng).owner.outputs
-            return new_x, {rng: next_rng}
+            next_rng, new_x = Normal.dist(mu=mu, sigma=sigma, rng=rng, return_next_rng=True)
+            return new_x, next_rng
 
         # We transpose inputs as scan iterates over first dimension
-        innov, innov_updates = pytensor.scan(
+        innov, noise_next_rng = pytensor.scan(
             fn=step,
-            outputs_info=[{"initial": init_dist.T, "taps": range(-ar_order, 0)}],
-            non_sequences=[rhos_bcast.T[::-1], sigma.T, noise_rng],
+            outputs_info=[
+                {"initial": init_dist.T, "taps": range(-ar_order, 0)},
+                noise_rng,
+            ],
+            non_sequences=[rhos_bcast.T[::-1], sigma.T],
             n_steps=steps,
             strict=True,
+            return_updates=False,
         )
-        (noise_next_rng,) = tuple(innov_updates.values())
         ar = pt.concatenate([init_dist, innov.T], axis=-1)
 
         return AutoRegressiveRV(
@@ -488,7 +503,7 @@ class AutoRegressiveRV(SymbolicRandomVariable):
             constant_term=constant_term,
         )(rhos, sigma, init_dist, steps, noise_rng)
 
-    def update(self, node: Node):
+    def update(self, node: Apply):
         """Return the update mapping for the noise RV."""
         return {node.inputs[-1]: node.outputs[0]}
 
@@ -586,20 +601,13 @@ class AR(Distribution):
         sigma = pt.as_tensor_variable(sigma)
         rhos = pt.atleast_1d(pt.as_tensor_variable(rho))
 
-        if "init" in kwargs:
-            warnings.warn(
-                "init parameter is now called init_dist. Using init will raise an error in a future release.",
-                FutureWarning,
-            )
-            init_dist = kwargs.pop("init")
-
         ar_order = cls._get_ar_order(rhos=rhos, constant=constant, ar_order=ar_order)
         steps = get_support_shape_1d(
             support_shape=steps, shape=kwargs.get("shape", None), support_shape_offset=ar_order
         )
         if steps is None:
             raise ValueError("Must specify steps or shape parameter")
-        steps = pt.as_tensor_variable(intX(steps), ndim=0)
+        steps = pt.as_tensor_variable(steps, dtype=int, ndim=0)
 
         if init_dist is not None:
             if not isinstance(init_dist, TensorVariable) or not isinstance(
@@ -628,7 +636,7 @@ class AR(Distribution):
 
     @classmethod
     def _get_ar_order(cls, rhos: TensorVariable, ar_order: int | None, constant: bool) -> int:
-        """Compute ar_order given inputs
+        """Compute ar_order given inputs.
 
         If ar_order is not specified we do constant folding on the shape of rhos
         to retrieve it. For example, this will detect that
@@ -713,7 +721,7 @@ def ar_support_point(op, rv, rhos, sigma, init_dist, steps, noise_rng):
 class GARCH11RV(SymbolicRandomVariable):
     """A placeholder used to specify a GARCH11 graph."""
 
-    signature = "(),(),(),(),(),(s),[rng]->[rng],(t)"
+    extended_signature = "(),(),(),(),(),(s),[rng]->[rng],(t)"
     _print_name = ("GARCH11", "\\operatorname{GARCH11}")
 
     @classmethod
@@ -724,7 +732,7 @@ class GARCH11RV(SymbolicRandomVariable):
         alpha_1 = pt.as_tensor(alpha_1)
         beta_1 = pt.as_tensor(beta_1)
         initial_vol = pt.as_tensor(initial_vol)
-        noise_rng = pytensor.shared(np.random.default_rng())
+        noise_rng = pt.random.shared_rng(seed=None)
         size = normalize_size_param(size)
 
         if rv_size_is_none(size):
@@ -737,24 +745,25 @@ class GARCH11RV(SymbolicRandomVariable):
 
         # Create OpFromGraph representing random draws from GARCH11 process
 
-        def step(prev_y, prev_sigma, omega, alpha_1, beta_1, rng):
+        def step(prev_y, prev_sigma, rng, omega, alpha_1, beta_1):
             new_sigma = pt.sqrt(
                 omega + alpha_1 * pt.square(prev_y) + beta_1 * pt.square(prev_sigma)
             )
-            next_rng, new_y = Normal.dist(mu=0, sigma=new_sigma, rng=rng).owner.outputs
-            return (new_y, new_sigma), {rng: next_rng}
+            next_rng, new_y = Normal.dist(mu=0, sigma=new_sigma, rng=rng, return_next_rng=True)
+            return new_y, new_sigma, next_rng
 
-        (y_t, _), innov_updates = pytensor.scan(
+        y_t, _, noise_next_rng = pytensor.scan(
             fn=step,
             outputs_info=[
                 init_dist,
                 pt.broadcast_to(initial_vol.astype("floatX"), init_dist.shape),
+                noise_rng,
             ],
-            non_sequences=[omega, alpha_1, beta_1, noise_rng],
+            non_sequences=[omega, alpha_1, beta_1],
             n_steps=steps,
             strict=True,
+            return_updates=False,
         )
-        (noise_next_rng,) = tuple(innov_updates.values())
 
         garch11 = pt.concatenate([init_dist[None, ...], y_t], axis=0).dimshuffle(
             (*range(1, y_t.ndim), 0)
@@ -765,14 +774,14 @@ class GARCH11RV(SymbolicRandomVariable):
             outputs=[noise_next_rng, garch11],
         )(omega, alpha_1, beta_1, initial_vol, init_dist, steps, noise_rng)
 
-    def update(self, node: Node):
+    def update(self, node: Apply):
         """Return the update mapping for the noise RV."""
         return {node.inputs[-1]: node.outputs[0]}
 
 
 class GARCH11(Distribution):
     r"""
-    GARCH(1,1) with Normal innovations. The model is specified by
+    GARCH(1,1) with Normal innovations. The model is specified by.
 
     .. math::
         y_t \sim N(0, \sigma_t^2)
@@ -843,12 +852,13 @@ def garch11_logp(
     def volatility_update(x, vol, w, a, b):
         return pt.sqrt(w + a * pt.square(x) + b * pt.square(vol))
 
-    vol, _ = pytensor.scan(
+    vol = pytensor.scan(
         fn=volatility_update,
         sequences=[value_dimswapped[:-1]],
         outputs_info=[initial_vol],
         non_sequences=[omega, alpha_1, beta_1],
         strict=True,
+        return_updates=False,
     )
     sigma_t = pt.concatenate([[initial_vol], vol])
     # Compute and collapse logp across time dimension
@@ -863,7 +873,7 @@ def garch11_support_point(op, rv, omega, alpha_1, beta_1, initial_vol, init_dist
 
 
 class EulerMaruyamaRV(SymbolicRandomVariable):
-    """A placeholder used to specify a log-likelihood for a EulerMaruyama sub-graph."""
+    """A placeholder used to specify a distribution for a EulerMaruyama sub-graph."""
 
     dt: float
     sde_fn: Callable
@@ -877,7 +887,7 @@ class EulerMaruyamaRV(SymbolicRandomVariable):
     @classmethod
     def rv_op(cls, init_dist, steps, sde_pars, dt, sde_fn, size=None):
         # We don't allow passing `rng` because we don't fully control the rng of the components!
-        noise_rng = pytensor.shared(np.random.default_rng())
+        noise_rng = pt.random.shared_rng(seed=None)
 
         # Init dist should have shape (*size,)
         if size is not None:
@@ -888,21 +898,21 @@ class EulerMaruyamaRV(SymbolicRandomVariable):
 
         # Create OpFromGraph representing random draws from SDE process
         def step(*prev_args):
-            prev_y, *prev_sde_pars, rng = prev_args
+            prev_y, rng, *prev_sde_pars = prev_args
             f, g = sde_fn(prev_y, *prev_sde_pars)
             mu = prev_y + dt * f
             sigma = pt.sqrt(dt) * g
-            next_rng, next_y = Normal.dist(mu=mu, sigma=sigma, rng=rng).owner.outputs
-            return next_y, {rng: next_rng}
+            next_rng, next_y = Normal.dist(mu=mu, sigma=sigma, rng=rng, return_next_rng=True)
+            return next_y, next_rng
 
-        y_t, innov_updates = pytensor.scan(
+        y_t, noise_next_rng = pytensor.scan(
             fn=step,
-            outputs_info=[init_dist],
-            non_sequences=[*sde_pars, noise_rng],
+            outputs_info=[init_dist, noise_rng],
+            non_sequences=[*sde_pars],
             n_steps=steps,
             strict=True,
+            return_updates=False,
         )
-        (noise_next_rng,) = tuple(innov_updates.values())
 
         sde_out = pt.concatenate([init_dist[None, ...], y_t], axis=0).dimshuffle(
             (*range(1, y_t.ndim), 0)
@@ -913,10 +923,10 @@ class EulerMaruyamaRV(SymbolicRandomVariable):
             outputs=[noise_next_rng, sde_out],
             dt=dt,
             sde_fn=sde_fn,
-            signature=f"(),(s),{','.join('()' for _ in sde_pars)},[rng]->[rng],(t)",
+            extended_signature=f"(),(s),{','.join('()' for _ in sde_pars)},[rng]->[rng],(t)",
         )(init_dist, steps, *sde_pars, noise_rng)
 
-    def update(self, node: Node):
+    def update(self, node: Apply):
         """Return the update mapping for the noise RV."""
         return {node.inputs[-1]: node.outputs[0]}
 
@@ -961,7 +971,7 @@ class EulerMaruyama(Distribution):
         )
         if steps is None:
             raise ValueError("Must specify steps or shape parameter")
-        steps = pt.as_tensor_variable(intX(steps), ndim=0)
+        steps = pt.as_tensor_variable(steps, dtype=int, ndim=0)
 
         dt = pt.as_tensor_variable(dt)
         sde_pars = [pt.as_tensor_variable(x) for x in sde_pars]

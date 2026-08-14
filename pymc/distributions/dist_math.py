@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,12 +13,10 @@
 #   limitations under the License.
 
 """
-Created on Mar 7, 2011
+Created on Mar 7, 2011.
 
 @author: johnsalvatier
 """
-
-import warnings
 
 from collections.abc import Iterable
 from functools import partial
@@ -26,18 +24,20 @@ from functools import partial
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
-import scipy.linalg
-import scipy.stats
 
 from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.op import Op
 from pytensor.scalar import UnaryScalarOp, upgrade_to_float_no_complex
 from pytensor.tensor import gammaln
 from pytensor.tensor.elemwise import Elemwise
+from pytensor.utils import lazy_scipy_module
 
 from pymc.distributions.shape_utils import to_tuple
 from pymc.logprob.utils import CheckParameterValue
 from pymc.pytensorf import floatX
+
+special = lazy_scipy_module("special")
+stats = lazy_scipy_module("stats")
 
 f = floatX
 c = -0.5 * np.log(2.0 * np.pi)
@@ -90,11 +90,20 @@ def check_icdf_value(expr: Variable, value: Variable) -> Variable:
 
 
 def logpow(x, m):
-    """
-    Calculates log(x**m) since m*log(x) will fail when m, x = 0.
-    """
-    # return m * log(x)
-    return pt.switch(pt.eq(x, 0), pt.switch(pt.eq(m, 0), 0.0, -np.inf), m * pt.log(x))
+    """Calculate log(x**m) since m*log(x) will fail when m, x = 0."""
+    # Guard on log(x), not on x. PyTensor stabilizes log(x) as a whole -- log(exp(a))
+    # becomes a, log1p(-sigmoid(a)) becomes -softplus(a) -- so log(x) stays finite
+    # when x merely collapsed to zero through underflow or cancellation, and is -inf
+    # only when x is genuinely zero. Testing x itself cannot tell those apart, and
+    # would discard a perfectly representable m * log(x) in the first case.
+    log_x = pt.log(x)
+    return pt.switch(
+        pt.and_(pt.eq(log_x, -np.inf), pt.le(m, 0)),
+        # 0 * log(0) is nan, and m * log(0) is +inf for m < 0 where we report -inf
+        # at the edge of the support
+        pt.switch(pt.eq(m, 0), 0.0, -np.inf),
+        m * log_x,
+    )
 
 
 def factln(n):
@@ -110,9 +119,7 @@ def betaln(x, y):
 
 
 def std_cdf(x):
-    """
-    Calculates the standard normal cumulative distribution function.
-    """
+    """Calculate the standard normal cumulative distribution function."""
     return 0.5 + 0.5 * pt.erf(x / pt.sqrt(2.0))
 
 
@@ -136,7 +143,7 @@ def normal_lccdf(mu, sigma, x):
 
 
 def log_diff_normal_cdf(mu, sigma, x, y):
-    """
+    r"""
     Compute :math:`\\log(\\Phi(\frac{x - \\mu}{\\sigma}) - \\Phi(\frac{y - \\mu}{\\sigma}))` safely in log space.
 
     Parameters
@@ -176,16 +183,18 @@ def log_diff_normal_cdf(mu, sigma, x, y):
 
 
 def sigma2rho(sigma):
+    """Convert `sigma` into `rho` with PyTensor.
+
+    :math:`mu + sigma*e = mu + log(1+exp(rho))*e`.
     """
-    `sigma -> rho` PyTensor converter
-    :math:`mu + sigma*e = mu + log(1+exp(rho))*e`"""
     return pt.log(pt.exp(pt.abs(sigma)) - 1.0)
 
 
 def rho2sigma(rho):
+    """Convert `rho` to `sigma` with PyTensor.
+
+    :math:`mu + sigma*e = mu + log(1+exp(rho))*e`.
     """
-    `rho -> sigma` PyTensor converter
-    :math:`mu + sigma*e = mu + log(1+exp(rho))*e`"""
     return pt.softplus(rho)
 
 
@@ -195,8 +204,7 @@ sd2rho = sigma2rho
 
 def log_normal(x, mean, **kwargs):
     """
-    Calculate logarithm of normal distribution at point `x`
-    with given `mean` and `std`
+    Calculate logarithm of normal distribution at point `x` with given `mean` and `std`.
 
     Parameters
     ----------
@@ -221,7 +229,7 @@ def log_normal(x, mean, **kwargs):
     rho = kwargs.get("rho")
     tau = kwargs.get("tau")
     eps = kwargs.get("eps", 0.0)
-    check = sum(map(lambda a: a is not None, [sigma, w, rho, tau]))
+    check = sum(a is not None for a in [sigma, w, rho, tau])
     if check > 1:
         raise ValueError("more than one required kwarg is passed")
     if check == 0:
@@ -239,9 +247,7 @@ def log_normal(x, mean, **kwargs):
 
 
 class SplineWrapper(Op):
-    """
-    Creates an PyTensor operation from scipy.interpolate.UnivariateSpline
-    """
+    """Creates a PyTensor operation from scipy.interpolate.UnivariateSpline."""
 
     __props__ = ("spline",)
 
@@ -276,14 +282,12 @@ class SplineWrapper(Op):
 
 
 class I1e(UnaryScalarOp):
-    """
-    Modified Bessel function of the first kind of order 1, exponentially scaled.
-    """
+    """Modified Bessel function of the first kind of order 1, exponentially scaled."""
 
     nfunc_spec = ("scipy.special.i1e", 1, 1)
 
     def impl(self, x):
-        return scipy.special.i1e(x)
+        return special.i1e(x)
 
 
 i1e_scalar = I1e(upgrade_to_float_no_complex, name="i1e")
@@ -291,14 +295,12 @@ i1e = Elemwise(i1e_scalar, name="Elemwise{i1e,no_inplace}")
 
 
 class I0e(UnaryScalarOp):
-    """
-    Modified Bessel function of the first kind of order 0, exponentially scaled.
-    """
+    """Modified Bessel function of the first kind of order 0, exponentially scaled."""
 
     nfunc_spec = ("scipy.special.i0e", 1, 1)
 
     def impl(self, x):
-        return scipy.special.i0e(x)
+        return special.i0e(x)
 
     def grad(self, inp, grads):
         (x,) = inp
@@ -311,7 +313,7 @@ i0e = Elemwise(i0e_scalar, name="Elemwise{i0e,no_inplace}")
 
 
 def random_choice(p, size):
-    """Return draws from categorical probability functions
+    """Return draws from categorical probability functions.
 
     Parameters
     ----------
@@ -350,9 +352,7 @@ def random_choice(p, size):
 
 
 def zvalue(value, sigma, mu):
-    """
-    Calculate the z-value for a normal distribution.
-    """
+    """Calculate the z-value for a normal distribution."""
     return (value - mu) / sigma
 
 
@@ -391,13 +391,13 @@ def clipped_beta_rvs(a, b, size=None, random_state=None, dtype="float64"):
         is shifted to ``np.nextafter(1, 0, dtype=dtype)``.
 
     """
-    out = scipy.stats.beta.rvs(a, b, size=size, random_state=random_state).astype(dtype)
+    out = stats.beta.rvs(a, b, size=size, random_state=random_state).astype(dtype)
     lower, upper = _beta_clip_values[dtype]
     return np.maximum(np.minimum(out, upper), lower)
 
 
 def multigammaln(a, p):
-    """Multivariate Log Gamma
+    """Multivariate Log Gamma.
 
     Parameters
     ----------
@@ -410,9 +410,7 @@ def multigammaln(a, p):
 
 
 def log_i0(x):
-    """
-    Calculates the logarithm of the 0 order modified Bessel function of the first kind""
-    """
+    """Calculate the logarithm of the 0 order modified Bessel function of the first kind."""
     return pt.switch(
         pt.lt(x, 5),
         pt.log1p(
@@ -432,12 +430,3 @@ def log_i0(x):
             + 11025.0 / (98304.0 * x**4.0)
         ),
     )
-
-
-def incomplete_beta(a, b, value):
-    warnings.warn(
-        "incomplete_beta has been deprecated. Use pytensor.tensor.betainc instead.",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return pt.betainc(a, b, value)

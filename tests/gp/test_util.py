@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -21,6 +21,16 @@ import pymc as pm
 
 
 class TestPlotGP:
+    @pytest.fixture(autouse=True)
+    def agg_backend(self):
+        """Draw headlessly.
+
+        Otherwise matplotlib picks TkAgg on Windows and fails against the
+        incomplete Tcl install in the CI environment.
+        """
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg", force=True)
+
     def test_plot_gp_dist(self):
         """Test that the plotting helper works with the stated input shapes."""
         import matplotlib.pyplot as plt

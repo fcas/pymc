@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -196,27 +196,29 @@ class TestErrors:
 
     def test_too_many_params(self):
         with pytest.raises(
-            pm.ShapeError,
+            pm.exceptions.ShapeError,
             match="Length of theta is wrong. \\(actual \\(2,\\) != expected \\(1,\\)\\)",
         ):
             self.ode_model(theta=[1, 1], y0=[0])
 
     def test_too_many_y0(self):
         with pytest.raises(
-            pm.ShapeError, match="Length of y0 is wrong. \\(actual \\(2,\\) != expected \\(1,\\)\\)"
+            pm.exceptions.ShapeError,
+            match="Length of y0 is wrong. \\(actual \\(2,\\) != expected \\(1,\\)\\)",
         ):
             self.ode_model(theta=[1], y0=[0, 0])
 
     def test_too_few_params(self):
         with pytest.raises(
-            pm.ShapeError,
+            pm.exceptions.ShapeError,
             match="Length of theta is wrong. \\(actual \\(0,\\) != expected \\(1,\\)\\)",
         ):
             self.ode_model(theta=[], y0=[1])
 
     def test_too_few_y0(self):
         with pytest.raises(
-            pm.ShapeError, match="Length of y0 is wrong. \\(actual \\(0,\\) != expected \\(1,\\)\\)"
+            pm.exceptions.ShapeError,
+            match="Length of y0 is wrong. \\(actual \\(0,\\) != expected \\(1,\\)\\)",
         ):
             self.ode_model(theta=[1], y0=[])
 
@@ -412,7 +414,9 @@ class TestDiffEqModel:
                     warnings.filterwarnings(
                         "ignore", "invalid value encountered in log", RuntimeWarning
                     )
-                    idata = pm.sample(50, tune=0, chains=1)
+                    idata = pm.sample(
+                        50, tune=0, chains=1, progressbar=False, compute_convergence_checks=False
+                    )
 
         assert idata.posterior["R"].shape == (1, 50)
         assert idata.posterior["sigma"].shape == (1, 50, 2)

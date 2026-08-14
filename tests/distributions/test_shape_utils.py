@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -27,36 +27,37 @@ from pytensor.tensor.shape import SpecifyShape
 
 import pymc as pm
 
-from pymc import ShapeError
 from pymc.distributions.shape_utils import (
-    broadcast_dist_samples_shape,
     change_dist_size,
     convert_dims,
+    convert_dims_with_ellipsis,
     convert_shape,
     convert_size,
     get_support_shape,
     get_support_shape_1d,
+    implicit_size_from_params,
     rv_size_is_none,
-    to_tuple,
 )
+from pymc.exceptions import ShapeError
 from pymc.model import Model
+from pymc.pytensorf import constant_fold
 
 test_shapes = [
-    (tuple(), (1,), (4,), (5, 4)),
-    (tuple(), (1,), (7,), (5, 4)),
-    (tuple(), (1,), (1, 4), (5, 4)),
-    (tuple(), (1,), (5, 1), (5, 4)),
-    (tuple(), (1,), (3, 4), (5, 4)),
-    (tuple(), (1,), (5, 3), (5, 4)),
-    (tuple(), (1,), (10, 4), (5, 4)),
-    (tuple(), (1,), (10,), (5, 4)),
-    (tuple(), (1,), (1, 1, 4), (5, 4)),
-    (tuple(), (1,), (10, 1, 4), (5, 4)),
-    (tuple(), (1,), (10, 5, 4), (5, 4)),
+    ((), (1,), (4,), (5, 4)),
+    ((), (1,), (7,), (5, 4)),
+    ((), (1,), (1, 4), (5, 4)),
+    ((), (1,), (5, 1), (5, 4)),
+    ((), (1,), (3, 4), (5, 4)),
+    ((), (1,), (5, 3), (5, 4)),
+    ((), (1,), (10, 4), (5, 4)),
+    ((), (1,), (10,), (5, 4)),
+    ((), (1,), (1, 1, 4), (5, 4)),
+    ((), (1,), (10, 1, 4), (5, 4)),
+    ((), (1,), (10, 5, 4), (5, 4)),
 ]
 test_sizes = [
     None,
-    tuple(),
+    (),
     1,
     (1,),
     10,
@@ -68,7 +69,7 @@ test_sizes = [
     (5, 4),
     (1, 1, 1, 1),
 ]
-test_to_shapes = [None, tuple(), (10, 5, 4), (10, 1, 1, 5, 1)]
+test_to_shapes = [None, (), (10, 5, 4), (10, 1, 1, 5, 1)]
 
 
 @pytest.fixture(params=test_sizes, ids=str)
@@ -98,28 +99,6 @@ class TestShapesBroadcasting:
                 np.broadcast_shapes(*shapes)
         else:
             out = np.broadcast_shapes(*shapes)
-            assert out == expected_out
-
-    def test_broadcast_dist_samples_shape(self, fixture_sizes, fixture_shapes):
-        size = fixture_sizes
-        shapes = fixture_shapes
-        size_ = to_tuple(size)
-        shapes_ = [
-            s if s[: min([len(size_), len(s)])] != size_ else s[len(size_) :] for s in shapes
-        ]
-        try:
-            expected_out = np.broadcast(*(np.empty(s) for s in shapes_)).shape
-        except ValueError:
-            expected_out = None
-        if expected_out is not None and any(
-            s[: min([len(size_), len(s)])] == size_ for s in shapes
-        ):
-            expected_out = size_ + expected_out
-        if expected_out is None:
-            with pytest.raises(ValueError):
-                broadcast_dist_samples_shape(shapes, size=size)
-        else:
-            out = broadcast_dist_samples_shape(shapes, size=size)
             assert out == expected_out
 
 
@@ -204,7 +183,7 @@ class TestSizeShapeDimsObserved:
             assert "ddata" in pmodel.dim_lengths
 
             # Size does not include support dims, so this test must use a dist with support dims.
-            kwargs = dict(name="y", size=(2, 3), mu=pt.ones((3, 4)), cov=pt.eye(4))
+            kwargs = {"name": "y", "size": (2, 3), "mu": pt.ones((3, 4)), "cov": pt.eye(4)}
             y = pm.MvNormal(**kwargs, dims=("dsize", "ddata", "dsupport"))
             assert pmodel.named_vars_to_dims["y"] == ("dsize", "ddata", "dsupport")
 
@@ -319,6 +298,14 @@ class TestSizeShapeDimsObserved:
         assert convert_dims(dims="town") == ("town",)
         with pytest.raises(ValueError, match="must be a tuple, str or list"):
             convert_dims(3)
+        with pytest.raises(ValueError, match="must be a tuple, str or list"):
+            convert_dims(...)
+
+    def test_convert_dims_with_ellipsis(self):
+        assert convert_dims_with_ellipsis(dims="town") == ("town",)
+        assert convert_dims_with_ellipsis(...) == (...,)
+        with pytest.raises(ValueError, match="must be a tuple, list, str or Ellipsis"):
+            convert_dims_with_ellipsis(3)
 
     def test_convert_shape(self):
         assert convert_shape(5) == (5,)
@@ -333,7 +320,7 @@ class TestSizeShapeDimsObserved:
     def test_lazy_flavors(self):
         assert pm.Uniform.dist(2, [4, 5], size=[3, 2]).eval().shape == (3, 2)
         assert pm.Uniform.dist(2, [4, 5], shape=[3, 2]).eval().shape == (3, 2)
-        with pm.Model(coords=dict(town=["Greifswald", "Madrid"])):
+        with pm.Model(coords={"town": ["Greifswald", "Madrid"]}):
             assert pm.Normal("n1", mu=[1, 2], dims="town").eval().shape == (2,)
             assert pm.Normal("n2", mu=[1, 2], dims=["town"]).eval().shape == (2,)
 
@@ -345,10 +332,10 @@ class TestSizeShapeDimsObserved:
         """Test that when setting size from dims we update the rng properly
         See https://github.com/pymc-devs/pymc/issues/5653
         """
-        with pm.Model(coords=dict(x_dim=range(2))):
+        with pm.Model(coords={"x_dim": range(2)}):
             x = pm.Normal("x", dims=("x_dim",))
 
-        fn = pm.pytensorf.compile_pymc([], x)
+        fn = pm.pytensorf.compile([], x)
         # Check that both function outputs (rng and draws) come from the same Apply node
         assert fn.maker.fgraph.outputs[0].owner is fn.maker.fgraph.outputs[1].owner
 
@@ -363,7 +350,7 @@ class TestSizeShapeDimsObserved:
         with pm.Model():
             x = pm.Normal("x", observed=[0, 1])
 
-        fn = pm.pytensorf.compile_pymc([], x)
+        fn = pm.pytensorf.compile([], x)
         # Check that both function outputs (rng and draws) come from the same Apply node
         assert fn.maker.fgraph.outputs[0].owner is fn.maker.fgraph.outputs[1].owner
 
@@ -384,7 +371,7 @@ def test_rv_size_is_none():
     assert rv_size_is_none(rv.owner.inputs[1])
 
     rv = pm.Normal.dist(0, 1, size=())
-    assert rv_size_is_none(rv.owner.inputs[1])
+    assert not rv_size_is_none(rv.owner.inputs[1])
 
     rv = pm.Normal.dist(0, 1, size=1)
     assert not rv_size_is_none(rv.owner.inputs[1])
@@ -449,31 +436,15 @@ def test_change_rv_size():
     assert tuple(rv_newer.shape.eval()) == (2,)
 
 
-def test_change_rv_size_default_update():
-    rng = pytensor.shared(np.random.default_rng(0))
-    x = normal(rng=rng)
-
-    # Test that "traditional" default_update is translated to the new rng
-    rng.default_update = x.owner.outputs[0]
-    new_x = change_dist_size(x, new_size=(2,))
-    new_rng = new_x.owner.inputs[0]
-    assert rng.default_update is x.owner.outputs[0]
-    assert new_rng.default_update is new_x.owner.outputs[0]
-
-    # Test that "non-traditional" default_update raises UserWarning
-    next_rng = pytensor.shared(np.random.default_rng(1))
-    rng.default_update = next_rng
-    with pytest.warns(UserWarning, match="could not be replicated in resized variable"):
-        new_x = change_dist_size(x, new_size=(2,))
-    new_rng = new_x.owner.inputs[0]
-    assert rng.default_update is next_rng
-    assert new_rng.default_update is None
-
-    # Test that default_update is not set if it was None before
-    rng.default_update = None
-    new_x = change_dist_size(x, new_size=(2,))
-    new_rng = new_x.owner.inputs[0]
-    assert new_rng.default_update is None
+def test_change_rv_size_expand_none_size():
+    x = pt.random.normal()
+    size = x.owner.op.size_param(x.owner)
+    assert rv_size_is_none(size)
+    new_x = change_dist_size(x, new_size=(2,), expand=True)
+    new_size = new_x.owner.op.size_param(new_x.owner)
+    assert not rv_size_is_none(new_size)
+    assert new_size.data == [2]
+    assert new_x.type.shape == (2,)
 
 
 def test_change_specify_shape_size_univariate():
@@ -654,3 +625,10 @@ def test_get_support_shape(
             assert (f() == expected_support_shape).all()
             with pytest.raises(AssertionError, match="support_shape does not match"):
                 inferred_support_shape.eval()
+
+
+def test_implicit_size_from_params():
+    x = pt.tensor(shape=(5, 1))
+    y = pt.tensor(shape=(3, 3))
+    res = implicit_size_from_params(x, y, ndims_params=[1, 2])
+    assert constant_fold([res]) == (5,)

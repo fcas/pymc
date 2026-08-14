@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,7 +19,9 @@ import pytensor.tensor as pt
 
 def make_sens_ic(n_states, n_theta, floatX):
     r"""
-    The sensitivity matrix will always have consistent form. (n_states, n_states + n_theta)
+    Make initial condition for the sensitivity matrix.
+
+    The sensitivity matrix will always have consistent form. (n_states, n_states + n_theta).
 
     If the first n_states entries of the parameters vector in the simulate call
     correspond to initial conditions of the system,
@@ -44,7 +46,6 @@ def make_sens_ic(n_states, n_theta, floatX):
     dydp : array
         1D-array of shape (n_states * (n_states + n_theta),), representing the initial condition of the sensitivities
     """
-
     # Initialize the sensitivity matrix to be 0 everywhere
     sens_matrix = np.zeros((n_states, n_states + n_theta), dtype=floatX)
 
@@ -59,7 +60,7 @@ def make_sens_ic(n_states, n_theta, floatX):
 
 def augment_system(ode_func, n_states, n_theta):
     """
-    Function to create augmented system.
+    Create augmented system.
 
     Take a function which specifies a set of differential equations and return
     a compiled function which allows for computation of gradients of the
@@ -81,23 +82,18 @@ def augment_system(ode_func, n_states, n_theta):
     system: function
         Augemted system of differential equations.
     """
-
     # Present state of the system
-    t_y = pt.vector("y", dtype="float64")
-    t_y.tag.test_value = np.ones((n_states,), dtype="float64")
+    t_y = pt.vector("y", dtype="float64", shape=(n_states,))
     # Parameter(s).  Should be vector to allow for generaliztion to multiparameter
     # systems of ODEs.  Is m dimensional because it includes all initial conditions as well as ode parameters
     t_p = pt.vector("p", dtype="float64")
-    t_p.tag.test_value = np.ones((n_states + n_theta,), dtype="float64")
     # Time.  Allow for non-autonomous systems of ODEs to be analyzed
     t_t = pt.scalar("t", dtype="float64")
-    t_t.tag.test_value = 2.459
 
     # Present state of the gradients:
     # Will always be 0 unless the parameter is the initial condition
     # Entry i,j is partial of y[i] wrt to p[j]
     dydp_vec = pt.vector("dydp", dtype="float64")
-    dydp_vec.tag.test_value = make_sens_ic(n_states, n_theta, "float64")
 
     dydp = dydp_vec.reshape((n_states, n_states + n_theta))
 

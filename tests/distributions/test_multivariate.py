@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -24,26 +24,29 @@ import scipy.special as sp
 import scipy.stats as st
 
 from pytensor import tensor as pt
+from pytensor.compile.mode import get_mode
 from pytensor.tensor import TensorVariable
-from pytensor.tensor.blockwise import Blockwise
+from pytensor.tensor.blockwise import Blockwise, BlockwiseWithCoreShape
+from pytensor.tensor.linalg.decomposition.cholesky import Cholesky
+from pytensor.tensor.linalg.inverse import MatrixInverse
+from pytensor.tensor.random.basic import multivariate_normal
 from pytensor.tensor.random.utils import broadcast_params
-from pytensor.tensor.slinalg import Cholesky
 
 import pymc as pm
 
+from pymc import Model
 from pymc.distributions.multivariate import (
-    MultivariateIntervalTransform,
+    LKJCorr,
     _LKJCholeskyCov,
-    _LKJCorr,
     _OrderedMultinomial,
-    posdef,
     quaddist_matrix,
 )
 from pymc.distributions.shape_utils import change_dist_size, to_tuple
+from pymc.distributions.transforms import CholeskyCorrTransform
 from pymc.logprob.basic import logp
 from pymc.logprob.utils import ParameterValueError
 from pymc.math import kronecker
-from pymc.pytensorf import compile_pymc, floatX, intX
+from pymc.pytensorf import compile, floatX
 from pymc.sampling.forward import draw
 from pymc.testing import (
     BaseTestDistributionRandom,
@@ -57,7 +60,7 @@ from pymc.testing import (
     Vector,
     assert_support_point_is_expected,
     check_logp,
-    continuous_random_tester,
+    partially_deterministic_continuous_random_tester,
     seeded_numpy_distribution_builder,
     select_by_precision,
 )
@@ -166,7 +169,7 @@ def stickbreakingweights_logpdf():
     _alpha = pt.scalar()
     _k = pt.iscalar()
     _logp = logp(pm.StickBreakingWeights.dist(_alpha, _k), _value)
-    core_fn = compile_pymc([_value, _alpha, _k], _logp)
+    core_fn = compile([_value, _alpha, _k], _logp)
 
     return np.vectorize(core_fn, signature="(n),(),()->()")
 
@@ -301,10 +304,8 @@ class TestMatchesScipy:
     def test_mvnormal_indef(self):
         cov_val = np.array([[1, 0.5], [0.5, -2]])
         cov = pt.matrix("cov")
-        cov.tag.test_value = np.eye(2)
         mu = floatX(np.zeros(2))
         x = pt.vector("x")
-        x.tag.test_value = np.zeros(2)
         mvn_logp = logp(pm.MvNormal.dist(mu=mu, cov=cov), x)
         f_logp = pytensor.function([cov, x], mvn_logp)
         with pytest.raises(ParameterValueError):
@@ -419,7 +420,7 @@ class TestMatchesScipy:
 
     @pytest.mark.parametrize("n", [2, 3])
     @pytest.mark.parametrize("m", [3])
-    @pytest.mark.parametrize("sigma", [None, 1])
+    @pytest.mark.parametrize("sigma", [0, 1])
     def test_kroneckernormal(self, n, m, sigma):
         np.random.seed(5)
         N = n * m
@@ -548,20 +549,28 @@ class TestMatchesScipy:
 
     @pytest.mark.parametrize("n", [2, 3])
     def test_wishart(self, n):
-        with pytest.warns(UserWarning, match="Wishart distribution can currently not be used"):
-            check_logp(
-                pm.Wishart,
-                PdMatrix(n),
-                {"nu": Domain([0, 3, 4, np.inf], "int64"), "V": PdMatrix(n)},
-                lambda value, nu, V: st.wishart.logpdf(value, int(nu), V),
-            )
+        check_logp(
+            pm.Wishart,
+            PdMatrix(n),
+            {"nu": Domain([0, 3, 4, np.inf], "int64"), "V": PdMatrix(n)},
+            lambda value, nu, V: st.wishart.logpdf(value, int(nu), V),
+        )
 
-    @pytest.mark.parametrize("x,eta,n,lp", LKJ_CASES)
-    def test_lkjcorr(self, x, eta, n, lp):
+    @pytest.mark.parametrize("x_tri,eta,n,lp", LKJ_CASES)
+    def test_lkjcorr(self, x_tri, eta, n, lp):
         with pm.Model() as model:
-            pm.LKJCorr("lkj", eta=eta, n=n, transform=None, return_matrix=False)
+            pm.LKJCorr("lkj", eta=eta, n=n, transform=None)
 
-        point = {"lkj": x}
+        x = np.eye(n)
+        x[np.tril_indices(n, -1)] = x_tri
+        x[np.triu_indices(n, 1)] = x_tri
+
+        try:
+            x_chol = np.linalg.cholesky(x)
+        except np.linalg.LinAlgError:
+            x_chol = x  # Will lead to -inf logp
+
+        point = {"lkj": x_chol}
         decimals = select_by_precision(float64=6, float32=4)
         npt.assert_almost_equal(
             model.compile_logp()(point), lp, decimal=decimals, err_msg=str(point)
@@ -640,7 +649,7 @@ class TestMatchesScipy:
             with pm.Model() as m:
                 x = pm.Multinomial("x", n=5, p=[1, 1, 1, 1, 1])
         # test stored p-vals have been normalised
-        assert np.isclose(m.x.owner.inputs[4].sum().eval(), 1.0)
+        assert np.isclose(m.x.owner.inputs[-1].sum().eval(), 1.0)
 
     def test_multinomial_negative_p_symbolic(self):
         # Passing symbolic negative p does not raise an immediate error, but evaluating
@@ -674,8 +683,8 @@ class TestMatchesScipy:
     )
     @pytest.mark.parametrize("extra_size", [(1,), (2,), (2, 3)])
     def test_multinomial_vectorized(self, n, p, extra_size):
-        n = intX(np.array(n))
-        p = floatX(np.array(p))
+        n = np.array(n)
+        p = np.array(p)
         p /= p.sum(axis=-1, keepdims=True)
 
         _, bcast_p = broadcast_params([n, p], ndims_params=[0, 1])
@@ -734,10 +743,10 @@ class TestMatchesScipy:
         ns = np.arange(n + 1)
         ns_dm = np.vstack((ns, n - ns)).T  # convert ns=1 to ns_dm=[1, 4], for all ns...
 
-        bb = pm.BetaBinomial.dist(n=n, alpha=a, beta=b, size=2)
+        bb = pm.BetaBinomial.dist(n=n, alpha=a, beta=b, size=6)
         bb_logp = logp(bb, ns).eval()
 
-        dm = pm.DirichletMultinomial.dist(n=n, a=[a, b], size=2)
+        dm = pm.DirichletMultinomial.dist(n=n, a=[a, b], size=6)
         dm_logp = logp(dm, ns_dm).eval().ravel()
 
         npt.assert_almost_equal(
@@ -757,8 +766,8 @@ class TestMatchesScipy:
     )
     @pytest.mark.parametrize("extra_size", [(1,), (2,), (2, 3)])
     def test_dirichlet_multinomial_vectorized(self, n, a, extra_size):
-        n = intX(np.array(n))
-        a = floatX(np.array(a))
+        n = np.array(n)
+        a = np.array(a)
 
         _, bcast_a = broadcast_params([n, a], ndims_params=[0, 1])
         size = extra_size + bcast_a.shape[:-1]
@@ -790,7 +799,7 @@ class TestMatchesScipy:
     )
     def test_stickbreakingweights_logp(self, value, alpha, K, logp):
         with pm.Model() as model:
-            sbw = pm.StickBreakingWeights("sbw", alpha=alpha, K=K, transform=None)
+            sbw = pm.StickBreakingWeights("sbw", alpha=alpha, K=K, default_transform=None)
         point = {"sbw": value}
         npt.assert_almost_equal(
             pm.logp(sbw, value).eval(),
@@ -817,7 +826,7 @@ class TestMatchesScipy:
     def test_stickbreakingweights_vectorized(self, alpha, K, stickbreakingweights_logpdf):
         value = pm.StickBreakingWeights.dist(alpha, K).eval()
         with pm.Model():
-            sbw = pm.StickBreakingWeights("sbw", alpha=alpha, K=K, transform=None)
+            sbw = pm.StickBreakingWeights("sbw", alpha=alpha, K=K, default_transform=None)
         point = {"sbw": value}
         npt.assert_almost_equal(
             pm.logp(sbw, value).eval(),
@@ -898,15 +907,15 @@ def test_car_matrix_check(sparse):
         W = pytensor.sparse.csr_from_dense(W)
 
     car_dist = pm.CAR.dist(mu, W, alpha, tau)
-    with pytest.raises(AssertionError, match="W must be a symmetric adjacency matrix"):
+    with pytest.raises(ParameterValueError, match="W is a symmetric adjacency matrix"):
         logp(car_dist, xs).eval()
 
     # W.ndim != 2
     if not sparse:
         W = np.array([0.0, 1.0, 2.0, 0.0])
         W = pytensor.tensor.as_tensor_variable(W)
-        with pytest.raises(ValueError, match="W must be a matrix"):
-            car_dist = pm.CAR.dist(mu, W, alpha, tau)
+        with pytest.raises(TypeError, match="W must be a matrix"):
+            pm.CAR.dist(mu, W, alpha, tau)
 
 
 @pytest.mark.parametrize("alpha", [1, -1])
@@ -926,7 +935,7 @@ def test_car_alpha_bounds(alpha):
     with pytest.raises(ValueError, match="the domain of alpha is: -1 < alpha < 1"):
         pm.draw(car_dist)
 
-    with pytest.raises(ValueError, match="-1 < alpha < 1, tau > 0"):
+    with pytest.raises(ParameterValueError, match="-1 < alpha < 1, tau > 0"):
         pm.logp(car_dist, values).eval()
 
 
@@ -1305,34 +1314,17 @@ class TestMoments:
     @pytest.mark.parametrize(
         "n, eta, size, expected",
         [
-            (3, 1, None, np.zeros(3)),
-            (5, 1, None, np.zeros(10)),
-            pytest.param(
-                3,
-                1,
-                1,
-                np.zeros((1, 3)),
-                marks=pytest.mark.xfail(
-                    raises=NotImplementedError,
-                    reason="LKJCorr logp is only implemented for vector values (ndim=1)",
-                ),
-            ),
-            pytest.param(
-                5,
-                1,
-                (2, 3),
-                np.zeros((2, 3, 10)),
-                marks=pytest.mark.xfail(
-                    raises=NotImplementedError,
-                    reason="LKJCorr logp is only implemented for vector values (ndim=1)",
-                ),
-            ),
+            (3, 1, None, np.eye(3)),
+            (5, 1, None, np.eye(5)),
+            (3, 1, (1,), np.broadcast_to(np.eye(3), (1, 3, 3))),
+            (5, 1, (2, 3), np.broadcast_to(np.eye(5), (2, 3, 5, 5))),
         ],
+        ids=["n=3", "n=5", "batch_1", "batch_2"],
     )
     def test_lkjcorr_support_point(self, n, eta, size, expected):
         with pm.Model() as model:
-            pm.LKJCorr("x", n=n, eta=eta, size=size, return_matrix=False)
-        assert_support_point_is_expected(model, expected)
+            pm.LKJCorr("x", n=n, eta=eta, size=size)
+        assert_support_point_is_expected(model, expected, check_finite_logp=True)
 
     @pytest.mark.parametrize(
         "n, eta, size, expected",
@@ -1390,6 +1382,11 @@ class TestMoments:
 
 
 class TestMvNormalCov(BaseTestDistributionRandom):
+    def mvnormal_rng_fn(self, size, mean, cov, rng):
+        if isinstance(size, int):
+            size = (size,)
+        return multivariate_normal.rng_fn(rng, mean, cov, size=size)
+
     pymc_dist = pm.MvNormal
     pymc_dist_params = {
         "mu": np.array([1.0, 2.0]),
@@ -1405,7 +1402,8 @@ class TestMvNormalCov(BaseTestDistributionRandom):
         "mean": np.array([1.0, 2.0]),
         "cov": np.array([[2.0, 0.0], [0.0, 3.5]]),
     }
-    reference_dist = seeded_numpy_distribution_builder("multivariate_normal")
+    reference_dist = lambda self: ft.partial(self.mvnormal_rng_fn, rng=self.get_random_state())  # noqa: E731
+
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -1421,7 +1419,7 @@ class TestMvNormalChol(BaseTestDistributionRandom):
     }
     expected_rv_op_params = {
         "mu": np.array([1.0, 2.0]),
-        "cov": quaddist_matrix(chol=pymc_dist_params["chol"]).eval(),
+        "cov": quaddist_matrix(chol=pymc_dist_params["chol"]).eval(mode="FAST_COMPILE"),
     }
     checks_to_run = ["check_pymc_params_match_rv_op"]
 
@@ -1434,7 +1432,7 @@ class TestMvNormalTau(BaseTestDistributionRandom):
     }
     expected_rv_op_params = {
         "mu": np.array([1.0, 2.0]),
-        "cov": quaddist_matrix(tau=pymc_dist_params["tau"]).eval(),
+        "cov": quaddist_matrix(tau=pymc_dist_params["tau"]).eval(mode="FAST_COMPILE"),
     }
     checks_to_run = ["check_pymc_params_match_rv_op"]
 
@@ -1448,7 +1446,7 @@ class TestMvNormalMisc:
                 "chol_cov", n=3, eta=2, sd_dist=sd_dist, compute_corr=True
             )
             mv = pm.MvNormal("mv", mu, chol=chol, size=4)
-            prior = pm.sample_prior_predictive(samples=10, return_inferencedata=False)
+            prior = pm.sample_prior_predictive(draws=10, return_inferencedata=False)
 
         assert prior["mv"].shape == (10, 4, 3)
 
@@ -1462,7 +1460,7 @@ class TestMvNormalMisc:
                 "chol_cov", n=3, eta=2, sd_dist=sd_dist, compute_corr=True
             )
             mv = pm.MvNormal("mv", mu, cov=pm.math.dot(chol, chol.T), size=4)
-            prior = pm.sample_prior_predictive(samples=10, return_inferencedata=False)
+            prior = pm.sample_prior_predictive(draws=10, return_inferencedata=False)
 
         assert prior["mv"].shape == (10, 4, 3)
 
@@ -1470,17 +1468,21 @@ class TestMvNormalMisc:
         self,
     ):
         with pm.Model() as model:
-            corr = pm.LKJCorr("corr", n=3, eta=2, return_matrix=True)
-            pm.Deterministic("corr_mat", corr)
-            mv = pm.MvNormal("mv", 0.0, cov=corr, size=4)
-            prior = pm.sample_prior_predictive(samples=10, return_inferencedata=False)
+            chol_corr_mat = pm.LKJCorr("chol_corr_mat", n=3, eta=2)
+            corr_mat = pm.Deterministic("corr_mat", chol_corr_mat @ chol_corr_mat.mT)
+            mv = pm.MvNormal("mv", 0.0, chol=corr_mat, size=4)
+            prior = pm.sample_prior_predictive(draws=10, return_inferencedata=False)
 
         assert prior["corr_mat"].shape == (10, 3, 3)  # square
-        assert (prior["corr_mat"][:, [0, 1, 2], [0, 1, 2]] == 1.0).all()  # 1.0 on diagonal
         assert (prior["corr_mat"] == prior["corr_mat"].transpose(0, 2, 1)).all()  # symmetric
-        assert (
-            prior["corr_mat"].max() <= 1.0 and prior["corr_mat"].min() >= -1.0
-        )  # constrained between -1 and 1
+
+        np.testing.assert_allclose(
+            prior["corr_mat"][:, [0, 1, 2], [0, 1, 2]], 1.0
+        )  # 1.0 on diagonal
+
+        # constrained between -1 and 1
+        assert prior["corr_mat"].max() <= (1.0 + 1e-12)
+        assert prior["corr_mat"].min() >= (-1.0 - 1e-12)
 
     def test_issue_3758(self):
         np.random.seed(42)
@@ -1529,14 +1531,14 @@ class TestZeroSumNormal:
     def assert_zerosum_axes(self, random_samples, axes_to_check, check_zerosum_axes=True):
         if check_zerosum_axes:
             for ax in axes_to_check:
-                assert np.isclose(
-                    random_samples.mean(axis=ax), 0
-                ).all(), f"{ax} is a zerosum_axis but is not summing to 0 across all samples."
+                assert np.allclose(random_samples.mean(axis=ax), 0), (
+                    f"{ax} is a zerosum_axis but is not summing to 0 across all samples."
+                )
         else:
             for ax in axes_to_check:
-                assert not np.isclose(
-                    random_samples.mean(axis=ax), 0
-                ).all(), f"{ax} is not a zerosum_axis, but is nonetheless summing to 0 across all samples."
+                assert not np.allclose(random_samples.mean(axis=ax), 0), (
+                    f"{ax} is not a zerosum_axis, but is nonetheless summing to 0 across all samples."
+                )
 
     @pytest.mark.parametrize(
         "dims, n_zerosum_axes",
@@ -1562,8 +1564,8 @@ class TestZeroSumNormal:
         )
 
         ndim_supp = v.owner.op.ndim_supp
-        n_zerosum_axes = np.arange(-ndim_supp, 0)
-        nonzero_axes = np.arange(v.ndim - ndim_supp)
+        n_zerosum_axes = tuple(range(-ndim_supp, 0))
+        nonzero_axes = tuple(range(v.ndim - ndim_supp))
         for samples in [
             s.posterior.v,
             random_samples,
@@ -1593,8 +1595,8 @@ class TestZeroSumNormal:
         )
 
         ndim_supp = v.owner.op.ndim_supp
-        n_zerosum_axes = np.arange(-ndim_supp, 0)
-        nonzero_axes = np.arange(v.ndim - ndim_supp)
+        n_zerosum_axes = tuple(range(-ndim_supp, 0))
+        nonzero_axes = tuple(range(v.ndim - ndim_supp))
         for samples in [
             s.posterior.v,
             random_samples,
@@ -1625,9 +1627,10 @@ class TestZeroSumNormal:
     def test_zsn_fail_axis(self, error, match, shape, support_shape, n_zerosum_axes):
         with pytest.raises(error, match=match):
             with pm.Model() as m:
-                _ = pm.ZeroSumNormal(
+                v = pm.ZeroSumNormal(
                     "v", shape=shape, support_shape=support_shape, n_zerosum_axes=n_zerosum_axes
                 )
+                v.eval()
 
     @pytest.mark.parametrize(
         "shape, support_shape",
@@ -1770,10 +1773,19 @@ class TestZeroSumNormal:
                 sigma=batch_test_sigma[None, :, None], n_zerosum_axes=2, support_shape=(3, 2)
             )
 
+    def test_batched_transformed_logp_shape(self):
+        with pm.Model() as m:
+            x = pm.ZeroSumNormal("x", sigma=np.ones(3)[:, None], support_shape=(2,))
+            assert x.type.shape == (3, 2)
+        assert m.logp(sum=False)[0].type.shape == (3,)
+        assert m.logp(sum=False, jacobian=False)[0].type.shape == (3,)
+
 
 class TestMvStudentTCov(BaseTestDistributionRandom):
     def mvstudentt_rng_fn(self, size, nu, mu, scale, rng):
-        mv_samples = rng.multivariate_normal(np.zeros_like(mu), scale, size=size)
+        if isinstance(size, int):
+            size = (size,)
+        mv_samples = multivariate_normal.rng_fn(rng, np.zeros_like(mu), scale, size=size)
         chi2_samples = rng.chisquare(nu, size=size)
         return (mv_samples / np.sqrt(chi2_samples[:, None] / nu)) + mu
 
@@ -1795,7 +1807,7 @@ class TestMvStudentTCov(BaseTestDistributionRandom):
         "mu": np.array([1.0, 2.0]),
         "scale": np.array([[2.0, 0.0], [0.0, 3.5]]),
     }
-    reference_dist = lambda self: ft.partial(self.mvstudentt_rng_fn, rng=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(self.mvstudentt_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_params_match_rv_op",
         "check_pymc_draws_match_reference",
@@ -1844,7 +1856,7 @@ class TestMvStudentTChol(BaseTestDistributionRandom):
     expected_rv_op_params = {
         "nu": 5,
         "mu": np.array([1.0, 2.0]),
-        "scale": quaddist_matrix(chol=pymc_dist_params["chol"]).eval(),
+        "scale": quaddist_matrix(chol=pymc_dist_params["chol"]).eval(mode="FAST_COMPILE"),
     }
     checks_to_run = ["check_pymc_params_match_rv_op"]
 
@@ -1859,7 +1871,7 @@ class TestMvStudentTTau(BaseTestDistributionRandom):
     expected_rv_op_params = {
         "nu": 5,
         "mu": np.array([1.0, 2.0]),
-        "cov": quaddist_matrix(tau=pymc_dist_params["tau"]).eval(),
+        "cov": quaddist_matrix(tau=pymc_dist_params["tau"]).eval(mode="FAST_COMPILE"),
     }
     checks_to_run = ["check_pymc_params_match_rv_op"]
 
@@ -1983,32 +1995,100 @@ class TestStickBreakingWeights_1D_alpha(BaseTestDistributionRandom):
 
 
 class TestWishart(BaseTestDistributionRandom):
-    def wishart_rng_fn(self, size, nu, V, rng):
-        return st.wishart.rvs(int(nu), V, size=size, random_state=rng)
-
     pymc_dist = pm.Wishart
 
-    V = np.eye(3)
-    pymc_dist_params = {"nu": 4, "V": V}
-    reference_dist_params = {"nu": 4, "V": V}
-    expected_rv_op_params = {"nu": 4, "V": V}
+    V = np.eye(3) + 0.1 * np.ones((3, 3))
+    scale_chol = np.linalg.cholesky(V)
+    pymc_dist_params = {"nu": 4, "scale_chol": scale_chol}
+    expected_rv_op_params = {"nu": 4, "scale_chol": scale_chol}
     sizes_to_check = [None, 1, (4, 5)]
     sizes_expected = [
         (3, 3),
         (1, 3, 3),
         (4, 5, 3, 3),
     ]
-    reference_dist = lambda self: ft.partial(self.wishart_rng_fn, rng=self.get_random_state())  # noqa E731
     checks_to_run = [
         "check_rv_size",
         "check_pymc_params_match_rv_op",
-        "check_pymc_draws_match_reference",
+        "check_random_matches_moments",
+        "check_random_matches_scipy",
         "check_rv_size_batched_params",
+        "check_param_validation",
     ]
 
+    def check_random_matches_moments(self):
+        """Verify the sampler produces draws with the right first two moments.
+
+        For ``X ~ Wishart(nu, V)`` the closed forms are
+        ``E[X_ij] = nu * V_ij`` and
+        ``Var(X_ij) = nu * (V_ij^2 + V_ii V_jj)``.
+        Neither depends on the Bartlett internals, so passing this gives
+        independent confirmation that the sampler is correct.
+        """
+        nu = 5
+        rng = np.random.default_rng(20240409)
+        # Non-trivial SPD scale to exercise off-diagonal entries.
+        A = rng.normal(size=(3, 3))
+        V = A @ A.T + 3 * np.eye(3)
+
+        n_draws = 20_000
+        draws = pm.draw(pm.Wishart.dist(nu=nu, V=V, size=n_draws), random_seed=20240409)
+        assert draws.shape == (n_draws, 3, 3)
+
+        # Closed-form moments.
+        expected_mean = nu * V
+        expected_entry_var = nu * (V**2 + np.outer(np.diag(V), np.diag(V)))
+
+        # First moment z-score: compare the sample mean's deviation from the
+        # expected value to its analytical standard error. With n_draws=20k,
+        # ~5 stderrs is overwhelmingly conservative for 9 independent entries.
+        se_mean = np.sqrt(expected_entry_var / n_draws)
+        z_mean = (draws.mean(axis=0) - expected_mean) / se_mean
+        npt.assert_array_less(np.abs(z_mean), 5.0)
+
+        # Second moment, same scheme. The SE of the sample variance scales
+        # like sqrt(2/n_draws) times the entry variance for near-Gaussian
+        # marginals — the Wishart entries are not Gaussian, so we use a
+        # somewhat looser bound here.
+        se_var = expected_entry_var * np.sqrt(2.0 / n_draws)
+        z_var = (draws.var(axis=0) - expected_entry_var) / se_var
+        npt.assert_array_less(np.abs(z_var), 6.0)
+
+    def check_random_matches_scipy(self):
+        """Entry-wise 2-sample KS against ``scipy.stats.wishart``.
+
+        Complements ``check_random_matches_moments`` (which checks closed-form
+        first and second moments) by comparing the full marginal distribution
+        of each unique entry against scipy's reference sampler.
+        """
+        nu = 6
+        rng = np.random.default_rng(20240410)
+        A = rng.normal(size=(3, 3))
+        V = A @ A.T + 3 * np.eye(3)
+
+        n_draws = 1_000
+        draws = pm.draw(pm.Wishart.dist(nu=nu, V=V, size=n_draws), random_seed=20240410)
+        ref = st.wishart(df=nu, scale=V).rvs(size=n_draws, random_state=20240411)
+
+        # Compare each unique entry (upper triangle including diagonal).
+        p = V.shape[-1]
+        iu = np.triu_indices(p)
+        p_values = [st.ks_2samp(draws[:, i, j], ref[:, i, j]).pvalue for i, j in zip(*iu)]
+        # Bonferroni-corrected threshold across the p(p+1)/2 entries.
+        assert min(p_values) > 0.001 / len(p_values)
+
+    def check_param_validation(self):
+        """``V`` and ``scale_chol`` are mutually exclusive."""
+        with pytest.raises(ValueError, match="exactly one of"):
+            pm.Wishart.dist(nu=5, V=np.eye(3), scale_chol=np.eye(3))
+        with pytest.raises(ValueError, match="exactly one of"):
+            pm.Wishart.dist(nu=5)
+
     def check_rv_size_batched_params(self):
+        # The Bartlett-based SymbolicRV supports batched scale matrices natively.
         for size in (None, (2,), (1, 2), (4, 3, 2)):
-            x = pm.Wishart.dist(nu=4, V=np.stack([np.eye(3), np.eye(3)]), size=size)
+            L = np.linalg.cholesky(np.stack([np.eye(3), np.eye(3)]))
+            x = pm.Wishart.dist(nu=4, scale_chol=L, size=size)
 
             if size is None:
                 expected_shape = (2, 3, 3)
@@ -2016,11 +2096,17 @@ class TestWishart(BaseTestDistributionRandom):
                 expected_shape = (*size, 3, 3)
 
             assert tuple(x.shape.eval()) == expected_shape
+            assert x.eval().shape == expected_shape
 
-            # RNG does not currently support batched parameters, whet it does this test
-            # should be updated to check that draws also have the expected shape
-            with pytest.raises(ValueError):
-                x.eval()
+
+class TestWishartV(BaseTestDistributionRandom):
+    pymc_dist = pm.Wishart
+
+    V = np.eye(3) + 0.1 * np.ones((3, 3))
+    L_V = np.linalg.cholesky(V)
+    pymc_dist_params = {"nu": 4, "V": V}
+    expected_rv_op_params = {"nu": 4, "scale_chol": L_V}
+    checks_to_run = ["check_pymc_params_match_rv_op"]
 
 
 class TestMatrixNormal(BaseTestDistributionRandom):
@@ -2097,7 +2183,7 @@ class TestMatrixNormal(BaseTestDistributionRandom):
         with pm.Model() as model:
             sd_dist = pm.HalfCauchy.dist(beta=2.5, size=D)
             packedL = pm.LKJCholeskyCov("packedL", eta=2, n=D, sd_dist=sd_dist, compute_corr=False)
-            L = pm.expand_packed_triangular(D, packedL, lower=True)
+            L = pm.math.expand_packed_triangular(D, packedL, lower=True)
             Sigma = pm.Deterministic("Sigma", L.dot(L.T))  # D x D covariance
             mu = pm.MatrixNormal(
                 "mu", mu=mu_0, rowcov=(1 / lambd) * Sigma, colcov=np.eye(K), shape=(D, K)
@@ -2109,9 +2195,11 @@ class TestMatrixNormal(BaseTestDistributionRandom):
 
 class TestKroneckerNormal(BaseTestDistributionRandom):
     def kronecker_rng_fn(self, size, mu, covs=None, sigma=None, rng=None):
-        cov = pm.math.kronecker(covs[0], covs[1]).eval()
+        if isinstance(size, int):
+            size = (size,)
+        cov = np.kron(covs[0], covs[1])
         cov += sigma**2 * np.identity(cov.shape[0])
-        return st.multivariate_normal.rvs(mean=mu, cov=cov, size=size, random_state=rng)
+        return multivariate_normal.rng_fn(rng, mean=mu, cov=cov, size=size)
 
     pymc_dist = pm.KroneckerNormal
 
@@ -2127,7 +2215,7 @@ class TestKroneckerNormal(BaseTestDistributionRandom):
     sizes_to_check = [None, (), 1, (1,), 5, (4, 5), (2, 4, 2)]
     sizes_expected = [(N,), (N,), (1, N), (1, N), (5, N), (4, 5, N), (2, 4, 2, N)]
 
-    reference_dist = lambda self: ft.partial(self.kronecker_rng_fn, rng=self.get_random_state())  # noqa E731
+    reference_dist = lambda self: ft.partial(self.kronecker_rng_fn, rng=self.get_random_state())  # noqa: E731
     checks_to_run = [
         "check_pymc_draws_match_reference",
         "check_rv_size",
@@ -2150,19 +2238,19 @@ class TestOrderedMultinomial(BaseTestDistributionRandom):
 
 
 class TestLKJCorr(BaseTestDistributionRandom):
-    pymc_dist = _LKJCorr
+    pymc_dist = LKJCorr
     pymc_dist_params = {"n": 3, "eta": 1.0}
     expected_rv_op_params = {"n": 3, "eta": 1.0}
 
     sizes_to_check = [None, (), 1, (1,), 5, (4, 5), (2, 4, 2)]
     sizes_expected = [
-        (3,),
-        (3,),
-        (1, 3),
-        (1, 3),
-        (5, 3),
-        (4, 5, 3),
-        (2, 4, 2, 3),
+        (3, 3),
+        (3, 3),
+        (1, 3, 3),
+        (1, 3, 3),
+        (5, 3, 3),
+        (4, 5, 3, 3),
+        (2, 4, 2, 3, 3),
     ]
 
     checks_to_run = [
@@ -2173,39 +2261,49 @@ class TestLKJCorr(BaseTestDistributionRandom):
 
     def check_draws_match_expected(self):
         def ref_rand(size, n, eta):
+            n = int(n.item())
+            size = np.atleast_1d(size)
+
             shape = int(n * (n - 1) // 2)
             beta = eta - 1 + n / 2
-            return (st.beta.rvs(size=(size, shape), a=beta, b=beta) - 0.5) * 2
+            tril_values = (st.beta.rvs(size=(*size, shape), a=beta, b=beta) - 0.5) * 2
 
-        continuous_random_tester(
-            _LKJCorr,
+            L = np.zeros((*size, n, n))
+            idx = np.tril_indices(n, -1)
+            L[..., idx[0], idx[1]] = tril_values
+            corr = L + np.swapaxes(L, -1, -2) + np.eye(n)
+
+            return np.linalg.cholesky(corr)
+
+        # n can be symbolic, but only n=2 is tested because if n > 2, the ref_rand function is wrong.
+        # We don't have a good reference for sampling LKJ
+        partially_deterministic_continuous_random_tester(
+            LKJCorr,
             {
-                "n": Domain([2, 10, 50], edges=(None, None)),
                 "eta": Domain([1.0, 10.0, 100.0], edges=(None, None)),
+                "n": Domain([2], dtype="int64", edges=(None, None)),
             },
             ref_rand=ref_rand,
             size=1000,
         )
 
 
-@pytest.mark.parametrize(
-    argnames="shape",
-    argvalues=[
-        (2,),
-        pytest.param(
-            (3, 2),
-            marks=pytest.mark.xfail(
-                raises=NotImplementedError,
-                reason="LKJCorr logp is only implemented for vector values (ndim=1)",
-            ),
-        ),
-    ],
-)
-def test_LKJCorr_default_transform(shape):
+def test_LKJCorr_default_transform():
+    # Make n large -- regression test for https://github.com/pymc-devs/pymc/issues/7101
+    # The transformation was previously wrong and resulted in non-valid correlation matrices when n >> 1
+    n = 50
+
     with pm.Model() as m:
-        x = pm.LKJCorr("x", n=2, eta=1, shape=shape, return_matrix=False)
-    assert isinstance(m.rvs_to_transforms[x], MultivariateIntervalTransform)
-    assert m.logp(sum=False)[0].type.shape == shape[:-1]
+        x = pm.LKJCorr("x", n=n, eta=1, shape=(3, n, n))
+    assert isinstance(m.rvs_to_transforms[x], CholeskyCorrTransform)
+
+    x_logp = m.logp(sum=False)[0]
+    assert x_logp.type.shape == (3,)
+
+    rng = np.random.default_rng()
+    fn = pytensor.function([m.rvs_to_values[x]], x_logp)
+    x_val = rng.uniform(size=(3, n * (n - 1) // 2))
+    assert np.isfinite(fn(x_val)).all()
 
 
 class TestLKJCholeskyCov(BaseTestDistributionRandom):
@@ -2230,11 +2328,6 @@ class TestLKJCholeskyCov(BaseTestDistributionRandom):
         "check_draws_match_expected",
     ]
 
-    def _instantiate_pymc_rv(self, dist_params=None):
-        # RNG cannot be passed through the PyMC class
-        params = dist_params if dist_params else self.pymc_dist_params
-        self.pymc_rv = self.pymc_dist.dist(**params, size=self.size)
-
     def check_rv_size(self):
         for size, expected in zip(self.sizes_to_check, self.sizes_expected):
             sd_dist = pm.Exponential.dist(1, size=(*to_tuple(size), 3))
@@ -2245,8 +2338,8 @@ class TestLKJCholeskyCov(BaseTestDistributionRandom):
 
     def check_draws_match_expected(self):
         # TODO: Find better comparison:
-        rng = self.get_random_state(reset=True)
-        x = _LKJCholeskyCov.dist(n=2, eta=10_000, sd_dist=pm.DiracDelta.dist([0.5, 2.0]))
+        rng = np.random.default_rng(2248)
+        x = _LKJCholeskyCov.dist(n=2, eta=100_000, sd_dist=pm.DiracDelta.dist([0.5, 2.0]))
         assert np.all(np.abs(draw(x, random_seed=rng) - np.array([0.5, 0, 2.0])) < 0.01)
 
 
@@ -2255,9 +2348,6 @@ class TestICAR(BaseTestDistributionRandom):
     pymc_dist_params = {"W": np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]]), "sigma": 2}
     expected_rv_op_params = {
         "W": np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]]),
-        "node1": np.array([1, 2, 2]),
-        "node2": np.array([0, 0, 1]),
-        "N": 3,
         "sigma": 2,
         "zero_sum_strength": 0.001,
     }
@@ -2350,24 +2440,6 @@ def test_car_rng_fn(sparse):
     assert p > delta
 
 
-@pytest.mark.parametrize(
-    "matrix, result",
-    [
-        ([[1.0, 0], [0, 1]], True),
-        ([[1.0, 2], [2, 1]], False),
-        ([[1.0, 1], [1, 1]], False),
-        ([[1, 0.99, 1], [0.99, 1, 0.999], [1, 0.999, 1]], False),
-    ],
-)
-def test_posdef_symmetric(matrix, result):
-    """The test returns 0 if the matrix has 0 eigenvalue.
-
-    Is this correct?
-    """
-    data = np.array(matrix, dtype=pytensor.config.floatX)
-    assert posdef(data) == result
-
-
 def test_mvnormal_no_cholesky_in_model_logp():
     """
     Test MvNormal likelihood when using Cholesky factor parameterization does not unnecessarily
@@ -2383,7 +2455,7 @@ def test_mvnormal_no_cholesky_in_model_logp():
         data = np.ones((batch_size, n))
         pm.MvNormal("y", mu=mu, chol=pt.broadcast_to(chol, (batch_size, n, n)), observed=data)
 
-    contains_cholesky_op = lambda fgraph: any(  # noqa E731
+    contains_cholesky_op = lambda fgraph: any(  # noqa: E731
         isinstance(node.op, Cholesky) for node in fgraph.apply_nodes
     )
 
@@ -2396,8 +2468,55 @@ def test_mvnormal_no_cholesky_in_model_logp():
     d2logp = m.compile_d2logp()
     assert not contains_cholesky_op(d2logp.f.maker.fgraph)
 
-    logp_dlogp = m.logp_dlogp_function()
+    logp_dlogp = m.logp_dlogp_function(ravel_inputs=True)
     assert not contains_cholesky_op(logp_dlogp._pytensor_function.maker.fgraph)
+
+
+def test_wishart_no_cholesky_in_model_logp():
+    """The Cholesky-based Wishart logp must not retain a Cholesky op for free RVs.
+
+    The default ``CholeskyCovTransform`` produces ``L @ L.T`` with ``L`` tagged as
+    lower-triangular, so PyTensor's ``cholesky_ldotlt`` rewrite folds the apparent
+    ``cholesky(L @ L.T)`` round trip in ``Wishart.logp`` back to ``L``. This test
+    locks in that property; if it fails the architecture has degraded and a custom
+    ``_logprob`` dispatcher is needed instead.
+    """
+    n = 3
+    with pm.Model() as m:
+        pm.Wishart("Sigma", nu=5, V=np.eye(n))
+
+    def fgraph_of(fn):
+        # PointFunc exposes the compiled pytensor function as `.f`,
+        # while ValueGradFunction (from logp_dlogp_function) uses `_pytensor_function`.
+        compiled = getattr(fn, "f", None) or fn._pytensor_function
+        return compiled.maker.fgraph
+
+    def contains_cholesky_op(fn):
+        return any(
+            isinstance(node.op, Cholesky)
+            or (
+                isinstance(node.op, Blockwise | BlockwiseWithCoreShape)
+                and isinstance(node.op.core_op, Cholesky)
+            )
+            for node in fgraph_of(fn).apply_nodes
+        )
+
+    # Negative control: when ``cholesky_ldotlt`` is excluded from the compilation
+    # mode (and only that rewrite), the optimized logp graph still contains a
+    # Cholesky op. This proves the test is sensitive to the rewrite firing.
+    no_rewrite_mode = get_mode().excluding("cholesky_ldotlt")
+    assert contains_cholesky_op(m.compile_logp(mode=no_rewrite_mode))
+
+    # The actual lock for logp.
+    assert not contains_cholesky_op(m.compile_logp())
+
+    # For dlogp / logp_dlogp the negative control via ``excluding`` does not
+    # work: PyTensor runs ``rewrite_pregrad`` (which includes cholesky_ldotlt)
+    # before the gradient is taken, so the rewrite still fires regardless of
+    # the final compilation mode. We just assert the optimized graphs stay
+    # Cholesky-free.
+    assert not contains_cholesky_op(m.compile_dlogp())
+    assert not contains_cholesky_op(m.logp_dlogp_function(ravel_inputs=True))
 
 
 def test_mvnormal_blockwise_solve_opt():
@@ -2418,56 +2537,103 @@ def test_mvnormal_blockwise_solve_opt():
 def test_mvnormal_mu_convenience():
     """Test that mu is broadcasted to the length of cov and provided a default of zero"""
     x = pm.MvNormal.dist(cov=np.eye(3))
-    mu = x.owner.inputs[3]
+    mu = x.owner.inputs[2]
     np.testing.assert_allclose(mu.eval(), np.zeros((3,)))
 
     x = pm.MvNormal.dist(mu=1, cov=np.eye(3))
-    mu = x.owner.inputs[3]
+    mu = x.owner.inputs[2]
     np.testing.assert_allclose(mu.eval(), np.ones((3,)))
 
     x = pm.MvNormal.dist(mu=np.ones((1, 1)), cov=np.eye(3))
-    mu = x.owner.inputs[3]
+    mu = x.owner.inputs[2]
     np.testing.assert_allclose(
         mu.eval(),
         np.ones((1, 3)),
     )
 
     x = pm.MvNormal.dist(mu=np.ones((10, 1)), cov=np.eye(3))
-    mu = x.owner.inputs[3]
+    mu = x.owner.inputs[2]
     np.testing.assert_allclose(
         mu.eval(),
         np.ones((10, 3)),
     )
 
     x = pm.MvNormal.dist(mu=np.ones((10, 1, 1)), cov=np.full((2, 3, 3), np.eye(3)))
-    mu = x.owner.inputs[3]
+    mu = x.owner.inputs[2]
     np.testing.assert_allclose(mu.eval(), np.ones((10, 2, 3)))
 
 
 def test_mvstudentt_mu_convenience():
     """Test that mu is broadcasted to the length of scale and provided a default of zero"""
     x = pm.MvStudentT.dist(nu=4, scale=np.eye(3))
-    mu = x.owner.inputs[4]
+    mu = x.owner.inputs[3]
     np.testing.assert_allclose(mu.eval(), np.zeros((3,)))
 
     x = pm.MvStudentT.dist(nu=4, mu=1, scale=np.eye(3))
-    mu = x.owner.inputs[4]
+    mu = x.owner.inputs[3]
     np.testing.assert_allclose(mu.eval(), np.ones((3,)))
 
     x = pm.MvStudentT.dist(nu=4, mu=np.ones((1, 1)), scale=np.eye(3))
-    mu = x.owner.inputs[4]
+    mu = x.owner.inputs[3]
     np.testing.assert_allclose(
         mu.eval(),
         np.ones((1, 3)),
     )
 
     x = pm.MvStudentT.dist(nu=4, mu=np.ones((10, 1)), scale=np.eye(3))
-    mu = x.owner.inputs[4]
+    mu = x.owner.inputs[3]
     np.testing.assert_allclose(
         mu.eval(),
         np.ones((10, 3)),
     )
 
     x = pm.MvStudentT.dist(nu=4, mu=np.ones((10, 1, 1)), scale=np.full((2, 3, 3), np.eye(3)))
-    mu = x.owner.inputs[4]
+    mu = x.owner.inputs[3]
     np.testing.assert_allclose(mu.eval(), np.ones((10, 2, 3)))
+
+
+def test_mvstudentt_method():
+    def all_svd_method(fgraph):
+        found_one = False
+        for node in fgraph.toposort():
+            if isinstance(node.op, pm.MvNormal):
+                found_one = True
+                if not node.op.method == "svd":
+                    return False
+        return found_one  # We want to fail if there were no MvNormal nodes
+
+    x = pm.MvStudentT.dist(nu=4, scale=np.eye(3), method="svd")
+    assert x.type.shape == (3,)
+    assert all_svd_method(x.owner.op.fgraph)
+
+    # Changing the size should preserve the method
+    resized_x = change_dist_size(x, (2,))
+    assert resized_x.type.shape == (2, 3)
+    assert all_svd_method(resized_x.owner.op.fgraph)
+
+
+def test_precision_mv_normal_optimization():
+    rng = np.random.default_rng(sum(map(ord, "be precise")))
+
+    n = 30
+    L = rng.uniform(low=0.1, high=1.0, size=(n, n))
+    Sigma_test = L @ L.T
+    mu_test = np.zeros(n)
+    Q_test = np.linalg.inv(Sigma_test)
+    y_test = rng.normal(size=n)
+
+    with Model() as m:
+        Q = pm.Flat("Q", shape=(n, n))
+        y = pm.MvNormal("y", mu=mu_test, tau=Q)
+
+    y_logp_fn = m.compile_logp(vars=[y]).f
+
+    # Check we don't have any MatrixInverses in the logp
+    assert not any(
+        node for node in y_logp_fn.maker.fgraph.apply_nodes if isinstance(node.op, MatrixInverse)
+    )
+
+    np.testing.assert_allclose(
+        y_logp_fn(y=y_test, Q=Q_test),
+        st.multivariate_normal.logpdf(y_test, mu_test, cov=Sigma_test),
+    )

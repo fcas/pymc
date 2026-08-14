@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -34,9 +34,12 @@
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 
+"""Conversion of PyMC graphs into logp graphs."""
+
 from pymc.logprob.basic import (
     conditional_logp,
     icdf,
+    logccdf,
     logcdf,
     logp,
     transformed_conditional_logp,
@@ -45,17 +48,21 @@ from pymc.logprob.basic import (
 # Add rewrites to the DBs
 import pymc.logprob.binary
 import pymc.logprob.censoring
+import pymc.logprob.arithmetic
 import pymc.logprob.cumsum
 import pymc.logprob.checks
+import pymc.logprob.linalg
 import pymc.logprob.mixture
 import pymc.logprob.order
 import pymc.logprob.scan
+import pymc.logprob.switch
 import pymc.logprob.tensor
 import pymc.logprob.transforms
 
 
 __all__ = (
-    "logp",
-    "logcdf",
     "icdf",
+    "logccdf",
+    "logcdf",
+    "logp",
 )

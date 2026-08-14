@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -14,11 +14,7 @@
 
 # Contains code from AePPL, Copyright (c) 2021-2022, Aesara Developers.
 
-# coding: utf-8
-"""
-A collection of common probability distributions for stochastic
-nodes in PyMC.
-"""
+"""A collection of common probability distributions for stochastic nodes in PyMC."""
 
 import warnings
 
@@ -30,7 +26,8 @@ from pytensor.graph.basic import Apply, Variable
 from pytensor.graph.op import Op
 from pytensor.raise_op import Assert
 from pytensor.tensor import gamma as gammafn
-from pytensor.tensor import gammaln
+from pytensor.tensor import gammaln, get_underlying_scalar_constant_value
+from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.extra_ops import broadcast_shape
 from pytensor.tensor.math import betaincinv, gammaincinv, tanh
 from pytensor.tensor.random.basic import (
@@ -39,7 +36,6 @@ from pytensor.tensor.random.basic import (
     cauchy,
     exponential,
     gumbel,
-    halfcauchy,
     halfnormal,
     invgamma,
     laplace,
@@ -54,10 +50,11 @@ from pytensor.tensor.random.basic import (
 )
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.utils import normalize_size_param
-from pytensor.tensor.variable import TensorConstant
+from pytensor.tensor.variable import TensorConstant, TensorVariable
 
+from pymc.distributions.custom import CustomDist
 from pymc.logprob.abstract import _logprob_helper
-from pymc.logprob.basic import icdf
+from pymc.logprob.basic import TensorLike, icdf
 from pymc.pytensorf import normalize_rng_param
 
 try:
@@ -74,8 +71,7 @@ except ImportError:  # pragma: no cover
         raise RuntimeError("polyagamma package is not installed!")
 
 
-from scipy import stats
-from scipy.interpolate import InterpolatedUnivariateSpline
+from pytensor.utils import lazy_scipy_module
 
 from pymc.distributions import transforms
 from pymc.distributions.dist_math import (
@@ -95,63 +91,66 @@ from pymc.distributions.dist_math import (
 from pymc.distributions.distribution import DIST_PARAMETER_TYPES, Continuous, SymbolicRandomVariable
 from pymc.distributions.shape_utils import implicit_size_from_params, rv_size_is_none
 from pymc.distributions.transforms import _default_transform
-from pymc.math import invlogit, logdiffexp, logit
+from pymc.math import invlogit, logdiffexp
+
+stats = lazy_scipy_module("stats")
+interpolate = lazy_scipy_module("interpolate")
 
 __all__ = [
-    "Uniform",
-    "Flat",
-    "HalfFlat",
-    "Normal",
-    "TruncatedNormal",
+    "AsymmetricLaplace",
     "Beta",
-    "Kumaraswamy",
-    "Exponential",
-    "Laplace",
-    "StudentT",
     "Cauchy",
-    "HalfCauchy",
-    "Gamma",
-    "Weibull",
-    "HalfStudentT",
-    "LogNormal",
     "ChiSquared",
-    "HalfNormal",
-    "Wald",
-    "Pareto",
-    "InverseGamma",
     "ExGaussian",
-    "VonMises",
-    "SkewNormal",
-    "Triangular",
+    "Exponential",
+    "Flat",
+    "Gamma",
     "Gumbel",
+    "HalfCauchy",
+    "HalfFlat",
+    "HalfNormal",
+    "HalfStudentT",
+    "Interpolated",
+    "InverseGamma",
+    "Kumaraswamy",
+    "Laplace",
+    "LogNormal",
     "Logistic",
     "LogitNormal",
-    "Interpolated",
-    "Rice",
     "Moyal",
-    "AsymmetricLaplace",
+    "Normal",
+    "Pareto",
     "PolyaGamma",
+    "Rice",
+    "SkewNormal",
     "SkewStudentT",
+    "StudentT",
+    "Triangular",
+    "TruncatedNormal",
+    "Uniform",
+    "VonMises",
+    "Wald",
+    "Weibull",
 ]
 
 
 class PositiveContinuous(Continuous):
-    """Base class for positive continuous distributions"""
+    """Base class for positive continuous distributions."""
 
 
 class UnitContinuous(Continuous):
-    """Base class for continuous distributions on [0,1]"""
+    """Base class for continuous distributions on [0,1]."""
 
 
 class CircularContinuous(Continuous):
-    """Base class for circular continuous distributions"""
+    """Base class for circular continuous distributions."""
 
 
 class BoundedContinuous(Continuous):
-    """Base class for bounded continuous distributions"""
+    """Base class for bounded continuous distributions."""
 
     # Indices of the arguments that define the lower and upper bounds of the distribution
-    bound_args_indices: list[int] | None = None
+    bound_args_indices: tuple[int | None, int | None] | None = None
 
 
 @_default_transform.register(PositiveContinuous)
@@ -182,37 +181,34 @@ def bounded_cont_transform(op, rv, bound_args_indices=None):
             upper = args[bound_args_indices[1]]
 
         if lower is not None:
-            if isinstance(lower, TensorConstant) and np.all(lower.value == -np.inf):
-                lower = None
-            else:
-                lower = pt.as_tensor_variable(lower)
+            lower = pt.as_tensor_variable(lower)
+            try:
+                if get_underlying_scalar_constant_value(lower) == -np.inf:
+                    lower = None
+            except NotScalarConstantError:
+                pass
 
         if upper is not None:
-            if isinstance(upper, TensorConstant) and np.all(upper.value == np.inf):
-                upper = None
-            else:
-                upper = pt.as_tensor_variable(upper)
+            upper = pt.as_tensor_variable(upper)
+            try:
+                if get_underlying_scalar_constant_value(upper) == np.inf:
+                    upper = None
+            except NotScalarConstantError:
+                pass
 
         return lower, upper
 
     return transforms.Interval(bounds_fn=transform_params)
 
 
-def assert_negative_support(var, label, distname, value=-1e-6):
-    warnings.warn(
-        "The assert_negative_support function will be deprecated in future versions!"
-        " See https://github.com/pymc-devs/pymc/issues/5162",
-        DeprecationWarning,
-    )
-    msg = f"The variable specified for {label} has negative support for {distname}, "
-    msg += "likely making it unsuitable for this parameter."
-    return Assert(msg)(var, pt.all(pt.ge(var, 0.0)))
-
-
-def get_tau_sigma(tau=None, sigma=None):
+def get_tau_sigma(
+    tau: TensorLike | None = None, sigma: TensorLike | None = None
+) -> tuple[TensorVariable, TensorVariable]:
     r"""
-    Find precision and standard deviation. The link between the two
-    parameterizations is given by the inverse relationship:
+    Find precision and standard deviation.
+
+    The link between the two parameterizations is given by the inverse
+    relationship:
 
     .. math::
         \tau = \frac{1}{\sigma^2}
@@ -236,13 +232,14 @@ def get_tau_sigma(tau=None, sigma=None):
         sigma = pt.as_tensor_variable(1.0)
         tau = pt.as_tensor_variable(1.0)
     elif tau is None:
+        assert sigma is not None  # Just for type checker
         sigma = pt.as_tensor_variable(sigma)
         # Keep tau negative, if sigma was negative, so that it will
         # fail when used
         tau = (sigma**-2.0) * pt.sign(sigma)
     else:
         tau = pt.as_tensor_variable(tau)
-        # Keep tau negative, if sigma was negative, so that it will
+        # Keep sigma negative, if tau was negative, so that it will
         # fail when used
         sigma = pt.abs(tau) ** -0.5 * pt.sign(tau)
 
@@ -251,7 +248,7 @@ def get_tau_sigma(tau=None, sigma=None):
 
 class Uniform(BoundedContinuous):
     r"""
-    Continuous uniform log-likelihood.
+    Continuous uniform distribution.
 
     The pdf of this distribution is
 
@@ -294,7 +291,7 @@ class Uniform(BoundedContinuous):
     """
 
     rv_op = uniform
-    bound_args_indices = (3, 4)  # Lower, Upper
+    bound_args_indices = (2, 3)  # Lower, Upper
 
     @classmethod
     def dist(cls, lower=0, upper=1, **kwargs):
@@ -352,8 +349,7 @@ def uniform_default_transform(op, rv):
 
 class FlatRV(RandomVariable):
     name = "flat"
-    ndim_supp = 0
-    ndims_params = []
+    signature = "->()"
     dtype = "floatX"
     _print_name = ("Flat", "\\operatorname{Flat}")
 
@@ -366,16 +362,9 @@ flat = FlatRV()
 
 
 class Flat(Continuous):
-    """
-    Uninformative log-likelihood that returns 0 regardless of
-    the passed value.
-    """
+    """Uninformative distribution that returns 0 regardless of the passed value."""
 
     rv_op = flat
-
-    def __new__(cls, *args, **kwargs):
-        kwargs.setdefault("initval", "support_point")
-        return super().__new__(cls, *args, **kwargs)
 
     @classmethod
     def dist(cls, **kwargs):
@@ -383,7 +372,7 @@ class Flat(Continuous):
         return res
 
     def support_point(rv, size):
-        return pt.zeros(size)
+        return pt.zeros(() if rv_size_is_none(size) else size)
 
     def logp(value):
         return pt.zeros_like(value)
@@ -396,8 +385,7 @@ class Flat(Continuous):
 
 class HalfFlatRV(RandomVariable):
     name = "half_flat"
-    ndim_supp = 0
-    ndims_params = []
+    signature = "->()"
     dtype = "floatX"
     _print_name = ("HalfFlat", "\\operatorname{HalfFlat}")
 
@@ -410,13 +398,34 @@ halfflat = HalfFlatRV()
 
 
 class HalfFlat(PositiveContinuous):
-    """Improper flat prior over the positive reals."""
+    r"""
+    Improper flat prior over the positive reals.
+
+    This is an unnormalized distribution and should be used only as
+    a vague, uninformative prior. It is not a valid probability
+    distribution and cannot be used for posterior predictive sampling.
+
+    The pdf of this distribution is
+
+    .. math::
+
+       f(x) \propto \begin{cases} 1 & \text{if } x > 0 \\ 0 & \text{otherwise} \end{cases}
+
+    ========  ============================
+    Support   :math:`x \in [0, \infty)`
+    Mean      undefined
+    Variance  undefined
+    ========  ============================
+
+    Examples
+    --------
+    .. code-block:: python
+
+        with pm.Model():
+            x = pm.HalfFlat("x")
+    """
 
     rv_op = halfflat
-
-    def __new__(cls, *args, **kwargs):
-        kwargs.setdefault("initval", "support_point")
-        return super().__new__(cls, *args, **kwargs)
 
     @classmethod
     def dist(cls, **kwargs):
@@ -424,7 +433,7 @@ class HalfFlat(PositiveContinuous):
         return res
 
     def support_point(rv, size):
-        return pt.ones(size)
+        return pt.ones(() if rv_size_is_none(size) else size)
 
     def logp(value):
         return pt.switch(pt.lt(value, 0), -np.inf, pt.zeros_like(value))
@@ -435,7 +444,7 @@ class HalfFlat(PositiveContinuous):
 
 class Normal(Continuous):
     r"""
-    Univariate normal log-likelihood.
+    Univariate normal distribution.
 
     The pdf of this distribution is
 
@@ -493,10 +502,10 @@ class Normal(Continuous):
     .. code-block:: python
 
         with pm.Model():
-            x = pm.Normal('x', mu=0, sigma=10)
+            x = pm.Normal("x", mu=0, sigma=10)
 
         with pm.Model():
-            x = pm.Normal('x', mu=0, tau=1/23)
+            x = pm.Normal("x", mu=0, tau=1 / 23)
     """
 
     rv_op = normal
@@ -505,11 +514,7 @@ class Normal(Continuous):
     def dist(cls, mu=0, sigma=None, tau=None, **kwargs):
         tau, sigma = get_tau_sigma(tau=tau, sigma=sigma)
         sigma = pt.as_tensor_variable(sigma)
-
-        # tau = pt.as_tensor_variable(tau)
-        # mean = median = mode = mu = pt.as_tensor_variable(floatX(mu))
-        # variance = 1.0 / self.tau
-
+        mu = pt.as_tensor_variable(mu)
         return super().dist([mu, sigma], **kwargs)
 
     def support_point(rv, size, mu, sigma):
@@ -533,6 +538,13 @@ class Normal(Continuous):
             msg="sigma > 0",
         )
 
+    def logccdf(value, mu, sigma):
+        return check_parameters(
+            normal_lccdf(mu, sigma, value),
+            sigma > 0,
+            msg="sigma > 0",
+        )
+
     def icdf(value, mu, sigma):
         res = mu + sigma * -np.sqrt(2.0) * pt.erfcinv(2 * value)
         res = check_icdf_value(res, value)
@@ -545,8 +557,7 @@ class Normal(Continuous):
 
 class TruncatedNormalRV(RandomVariable):
     name = "truncated_normal"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0, 0]
+    signature = "(),(),(),()->()"
     dtype = "floatX"
     _print_name = ("TruncatedNormal", "\\operatorname{TruncatedNormal}")
 
@@ -575,9 +586,16 @@ class TruncatedNormalRV(RandomVariable):
 truncated_normal = TruncatedNormalRV()
 
 
+def _truncation_is_bounded(lower, upper):
+    """Whether each truncation bound is finite, when this can be known statically."""
+    is_lower_bounded = not (isinstance(lower, TensorConstant) and np.all(np.isneginf(lower.value)))
+    is_upper_bounded = not (isinstance(upper, TensorConstant) and np.all(np.isinf(upper.value)))
+    return is_lower_bounded, is_upper_bounded
+
+
 class TruncatedNormal(BoundedContinuous):
     r"""
-    Univariate truncated normal log-likelihood.
+    Univariate truncated normal distribution.
 
     The pdf of this distribution is
 
@@ -642,18 +660,18 @@ class TruncatedNormal(BoundedContinuous):
     .. code-block:: python
 
         with pm.Model():
-            x = pm.TruncatedNormal('x', mu=0, sigma=10, lower=0)
+            x = pm.TruncatedNormal("x", mu=0, sigma=10, lower=0)
 
         with pm.Model():
-            x = pm.TruncatedNormal('x', mu=0, sigma=10, upper=1)
+            x = pm.TruncatedNormal("x", mu=0, sigma=10, upper=1)
 
         with pm.Model():
-            x = pm.TruncatedNormal('x', mu=0, sigma=10, lower=0, upper=1)
+            x = pm.TruncatedNormal("x", mu=0, sigma=10, lower=0, upper=1)
 
     """
 
     rv_op = truncated_normal
-    bound_args_indices = (5, 6)  # indexes for lower and upper args
+    bound_args_indices = (4, 5)  # indexes for lower and upper args
 
     @classmethod
     def dist(
@@ -700,17 +718,10 @@ class TruncatedNormal(BoundedContinuous):
         return support_point
 
     def logp(value, mu, sigma, lower, upper):
-        is_lower_bounded = not (
-            isinstance(lower, TensorConstant) and np.all(np.isneginf(lower.value))
-        )
-        is_upper_bounded = not (isinstance(upper, TensorConstant) and np.all(np.isinf(upper.value)))
+        is_lower_bounded, is_upper_bounded = _truncation_is_bounded(lower, upper)
 
         if is_lower_bounded and is_upper_bounded:
-            lcdf_a = normal_lcdf(mu, sigma, lower)
-            lcdf_b = normal_lcdf(mu, sigma, upper)
-            lsf_a = normal_lccdf(mu, sigma, lower)
-            lsf_b = normal_lccdf(mu, sigma, upper)
-            norm = pt.switch(lower > 0, logdiffexp(lsf_a, lsf_b), logdiffexp(lcdf_b, lcdf_a))
+            norm = log_diff_normal_cdf(mu, sigma, upper, lower)
         elif is_lower_bounded:
             norm = normal_lccdf(mu, sigma, lower)
         elif is_upper_bounded:
@@ -740,10 +751,7 @@ class TruncatedNormal(BoundedContinuous):
             mu, sigma, upper, lower
         )
 
-        is_lower_bounded = not (
-            isinstance(lower, TensorConstant) and np.all(np.isneginf(lower.value))
-        )
-        is_upper_bounded = not (isinstance(upper, TensorConstant) and np.all(np.isinf(upper.value)))
+        is_lower_bounded, is_upper_bounded = _truncation_is_bounded(lower, upper)
 
         if is_lower_bounded:
             logcdf = pt.switch(value < lower, -np.inf, logcdf)
@@ -760,6 +768,51 @@ class TruncatedNormal(BoundedContinuous):
 
         return logcdf
 
+    def icdf(value, mu, sigma, lower, upper):
+        is_lower_bounded, is_upper_bounded = _truncation_is_bounded(lower, upper)
+
+        if is_lower_bounded and is_upper_bounded:
+            log_norm = log_diff_normal_cdf(mu, sigma, upper, lower)
+        elif is_lower_bounded:
+            log_norm = normal_lccdf(mu, sigma, lower)
+        elif is_upper_bounded:
+            log_norm = normal_lcdf(mu, sigma, upper)
+        else:
+            log_norm = 0.0
+
+        # p = cdf(lower) + value * (cdf(upper) - cdf(lower)), computed in logspace
+        # for numerical stability, along with its complement 1 - p
+        log_p = pt.log(value) + log_norm
+        log_1mp = pt.log1p(-value) + log_norm
+        # Stable logaddexp(a, b). pt.logaddexp is not usable here: with constant
+        # bounds, exp(a) folds to zero before local_log_add_exp can stabilize it.
+        if is_lower_bounded:
+            lower_lcdf = normal_lcdf(mu, sigma, lower)
+            log_p = lower_lcdf + pt.softplus(log_p - lower_lcdf)
+        if is_upper_bounded:
+            upper_lccdf = normal_lccdf(mu, sigma, upper)
+            log_1mp = upper_lccdf + pt.softplus(log_1mp - upper_lccdf)
+
+        res = pt.switch(
+            log_p <= np.log(0.5),
+            mu + sigma * pt.ndtri_exp(log_p),
+            mu - sigma * pt.ndtri_exp(log_1mp),
+        )
+        res = check_icdf_value(res, value)
+
+        if is_lower_bounded and is_upper_bounded:
+            res = check_icdf_parameters(
+                res,
+                pt.le(lower, upper),
+                msg="lower_bound <= upper_bound",
+            )
+
+        return check_icdf_parameters(
+            res,
+            sigma > 0,
+            msg="sigma > 0",
+        )
+
 
 @_default_transform.register(TruncatedNormal)
 def truncated_normal_default_transform(op, rv):
@@ -768,7 +821,7 @@ def truncated_normal_default_transform(op, rv):
 
 class HalfNormal(PositiveContinuous):
     r"""
-    Half-normal log-likelihood.
+    Half-normal distribution.
 
     The pdf of this distribution is
 
@@ -827,10 +880,10 @@ class HalfNormal(PositiveContinuous):
     .. code-block:: python
 
         with pm.Model():
-            x = pm.HalfNormal('x', sigma=10)
+            x = pm.HalfNormal("x", sigma=10)
 
         with pm.Model():
-            x = pm.HalfNormal('x', tau=1/15)
+            x = pm.HalfNormal("x", tau=1 / 15)
     """
 
     rv_op = halfnormal
@@ -884,8 +937,7 @@ class HalfNormal(PositiveContinuous):
 
 class WaldRV(RandomVariable):
     name = "wald"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "floatX"
     _print_name = ("Wald", "\\operatorname{Wald}")
 
@@ -899,7 +951,7 @@ wald = WaldRV()
 
 class Wald(PositiveContinuous):
     r"""
-    Wald log-likelihood.
+    Wald distribution.
 
     The pdf of this distribution is
 
@@ -1016,8 +1068,7 @@ class Wald(PositiveContinuous):
                     return mu, lam, lam / mu
 
         raise ValueError(
-            "Wald distribution must specify either mu only, "
-            "mu and lam, mu and phi, or lam and phi."
+            "Wald distribution must specify either mu only, mu and lam, mu and phi, or lam and phi."
         )
 
     def logp(value, mu, lam, alpha):
@@ -1079,7 +1130,7 @@ beta = BetaClippedRV()
 
 class Beta(UnitContinuous):
     r"""
-    Beta log-likelihood.
+    Beta distribution.
 
     The pdf of this distribution is
 
@@ -1129,8 +1180,8 @@ class Beta(UnitContinuous):
 
        \text{where } \kappa = \frac{\mu(1-\mu)}{\sigma^2} - 1
 
-       \alpha = \mu * \nu
-       \beta = (1 - \mu) * \nu
+       \alpha &= \mu * \nu \\
+       \beta &= (1 - \mu) * \nu
 
     Parameters
     ----------
@@ -1241,7 +1292,7 @@ class Beta(UnitContinuous):
 
 class KumaraswamyRV(SymbolicRandomVariable):
     name = "kumaraswamy"
-    signature = "[rng],[size],(),()->[rng],()"
+    extended_signature = "[rng],[size],(),()->[rng],()"
     _print_name = ("Kumaraswamy", "\\operatorname{Kumaraswamy}")
 
     @classmethod
@@ -1254,7 +1305,7 @@ class KumaraswamyRV(SymbolicRandomVariable):
         if rv_size_is_none(size):
             size = implicit_size_from_params(a, b, ndims_params=cls.ndims_params)
 
-        next_rng, u = uniform(size=size, rng=rng).owner.outputs
+        next_rng, u = uniform(size=size, rng=rng, return_next_rng=True)
         draws = (1 - (1 - u) ** (1 / b)) ** (1 / a)
 
         return cls(
@@ -1265,7 +1316,7 @@ class KumaraswamyRV(SymbolicRandomVariable):
 
 class Kumaraswamy(UnitContinuous):
     r"""
-    Kumaraswamy log-likelihood.
+    Kumaraswamy distribution.
 
     The pdf of this distribution is
 
@@ -1352,10 +1403,20 @@ class Kumaraswamy(UnitContinuous):
             msg="a > 0, b > 0",
         )
 
+    def icdf(value, a, b):
+        res = pt.exp(pt.reciprocal(a) * pt.log1mexp(pt.reciprocal(b) * pt.log1p(-value)))
+        res = check_icdf_value(res, value)
+        return check_icdf_parameters(
+            res,
+            a > 0,
+            b > 0,
+            msg="a > 0, b > 0",
+        )
+
 
 class Exponential(PositiveContinuous):
     r"""
-    Exponential log-likelihood.
+    Exponential distribution.
 
     The pdf of this distribution is
 
@@ -1397,13 +1458,12 @@ class Exponential(PositiveContinuous):
     rv_op = exponential
 
     @classmethod
-    def dist(cls, lam=None, scale=None, *args, **kwargs):
-        if lam is not None and scale is not None:
+    def dist(cls, lam=None, *, scale=None, **kwargs):
+        if lam is None and scale is None:
+            scale = 1.0
+        elif lam is not None and scale is not None:
             raise ValueError("Incompatible parametrization. Can't specify both lam and scale.")
-        elif lam is None and scale is None:
-            raise ValueError("Incompatible parametrization. Must specify either lam or scale.")
-
-        if scale is None:
+        elif lam is not None:
             scale = pt.reciprocal(lam)
 
         scale = pt.as_tensor_variable(scale)
@@ -1450,7 +1510,7 @@ class Exponential(PositiveContinuous):
 
 class Laplace(Continuous):
     r"""
-    Laplace log-likelihood.
+    Laplace distribution.
 
     The pdf of this distribution is
 
@@ -1544,7 +1604,7 @@ class Laplace(Continuous):
 
 class AsymmetricLaplaceRV(SymbolicRandomVariable):
     name = "asymmetriclaplace"
-    signature = "[rng],[size],(),(),()->[rng],()"
+    extended_signature = "[rng],[size],(),(),()->[rng],()"
     _print_name = ("AsymmetricLaplace", "\\operatorname{AsymmetricLaplace}")
 
     @classmethod
@@ -1558,7 +1618,7 @@ class AsymmetricLaplaceRV(SymbolicRandomVariable):
         if rv_size_is_none(size):
             size = implicit_size_from_params(b, kappa, mu, ndims_params=cls.ndims_params)
 
-        next_rng, u = uniform(size=size, rng=rng).owner.outputs
+        next_rng, u = uniform(size=size, rng=rng, return_next_rng=True)
         switch = kappa**2 / (1 + kappa**2)
         non_positive_x = mu + kappa * pt.log(u * (1 / switch)) / b
         positive_x = mu - pt.log((1 - u) * (1 + kappa**2)) / (kappa * b)
@@ -1572,7 +1632,7 @@ class AsymmetricLaplaceRV(SymbolicRandomVariable):
 
 class AsymmetricLaplace(Continuous):
     r"""
-    Asymmetric-Laplace log-likelihood.
+    Asymmetric-Laplace distribution.
 
     The pdf of this distribution is
 
@@ -1628,8 +1688,7 @@ class AsymmetricLaplace(Continuous):
     def get_kappa(cls, kappa=None, q=None):
         if kappa is not None and q is not None:
             raise ValueError(
-                "Incompatible parameterization. Either use "
-                "kappa or q to specify the distribution."
+                "Incompatible parameterization. Either use kappa or q to specify the distribution."
             )
         elif q is not None:
             if isinstance(q, Variable):
@@ -1649,8 +1708,8 @@ class AsymmetricLaplace(Continuous):
 
     def logp(value, b, kappa, mu):
         value = value - mu
-        res = pt.log(b / (kappa + (kappa**-1))) + (
-            -value * b * pt.sgn(value) * (kappa ** pt.sgn(value))
+        res = pt.log(b / (kappa + pt.reciprocal(kappa))) + (
+            -value * b * pt.sign(value) * (kappa ** pt.sign(value))
         )
 
         return check_parameters(
@@ -1663,7 +1722,7 @@ class AsymmetricLaplace(Continuous):
 
 class LogNormal(PositiveContinuous):
     r"""
-    Log-normal log-likelihood.
+    Log-normal distribution.
 
     Distribution of any random variable whose logarithm is normally
     distributed. A variable might be modeled as log-normal if it can
@@ -1722,10 +1781,10 @@ class LogNormal(PositiveContinuous):
 
         # Example to show that we pass in only ``sigma`` or ``tau`` but not both.
         with pm.Model():
-            x = pm.LogNormal('x', mu=2, sigma=30)
+            x = pm.LogNormal("x", mu=2, sigma=30)
 
         with pm.Model():
-            x = pm.LogNormal('x', mu=2, tau=1/100)
+            x = pm.LogNormal("x", mu=2, tau=1 / 100)
     """
 
     rv_op = lognormal
@@ -1772,6 +1831,19 @@ class LogNormal(PositiveContinuous):
             msg="sigma > 0",
         )
 
+    def logccdf(value, mu, sigma):
+        res = pt.switch(
+            pt.le(value, 0),
+            0.0,
+            normal_lccdf(mu, sigma, pt.log(value)),
+        )
+
+        return check_parameters(
+            res,
+            sigma > 0,
+            msg="sigma > 0",
+        )
+
     def icdf(value, mu, sigma):
         res = pt.exp(icdf(Normal.dist(mu, sigma), value))
         return res
@@ -1782,7 +1854,7 @@ Lognormal = LogNormal
 
 class StudentT(Continuous):
     r"""
-    Student's T log-likelihood.
+    Student's T distribution.
 
     Describes a normal variable whose precision is gamma distributed.
     If only nu parameter is passed, this specifies a standard (central)
@@ -1839,10 +1911,10 @@ class StudentT(Continuous):
     .. code-block:: python
 
         with pm.Model():
-            x = pm.StudentT('x', nu=15, mu=0, sigma=10)
+            x = pm.StudentT("x", nu=15, mu=0, sigma=10)
 
         with pm.Model():
-            x = pm.StudentT('x', nu=15, mu=0, lam=1/23)
+            x = pm.StudentT("x", nu=15, mu=0, lam=1 / 23)
     """
 
     rv_op = t
@@ -1912,8 +1984,7 @@ class StudentT(Continuous):
 
 class SkewStudentTRV(RandomVariable):
     name = "skewstudentt"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0, 0]
+    signature = "(),(),(),()->()"
     dtype = "floatX"
     _print_name = ("SkewStudentT", "\\operatorname{SkewStudentT}")
 
@@ -1929,7 +2000,7 @@ skewstudentt = SkewStudentTRV()
 
 class SkewStudentT(Continuous):
     r"""
-    Skewed Student's T distribution log-likelihood.
+    Skewed Student's T distribution distribution.
 
     This follows Jones and Faddy (2003)
 
@@ -2044,7 +2115,7 @@ class SkewStudentT(Continuous):
 
 class Pareto(BoundedContinuous):
     r"""
-    Pareto log-likelihood.
+    Pareto distribution.
 
     Often used to characterize wealth distribution, or other examples of the
     80/20 rule.
@@ -2090,7 +2161,7 @@ class Pareto(BoundedContinuous):
     """
 
     rv_op = pareto
-    bound_args_indices = (4, None)  # lower-bounded by `m`
+    bound_args_indices = (3, None)  # lower-bounded by `m`
 
     @classmethod
     def dist(cls, alpha, m, **kwargs):
@@ -2153,7 +2224,7 @@ def pareto_default_transform(op, rv):
 
 class Cauchy(Continuous):
     r"""
-    Cauchy log-likelihood.
+    Cauchy distribution.
 
     Also known as the Lorentz or the Breit-Wigner distribution.
 
@@ -2239,9 +2310,26 @@ class Cauchy(Continuous):
         )
 
 
+class HalfCauchyRV(SymbolicRandomVariable):
+    name = "halfcauchy"
+    extended_signature = "[rng],[size],()->[rng],()"
+    _print_name = ("HalfCauchy", "\\operatorname{HalfCauchy}")
+
+    @classmethod
+    def rv_op(cls, beta, *, size=None, rng=None):
+        bt = pt.as_tensor(beta)
+        rng = normalize_rng_param(rng)
+        size = normalize_size_param(size)
+
+        next_rng, cauchy_draws = cauchy(loc=0, scale=beta, size=size, rng=rng, return_next_rng=True)
+        draws = pt.abs(cauchy_draws)
+
+        return cls(inputs=[rng, size, beta], outputs=[next_rng, draws])(rng, size, beta)
+
+
 class HalfCauchy(PositiveContinuous):
     r"""
-    Half-Cauchy log-likelihood.
+    Half-Cauchy distribution.
 
     The pdf of this distribution is
 
@@ -2279,32 +2367,33 @@ class HalfCauchy(PositiveContinuous):
         Scale parameter (beta > 0).
     """
 
-    rv_op = halfcauchy
+    rv_op = HalfCauchyRV.rv_op
+    rv_type = HalfCauchyRV
 
     @classmethod
     def dist(cls, beta, *args, **kwargs):
         beta = pt.as_tensor_variable(beta)
-        return super().dist([0.0, beta], **kwargs)
+        return super().dist([beta], **kwargs)
 
-    def support_point(rv, size, loc, beta):
+    def support_point(rv, size, beta):
         if not rv_size_is_none(size):
             beta = pt.full(size, beta)
         return beta
 
-    def logp(value, loc, beta):
-        res = pt.log(2) + _logprob_helper(Cauchy.dist(loc, beta), value)
-        res = pt.switch(pt.ge(value, loc), res, -np.inf)
+    def logp(value, beta):
+        res = pt.log(2) + _logprob_helper(Cauchy.dist(alpha=0, beta=beta), value)
+        res = pt.switch(value >= 0, res, -np.inf)
         return check_parameters(
             res,
             beta > 0,
             msg="beta > 0",
         )
 
-    def logcdf(value, loc, beta):
+    def logcdf(value, beta):
         res = pt.switch(
-            pt.lt(value, loc),
+            value < 0,
             -np.inf,
-            pt.log(2 * pt.arctan((value - loc) / beta) / np.pi),
+            pt.log(2 * pt.arctan(value / beta) / np.pi),
         )
 
         return check_parameters(
@@ -2313,8 +2402,8 @@ class HalfCauchy(PositiveContinuous):
             msg="beta > 0",
         )
 
-    def icdf(value, loc, beta):
-        res = loc + beta * pt.tan(np.pi * (value) / 2.0)
+    def icdf(value, beta):
+        res = beta * pt.tan(np.pi * (value) / 2.0)
         res = check_icdf_value(res, value)
         return check_icdf_parameters(
             res,
@@ -2325,7 +2414,7 @@ class HalfCauchy(PositiveContinuous):
 
 class Gamma(PositiveContinuous):
     r"""
-    Gamma log-likelihood.
+    Gamma distribution.
 
     Represents the sum of alpha exponentially distributed random variables,
     each of which has rate beta.
@@ -2336,6 +2425,8 @@ class Gamma(PositiveContinuous):
 
        f(x \mid \alpha, \beta) =
            \frac{\beta^{\alpha}x^{\alpha-1}e^{-\beta x}}{\Gamma(\alpha)}
+
+    Here, the gamma distribution is parameterized by shape (alpha) and rate (beta).
 
     .. plot::
         :context: close-figs
@@ -2400,11 +2491,8 @@ class Gamma(PositiveContinuous):
         if (alpha is not None) and (beta is not None):
             pass
         elif (mu is not None) and (sigma is not None):
-            if isinstance(sigma, Variable):
-                sigma = check_parameters(sigma, sigma > 0, msg="sigma > 0")
-            else:
-                assert np.all(np.asarray(sigma) > 0)
-            alpha = mu**2 / sigma**2
+            # Use sign of sigma to not let negative sigma fly by
+            alpha = (mu**2 / sigma**2) * pt.sign(sigma)
             beta = mu / sigma**2
         else:
             raise ValueError(
@@ -2454,7 +2542,7 @@ class Gamma(PositiveContinuous):
 
 class InverseGamma(PositiveContinuous):
     r"""
-    Inverse gamma log-likelihood, the reciprocal of the gamma distribution.
+    Inverse gamma distribution, the reciprocal of the gamma distribution.
 
     The pdf of this distribution is
 
@@ -2526,13 +2614,10 @@ class InverseGamma(PositiveContinuous):
             if beta is not None:
                 pass
             else:
-                beta = 1
+                beta = 1.0
         elif (mu is not None) and (sigma is not None):
-            if isinstance(sigma, Variable):
-                sigma = check_parameters(sigma, sigma > 0, msg="sigma > 0")
-            else:
-                assert np.all(np.asarray(sigma) > 0)
-            alpha = (2 * sigma**2 + mu**2) / sigma**2
+            # Use sign of sigma to not let negative sigma fly by
+            alpha = ((2 * sigma**2 + mu**2) / sigma**2) * pt.sign(sigma)
             beta = mu * (mu**2 + sigma**2) / sigma**2
         else:
             raise ValueError(
@@ -2567,10 +2652,13 @@ class InverseGamma(PositiveContinuous):
             msg="alpha > 0, beta > 0",
         )
 
+    def icdf(value, alpha, beta):
+        return icdf(1 / Gamma.dist(alpha, beta), value)
+
 
 class ChiSquared:
     r"""
-    :math:`\chi^2` log-likelihood.
+    :math:`\chi^2` distribution.
 
     This is the distribution from the sum of the squares of :math:`\nu` independent standard normal random variables or a special
     case of the gamma distribution with :math:`\alpha = \nu/2` and :math:`\beta = 1/2`.
@@ -2611,6 +2699,11 @@ class ChiSquared:
     ----------
     nu : tensor_like of float
         Degrees of freedom (nu > 0).
+
+    Notes
+    -----
+    This is implemented as a special case of the Gamma distribution.
+    :math:`\chi^2(\nu) = \text{Gamma}(\alpha=\nu/2, \beta=1/2)`
     """
 
     def __new__(cls, name, nu, **kwargs):
@@ -2621,29 +2714,32 @@ class ChiSquared:
         return Gamma.dist(alpha=nu / 2, beta=1 / 2, **kwargs)
 
 
-class WeibullBetaRV(RandomVariable):
+class WeibullBetaRV(SymbolicRandomVariable):
     name = "weibull"
-    ndim_supp = 0
-    ndims_params = [0, 0]
-    dtype = "floatX"
+    extended_signature = "[rng],[size],(),()->[rng],()"
     _print_name = ("Weibull", "\\operatorname{Weibull}")
 
-    def __call__(self, alpha, beta, size=None, **kwargs):
-        return super().__call__(alpha, beta, size=size, **kwargs)
-
     @classmethod
-    def rng_fn(cls, rng, alpha, beta, size) -> np.ndarray:
-        if size is None:
-            size = np.broadcast_shapes(alpha.shape, beta.shape)
-        return np.asarray(beta * rng.weibull(alpha, size=size))
+    def rv_op(cls, alpha, beta, *, rng=None, size=None):
+        alpha = pt.as_tensor(alpha)
+        beta = pt.as_tensor(beta)
+        rng = normalize_rng_param(rng)
+        size = normalize_size_param(size)
 
+        if rv_size_is_none(size):
+            size = implicit_size_from_params(alpha, beta, ndims_params=cls.ndims_params)
 
-weibull_beta = WeibullBetaRV()
+        next_rng, raw_weibull = pt.random.weibull(alpha, size=size, rng=rng, return_next_rng=True)
+        draws = beta * raw_weibull
+        return cls(
+            inputs=[rng, size, alpha, beta],
+            outputs=[next_rng, draws],
+        )(rng, size, alpha, beta)
 
 
 class Weibull(PositiveContinuous):
     r"""
-    Weibull log-likelihood.
+    Weibull distribution.
 
     The pdf of this distribution is
 
@@ -2687,7 +2783,8 @@ class Weibull(PositiveContinuous):
         Scale parameter (beta > 0).
     """
 
-    rv_op = weibull_beta
+    rv_type = WeibullBetaRV
+    rv_op = WeibullBetaRV.rv_op
 
     @classmethod
     def dist(cls, alpha, beta, *args, **kwargs):
@@ -2746,17 +2843,17 @@ class Weibull(PositiveContinuous):
 
 class HalfStudentTRV(SymbolicRandomVariable):
     name = "halfstudentt"
-    signature = "[rng],[size],(),()->[rng],()"
+    extended_signature = "[rng],[size],(),()->[rng],()"
     _print_name = ("HalfStudentT", "\\operatorname{HalfStudentT}")
 
     @classmethod
-    def rv_op(cls, nu, sigma, *, size=None, rng=None) -> np.ndarray:
+    def rv_op(cls, nu, sigma, *, size=None, rng=None):
         nu = pt.as_tensor(nu)
         sigma = pt.as_tensor(sigma)
         rng = normalize_rng_param(rng)
         size = normalize_size_param(size)
 
-        next_rng, t_draws = t(df=nu, scale=sigma, size=size, rng=rng).owner.outputs
+        next_rng, t_draws = t(df=nu, scale=sigma, size=size, rng=rng, return_next_rng=True)
         draws = pt.abs(t_draws)
 
         return cls(inputs=[rng, size, nu, sigma], outputs=[next_rng, draws])(rng, size, nu, sigma)
@@ -2764,7 +2861,7 @@ class HalfStudentTRV(SymbolicRandomVariable):
 
 class HalfStudentT(PositiveContinuous):
     r"""
-    Half Student's T log-likelihood.
+    Half Student's T distribution.
 
     The pdf of this distribution is
 
@@ -2815,10 +2912,10 @@ class HalfStudentT(PositiveContinuous):
 
         # Only pass in one of lam or sigma, but not both.
         with pm.Model():
-            x = pm.HalfStudentT('x', sigma=10, nu=10)
+            x = pm.HalfStudentT("x", sigma=10, nu=10)
 
         with pm.Model():
-            x = pm.HalfStudentT('x', lam=4, nu=10)
+            x = pm.HalfStudentT("x", lam=4, nu=10)
     """
 
     rv_type = HalfStudentTRV
@@ -2857,10 +2954,17 @@ class HalfStudentT(PositiveContinuous):
             msg="sigma > 0, nu > 0",
         )
 
+    def icdf(value, nu, sigma):
+        # Map half-t quantiles to full StudentT quantiles:
+        # F_half^{-1}(u) = F_t^{-1}((u + 1)/2; nu, mu=0, sigma)
+        res = icdf(StudentT.dist(nu, sigma=sigma), (value + 1.0) / 2.0)
+        res = check_icdf_value(res, value)
+        return res
+
 
 class ExGaussianRV(SymbolicRandomVariable):
     name = "exgaussian"
-    signature = "[rng],[size],(),(),()->[rng],()"
+    extended_signature = "[rng],[size],(),(),()->[rng],()"
     _print_name = ("ExGaussian", "\\operatorname{ExGaussian}")
 
     @classmethod
@@ -2874,8 +2978,12 @@ class ExGaussianRV(SymbolicRandomVariable):
         if rv_size_is_none(size):
             size = implicit_size_from_params(mu, sigma, nu, ndims_params=cls.ndims_params)
 
-        next_rng, normal_draws = normal(loc=mu, scale=sigma, size=size, rng=rng).owner.outputs
-        final_rng, exponential_draws = exponential(scale=nu, size=size, rng=next_rng).owner.outputs
+        next_rng, normal_draws = normal(
+            loc=mu, scale=sigma, size=size, rng=rng, return_next_rng=True
+        )
+        final_rng, exponential_draws = exponential(
+            scale=nu, size=size, rng=next_rng, return_next_rng=True
+        )
         draws = normal_draws + exponential_draws
 
         return cls(inputs=[rng, size, mu, sigma, nu], outputs=[final_rng, draws])(
@@ -2885,7 +2993,7 @@ class ExGaussianRV(SymbolicRandomVariable):
 
 class ExGaussian(Continuous):
     r"""
-    Exponentially modified Gaussian log-likelihood.
+    Exponentially modified Gaussian distribution.
 
     Results from the convolution of a normal distribution with an exponential
     distribution.
@@ -2954,8 +3062,8 @@ class ExGaussian(Continuous):
     rv_op = ExGaussianRV.rv_op
 
     @classmethod
-    def dist(cls, mu=0.0, sigma=None, nu=None, *args, **kwargs):
-        return super().dist([mu, sigma, nu], *args, **kwargs)
+    def dist(cls, mu=0.0, sigma=1.0, *, nu, **kwargs):
+        return super().dist([mu, sigma, nu], **kwargs)
 
     def support_point(rv, size, mu, sigma, nu):
         mu, nu, _ = pt.broadcast_arrays(mu, nu, sigma)
@@ -3008,7 +3116,7 @@ class ExGaussian(Continuous):
 
 class VonMises(CircularContinuous):
     r"""
-    Univariate VonMises log-likelihood.
+    Univariate VonMises distribution.
 
     The pdf of this distribution is
 
@@ -3078,8 +3186,7 @@ class VonMises(CircularContinuous):
 
 class SkewNormalRV(RandomVariable):
     name = "skewnormal"
-    ndim_supp = 0
-    ndims_params = [0, 0, 0]
+    signature = "(),(),()->()"
     dtype = "floatX"
     _print_name = ("SkewNormal", "\\operatorname{SkewNormal}")
 
@@ -3095,7 +3202,7 @@ skewnormal = SkewNormalRV()
 
 class SkewNormal(Continuous):
     r"""
-    Univariate skew-normal log-likelihood.
+    Univariate skew-normal distribution.
 
     The pdf of this distribution is
 
@@ -3190,7 +3297,7 @@ class SkewNormal(Continuous):
 
 class Triangular(BoundedContinuous):
     r"""
-    Continuous Triangular log-likelihood.
+    Continuous Triangular distribution.
 
     The pdf of this distribution is
 
@@ -3245,7 +3352,7 @@ class Triangular(BoundedContinuous):
     """
 
     rv_op = triangular
-    bound_args_indices = (3, 5)  # lower, upper
+    bound_args_indices = (2, 4)  # lower, upper
 
     @classmethod
     def dist(cls, lower=0, upper=1, c=0.5, *args, **kwargs):
@@ -3319,7 +3426,7 @@ def triangular_default_transform(op, rv):
 
 class Gumbel(Continuous):
     r"""
-    Univariate right-skewed Gumbel log-likelihood.
+    Univariate right-skewed Gumbel distribution.
 
     This distribution is typically used for modeling maximum (or extreme) values.
     Those looking to find the extreme minimum provided by the left-skewed Gumbel should
@@ -3416,8 +3523,7 @@ class Gumbel(Continuous):
 
 class RiceRV(RandomVariable):
     name = "rice"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Rice", "\\operatorname{Rice}")
 
@@ -3510,7 +3616,7 @@ class Rice(PositiveContinuous):
         elif nu is not None and b is None:
             b = nu / sigma
             return nu, b, sigma
-        raise ValueError("Rice distribution must specify either nu" " or b.")
+        raise ValueError("Rice distribution must specify either nu or b.")
 
     def support_point(rv, size, nu, sigma):
         nu_sigma_ratio = -(nu**2) / (2 * sigma**2)
@@ -3547,7 +3653,7 @@ class Rice(PositiveContinuous):
 
 class Logistic(Continuous):
     r"""
-    Logistic log-likelihood.
+    Logistic distribution.
 
     The pdf of this distribution is
 
@@ -3632,30 +3738,9 @@ class Logistic(Continuous):
         )
 
 
-class LogitNormalRV(SymbolicRandomVariable):
-    name = "logit_normal"
-    signature = "[rng],[size],(),()->[rng],()"
-    _print_name = ("logitNormal", "\\operatorname{logitNormal}")
-
-    @classmethod
-    def rv_op(cls, mu, sigma, *, size=None, rng=None):
-        mu = pt.as_tensor(mu)
-        sigma = pt.as_tensor(sigma)
-        rng = normalize_rng_param(rng)
-        size = normalize_size_param(size)
-
-        next_rng, normal_draws = normal(loc=mu, scale=sigma, size=size, rng=rng).owner.outputs
-        draws = pt.expit(normal_draws)
-
-        return cls(
-            inputs=[rng, size, mu, sigma],
-            outputs=[next_rng, draws],
-        )(rng, size, mu, sigma)
-
-
-class LogitNormal(UnitContinuous):
+class LogitNormal:
     r"""
-    Logit-Normal log-likelihood.
+    Logit-Normal distribution.
 
     The pdf of this distribution is
 
@@ -3701,41 +3786,39 @@ class LogitNormal(UnitContinuous):
         Defaults to 1.
     """
 
-    rv_type = LogitNormalRV
-    rv_op = LogitNormalRV.rv_op
+    @staticmethod
+    def logitnormal_dist(mu, sigma, size):
+        return invlogit(Normal.dist(mu=mu, sigma=sigma, size=size))
+
+    def __new__(cls, name, mu=0, sigma=None, tau=None, **kwargs):
+        _, sigma = get_tau_sigma(tau=tau, sigma=sigma)
+        return CustomDist(
+            name,
+            mu,
+            sigma,
+            dist=cls.logitnormal_dist,
+            class_name="LogitNormal",
+            **kwargs,
+        )
 
     @classmethod
     def dist(cls, mu=0, sigma=None, tau=None, **kwargs):
         _, sigma = get_tau_sigma(tau=tau, sigma=sigma)
-        return super().dist([mu, sigma], **kwargs)
-
-    def support_point(rv, size, mu, sigma):
-        median, _ = pt.broadcast_arrays(invlogit(mu), sigma)
-        if not rv_size_is_none(size):
-            median = pt.full(size, median)
-        return median
-
-    def logp(value, mu, sigma):
-        tau, _ = get_tau_sigma(sigma=sigma)
-
-        res = pt.switch(
-            pt.or_(pt.le(value, 0), pt.ge(value, 1)),
-            -np.inf,
-            (
-                -0.5 * tau * (logit(value) - mu) ** 2
-                + 0.5 * pt.log(tau / (2.0 * np.pi))
-                - pt.log(value * (1 - value))
-            ),
-        )
-
-        return check_parameters(
-            res,
-            tau > 0,
-            msg="tau > 0",
+        return CustomDist.dist(
+            mu, sigma, dist=cls.logitnormal_dist, class_name="LogitNormal", **kwargs
         )
 
 
 def _interpolated_argcdf(p, pdf, cdf, x):
+    if np.prod(cdf.shape[:-1]) != 1 or np.prod(pdf.shape[:-1]) != 1 or np.prod(x.shape[:-1]) != 1:
+        raise NotImplementedError(
+            "Function not implemented for batched points. "
+            "Open an issue in https://github.com/pymc-devs/pymc if you need this functionality"
+        )
+    cdf = cdf.squeeze(tuple(range(cdf.ndim - 1)))
+    pdf = pdf.squeeze(tuple(range(pdf.ndim - 1)))
+    x = x.squeeze(tuple(range(x.ndim - 1)))
+
     index = np.searchsorted(cdf, p) - 1
     slope = (pdf[index + 1] - pdf[index]) / (x[index + 1] - x[index])
 
@@ -3757,8 +3840,7 @@ def _interpolated_argcdf(p, pdf, cdf, x):
 
 class InterpolatedRV(RandomVariable):
     name = "interpolated"
-    ndim_supp = 0
-    ndims_params = [1, 1, 1]
+    signature = "(x),(x),(x)->()"
     dtype = "floatX"
     _print_name = ("Interpolated", "\\operatorname{Interpolated}")
 
@@ -3773,8 +3855,7 @@ interpolated = InterpolatedRV()
 
 class Interpolated(BoundedContinuous):
     r"""
-    Univariate probability distribution defined as a linear interpolation
-    of probability density function evaluated on some lattice of points.
+    Univariate linear interpolation of pdf evaluated on some lattice of points.
 
     The lattice can be uneven, so the steps between different points can have
     different size and it is possible to vary the precision between regions
@@ -3827,7 +3908,7 @@ class Interpolated(BoundedContinuous):
 
     @classmethod
     def dist(cls, x_points, pdf_points, *args, **kwargs):
-        interp = InterpolatedUnivariateSpline(x_points, pdf_points, k=1, ext="zeros")
+        interp = interpolate.InterpolatedUnivariateSpline(x_points, pdf_points, k=1, ext="zeros")
 
         Z = interp.integral(x_points[0], x_points[-1])
         cdf_points = interp.antiderivative()(x_points) / Z
@@ -3844,11 +3925,11 @@ class Interpolated(BoundedContinuous):
         return super().dist([x_points, pdf_points, cdf_points], **kwargs)
 
     def support_point(rv, size, x_points, pdf_points, cdf_points):
-        """
-        Estimates the expectation integral using the trapezoid rule; cdf_points are not used.
-        """
+        """Estimates the expectation integral using the trapezoid rule; cdf_points are not used."""
         x_fx = pt.mul(x_points, pdf_points)  # x_i * f(x_i) for all xi's in x_points
-        support_point = pt.sum(pt.mul(pt.diff(x_points), x_fx[1:] + x_fx[:-1])) / 2
+        support_point = (
+            pt.sum(pt.mul(pt.diff(x_points, axis=-1), x_fx[..., 1:] + x_fx[..., :-1])) / 2
+        )
 
         if not rv_size_is_none(size):
             support_point = pt.full(size, support_point)
@@ -3857,9 +3938,16 @@ class Interpolated(BoundedContinuous):
 
     def logp(value, x_points, pdf_points, cdf_points):
         # x_points and pdf_points are expected to be non-symbolic arrays wrapped
-        # within a tensor.constant. We use the .data method to retrieve them
-        interp = InterpolatedUnivariateSpline(x_points.data, pdf_points.data, k=1, ext="zeros")
-        Z = interp.integral(x_points.data[0], x_points.data[-1])
+        # within a tensor.constant. We use the .data method to retrieve them.
+        # Squeeze to 1-D in case size broadcasting prepended length-1 batch dims;
+        # the spline is always defined over a single set of points, and scipy's
+        # integral bounds must be 0-dimensional.
+        x_points_data = np.squeeze(x_points.data)
+        pdf_points_data = np.squeeze(pdf_points.data)
+        interp = interpolate.InterpolatedUnivariateSpline(
+            x_points_data, pdf_points_data, k=1, ext="zeros"
+        )
+        Z = interp.integral(x_points_data[0], x_points_data[-1])
 
         # interp and Z are converted to symbolic variables here
         interp_op = SplineWrapper(interp)
@@ -3871,16 +3959,15 @@ class Interpolated(BoundedContinuous):
 @_default_transform.register(Interpolated)
 def interpolated_default_transform(op, rv):
     def transform_params(*params):
-        _, _, _, x_points, _, _ = params
-        return x_points[0], x_points[-1]
+        _, _, x_points, _, _ = params
+        return x_points[..., 0], x_points[..., -1]
 
     return transforms.Interval(bounds_fn=transform_params)
 
 
 class MoyalRV(RandomVariable):
     name = "moyal"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("Moyal", "\\operatorname{Moyal}")
 
@@ -3894,7 +3981,7 @@ moyal = MoyalRV()
 
 class Moyal(Continuous):
     r"""
-    Moyal log-likelihood.
+    Moyal distribution.
 
     The pdf of this distribution is
 
@@ -3989,8 +4076,7 @@ class PolyaGammaRV(RandomVariable):
     """Polya-Gamma random variable."""
 
     name = "polyagamma"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "floatX"
     _print_name = ("PG", "\\operatorname{PG}")
 
@@ -4000,18 +4086,11 @@ class PolyaGammaRV(RandomVariable):
     @classmethod
     def rng_fn(cls, rng, h, z, size=None) -> np.ndarray:
         """
-        Generate a random sample from the distribution with the given parameters
+        Generate a random sample from the distribution with the given parameters.
 
         Parameters
         ----------
-        rng : {None, int, array_like[ints], SeedSequence, BitGenerator, Generator}
-            A seed to initialize the random number generator. If None, then fresh,
-            unpredictable entropy will be pulled from the OS. If an ``int`` or
-            ``array_like[ints]`` is passed, then it will be passed to
-            `SeedSequence` to derive the initial `BitGenerator` state. One may also
-            pass in a `SeedSequence` instance.
-            Additionally, when passed a `BitGenerator`, it will be wrapped by
-            `Generator`. If passed a `Generator`, it will be returned unaltered.
+        rng : Generator
         h : scalar or sequence
             The shape parameter of the distribution.
         z : scalar or sequence
@@ -4024,10 +4103,11 @@ class PolyaGammaRV(RandomVariable):
             to the largest integer smaller than its value (e.g (2.1, 1) -> (2, 1)).
             This parameter only applies if `h` and `z` are scalars.
         """
-        # handle the kind of rng passed to the sampler
-        bg = rng._bit_generator if isinstance(rng, np.random.RandomState) else rng
+        # random_polyagamma needs explicit size to work correctly
+        if size is None:
+            size = np.broadcast_shapes(h.shape, z.shape)
         return np.asarray(
-            random_polyagamma(h, z, size=size, random_state=bg).astype(pytensor.config.floatX)
+            random_polyagamma(h, z, size=size, random_state=rng).astype(pytensor.config.floatX)
         )
 
 
@@ -4117,9 +4197,9 @@ class PolyaGamma(PositiveContinuous):
 
         rng = np.random.default_rng()
         with pm.Model():
-            x = pm.PolyaGamma('x', h=1, z=5.5)
+            x = pm.PolyaGamma("x", h=1, z=5.5)
         with pm.Model():
-            x = pm.PolyaGamma('x', h=25, z=-2.3, rng=rng, size=(100, 5))
+            x = pm.PolyaGamma("x", h=25, z=-2.3, rng=rng, size=(100, 5))
 
     References
     ----------

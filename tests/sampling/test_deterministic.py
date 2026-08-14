@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from numpy.testing import assert_allclose
+from xarray import DataTree
 
 from pymc.distributions import Normal
 from pymc.model.core import Deterministic, Model
@@ -25,7 +26,8 @@ from pymc.sampling.forward import sample_prior_predictive
 pytestmark = pytest.mark.filterwarnings("error")
 
 
-def test_compute_deterministics():
+@pytest.mark.parametrize("via", ["compile_kwargs", "backend"])
+def test_compute_deterministics(via):
     with Model(coords={"group": (0, 2, 4)}) as m:
         mu_raw = Normal("mu_raw", 0, 1, dims="group")
         mu = Deterministic("mu", mu_raw.cumsum(), dims="group")
@@ -34,7 +36,7 @@ def test_compute_deterministics():
         sigma = Deterministic("sigma", sigma_raw.exp())
 
     dataset = sample_prior_predictive(
-        samples=5, model=m, var_names=["mu_raw", "sigma_raw"], random_seed=22
+        draws=5, model=m, var_names=["mu_raw", "sigma_raw"], random_seed=22
     ).prior
 
     # Test default
@@ -47,14 +49,20 @@ def test_compute_deterministics():
     assert_allclose(all_dets["sigma"], np.exp(dataset["sigma_raw"]))
 
     # Test custom arguments
-    extended_with_mu = compute_deterministics(
-        dataset,
-        var_names=["mu"],
-        merge_dataset=True,
-        model=m,
-        compile_kwargs={"mode": "FAST_COMPILE"},
-        progressbar=False,
+    mode_kwargs = (
+        {"compile_kwargs": {"mode": "FAST_COMPILE"}}
+        if via == "compile_kwargs"
+        else {"backend": "FAST_COMPILE"}
     )
+    with pytest.warns(FutureWarning, match="`merge_dataset` is deprecated"):
+        extended_with_mu = compute_deterministics(
+            dataset,
+            var_names=["mu"],
+            merge_dataset=True,
+            model=m,
+            progressbar=False,
+            **mode_kwargs,
+        )
     assert set(extended_with_mu.data_vars.variables) == {"mu_raw", "sigma_raw", "mu"}
     assert extended_with_mu["mu"].dims == ("chain", "draw", "group")
     assert_allclose(extended_with_mu["mu"], dataset["mu_raw"].cumsum("group"))
@@ -63,6 +71,68 @@ def test_compute_deterministics():
     assert set(only_sigma.data_vars.variables) == {"sigma"}
     assert only_sigma["sigma"].dims == ("chain", "draw")
     assert_allclose(only_sigma["sigma"], np.exp(dataset["sigma_raw"]))
+
+
+def test_compute_deterministics_extend_dataset():
+    with Model() as m:
+        mu_raw = Normal("mu_raw")
+        mu = Deterministic("mu", mu_raw.exp())
+
+    idata = sample_prior_predictive(draws=5, model=m, var_names=["mu_raw"], random_seed=22)
+
+    dataset = idata.prior.to_dataset()
+    extended = compute_deterministics(dataset, extend_dataset=True, model=m, progressbar=False)
+    assert extended is dataset
+    assert set(dataset.data_vars) == {"mu_raw", "mu"}
+    assert_allclose(dataset["mu"], np.exp(dataset["mu_raw"]))
+
+    # Extending an InferenceData mutates the selected group in place
+    extended = compute_deterministics(idata, extend_dataset=True, model=m, progressbar=False)
+    assert extended is idata
+    assert set(idata.prior.data_vars) == {"mu_raw", "mu"}
+    assert_allclose(idata.prior["mu"], np.exp(idata.prior["mu_raw"]))
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        compute_deterministics(
+            idata, merge_dataset=True, extend_dataset=True, model=m, progressbar=False
+        )
+
+
+def test_compute_deterministics_from_inferencedata():
+    with Model() as m:
+        mu_raw = Normal("mu_raw")
+        mu = Deterministic("mu", mu_raw.exp())
+
+    idata = sample_prior_predictive(draws=5, model=m, var_names=["mu_raw"], random_seed=22)
+    assert "prior" in idata.children and "posterior" not in idata.children
+
+    # No posterior group, so the prior is used by default
+    with m:
+        from_prior = compute_deterministics(idata, progressbar=False)
+    assert_allclose(from_prior["mu"], np.exp(idata.prior["mu_raw"]))
+
+    # Explicit group
+    with m:
+        assert_allclose(
+            compute_deterministics(idata, group="prior", progressbar=False)["mu"],
+            from_prior["mu"],
+        )
+
+    # Posterior takes precedence over prior
+    idata["posterior"] = idata.prior.dataset * 2
+    with m:
+        from_posterior = compute_deterministics(idata, progressbar=False)
+    assert_allclose(from_posterior["mu"], np.exp(idata.posterior["mu_raw"]))
+
+    with m, pytest.raises(ValueError, match="InferenceData has no group 'predictions'"):
+        compute_deterministics(idata, group="predictions", progressbar=False)
+
+    groupless = DataTree.from_dict({"predictions": idata.prior.dataset})
+    with m, pytest.raises(ValueError, match="neither a `posterior` nor a `prior` group"):
+        compute_deterministics(groupless, progressbar=False)
+
+    with m, pytest.raises(ValueError, match="`group` argument can only be used"):
+        compute_deterministics(idata.prior, group="prior", progressbar=False)
 
 
 def test_docstring_example():
@@ -77,6 +147,6 @@ def test_docstring_example():
     assert "mu" not in trace.posterior
 
     with m:
-        trace.posterior = pm.compute_deterministics(trace.posterior, merge_dataset=True)
+        pm.compute_deterministics(trace, extend_dataset=True)
 
     assert "mu" in trace.posterior

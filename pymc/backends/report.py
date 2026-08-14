@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ class SamplerReport:
 
     @property
     def n_tune(self) -> int | None:
-        """Number of tune iterations - not necessarily kept in trace!"""
+        """Number of tune iterations - not necessarily kept in trace."""
         return self._n_tune
 
     @property

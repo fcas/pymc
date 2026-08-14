@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -42,19 +42,17 @@ import pytensor.tensor as pt
 import pytest
 import scipy.stats.distributions as sp
 
-from pytensor.graph.basic import ancestors, equal_computations
+from pytensor.graph.basic import equal_computations
+from pytensor.graph.traversal import ancestors
 from pytensor.tensor.random.op import RandomVariable
-from pytensor.tensor.subtensor import (
-    AdvancedIncSubtensor,
-    AdvancedIncSubtensor1,
-    IncSubtensor,
-)
+from scipy import stats
 
 import pymc as pm
 
 from pymc.logprob.basic import (
     conditional_logp,
     icdf,
+    logccdf,
     logcdf,
     logp,
     transformed_conditional_logp,
@@ -93,7 +91,7 @@ def test_factorized_joint_logprob_basic():
         [ll_Y],
         rvs_to_values={sigma: sigma_value_var},
     )
-    total_ll_exp = logp(sigma, sigma_value_var) + ll_Y
+    total_ll_exp = ll_Y + logp(sigma, sigma_value_var)
 
     assert equal_computations([total_ll_combined], [total_ll_exp])
 
@@ -173,20 +171,6 @@ def test_factorized_joint_logprob_diff_dims():
     assert exp_logp_val == pytest.approx(logp_val)
 
 
-def test_incsubtensor_original_values_output_dict():
-    """
-    Test that the original un-incsubtensor value variable appears an the key of
-    the logprob factor
-    """
-
-    base_rv = pt.random.normal(0, 1, size=2)
-    rv = pt.set_subtensor(base_rv[0], 5)
-    vv = rv.clone()
-
-    logp_dict = conditional_logp({rv: vv})
-    assert vv in logp_dict
-
-
 def test_persist_inputs():
     """Make sure we don't unnecessarily clone variables."""
     x = pt.scalar("x")
@@ -219,7 +203,7 @@ def test_persist_inputs():
     assert y_vv_2 in ancestors([logp_2_combined])
 
 
-def test_warn_random_found_factorized_joint_logprob():
+def test_warn_rvs_conditional_logp():
     x_rv = pt.random.normal(name="x")
     y_rv = pt.random.normal(x_rv, 1, name="y")
 
@@ -274,54 +258,6 @@ def test_joint_logp_basic():
     assert b_value_var in res_ancestors
     assert c_value_var in res_ancestors
     assert a_value_var in res_ancestors
-
-
-@pytest.mark.parametrize(
-    "indices, size",
-    [
-        (slice(0, 2), 5),
-        (np.r_[True, True, False, False, True], 5),
-        (np.r_[0, 1, 4], 5),
-        ((np.array([0, 1, 4]), np.array([0, 1, 4])), (5, 5)),
-    ],
-)
-def test_joint_logp_incsubtensor(indices, size):
-    """Make sure we can compute a log-likelihood for ``Y[idx] = data`` where ``Y`` is univariate."""
-
-    mu = pm.floatX(np.power(10, np.arange(np.prod(size)))).reshape(size)
-    data = mu[indices]
-    sigma = 0.001
-    rng = np.random.RandomState(232)
-    a_val = rng.normal(mu, sigma, size=size).astype(pytensor.config.floatX)
-
-    rng = pytensor.shared(rng, borrow=False)
-    a = pm.Normal.dist(mu, sigma, size=size, rng=rng)
-    a_value_var = a.type()
-    a.name = "a"
-
-    a_idx = pt.set_subtensor(a[indices], data)
-
-    assert isinstance(a_idx.owner.op, IncSubtensor | AdvancedIncSubtensor | AdvancedIncSubtensor1)
-
-    a_idx_value_var = a_idx.type()
-    a_idx_value_var.name = "a_idx_value"
-
-    a_idx_logp = transformed_conditional_logp(
-        (a_idx,),
-        rvs_to_values={a_idx: a_value_var},
-        rvs_to_transforms={},
-    )
-
-    logp_vals = a_idx_logp[0].eval({a_value_var: a_val})
-
-    # The indices that were set should all have the same log-likelihood values,
-    # because the values they were set to correspond to the unique means along
-    # that dimension.  This helps us confirm that the log-likelihood is
-    # associating the assigned values with their correct parameters.
-    a_val_idx = a_val.copy()
-    a_val_idx[indices] = data
-    exp_obs_logps = sp.norm.logpdf(a_val_idx, mu, sigma)
-    np.testing.assert_almost_equal(logp_vals, exp_obs_logps)
 
 
 def test_model_unchanged_logprob_access():
@@ -401,14 +337,28 @@ def test_probability_direct_dispatch(func, scipy_func):
     [
         (logp, "logpdf", 5.0),
         (logcdf, "logcdf", 5.0),
+        (logccdf, "logccdf", 5.0),
         (icdf, "ppf", 0.7),
     ],
 )
 def test_probability_inference(func, scipy_func, test_value):
-    assert np.isclose(
-        func(pt.exp(pm.Normal.dist()), test_value).eval(),
-        getattr(sp.lognorm(s=1), scipy_func)(test_value),
-    )
+    if scipy_func == "logccdf":
+        # Scipy lognorm doesn't have logccdf
+        expected = np.log1p(-sp.lognorm(s=1).cdf(test_value))
+    else:
+        expected = getattr(sp.lognorm(s=1), scipy_func)(test_value)
+
+    res = func(pt.exp(pm.Normal.dist()), test_value).eval()
+    assert res.shape == ()
+    np.testing.assert_allclose(res, expected)
+
+    res = func(pt.exp(pm.Normal.dist(size=(2,))), test_value).eval()
+    assert res.shape == (2,)
+    np.testing.assert_allclose(res, expected)
+
+    res = func(pt.exp(pm.Normal.dist(size=(2,))), np.broadcast_to(test_value, (3, 2))).eval()
+    assert res.shape == (3, 2)
+    np.testing.assert_allclose(res, expected)
 
 
 @pytest.mark.parametrize(
@@ -435,7 +385,7 @@ def test_probability_inference_fails(func, func_name):
         (icdf, "ppf", 0.7),
     ],
 )
-def test_warn_random_found_probability_inference(func, scipy_func, test_value):
+def test_warn_rvs_probability_derivation(func, scipy_func, test_value):
     # Fail if unexpected warning is issued
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -448,7 +398,7 @@ def test_warn_random_found_probability_inference(func, scipy_func, test_value):
         with pytest.warns(
             UserWarning, match="RandomVariables {input} were found in the derived graph"
         ):
-            assert func(rv, 0.0)
+            func(rv, 0.0)
 
         res = func(rv, 0.0, warn_rvs=False)
         # This is the problem we are warning about, as now we can no longer identify the original rv in the graph
@@ -480,3 +430,71 @@ def test_icdf_discrete():
         dist_icdf.eval(),
         sp.geom.ppf(value, p),
     )
+
+
+def test_ir_rewrite_does_not_disconnect_valued_rvs():
+    """Check that we don't lose the dependency across RV values do to automatic rewrites.
+
+    See ValuedRV docstrings for more context.
+
+    Regression test for https://github.com/pymc-devs/pymc/issues/6917
+    """
+    a_base = pm.Normal.dist()
+    a = a_base * 5
+    b = pm.Normal.dist(a * 8)
+
+    a_value = a.type()
+    b_value = b.type()
+    logp_b = conditional_logp({a: a_value, b: b_value})[b_value]
+
+    assert_no_rvs(logp_b)
+    np.testing.assert_allclose(
+        logp_b.eval({a_value: np.pi, b_value: np.e}),
+        stats.norm.logpdf(np.e, np.pi * 8, 1),
+    )
+
+
+def test_ir_ops_can_be_evaluated_with_warning():
+    _eval_values = [None, None]
+
+    def my_logp(value, lam):
+        nonlocal _eval_values
+        _eval_values[0] = value.eval()
+        _eval_values[1] = lam.eval({"lam_log__": -1.5})
+        return value * lam
+
+    with pm.Model() as m:
+        lam = pm.Exponential("lam")
+        pm.CustomDist("y", lam, logp=my_logp, observed=[0, 1, 2])
+
+    with pytest.warns(
+        UserWarning, match="TransformedValue should not be present in the final graph"
+    ):
+        with pytest.warns(UserWarning, match="ValuedVar should not be present in the final graph"):
+            m.logp()
+
+    assert _eval_values[0].sum() == 3
+    assert _eval_values[1] == np.exp(-1.5)
+
+
+def test_broadcasted_logp_does_not_reference_rv():
+    """Size referencing another RV's shape should not leak into the logp graph.
+
+    RVs in distribution parameters (e.g. Normal(mu=rv)) are expected — they
+    represent statistical dependencies. But RVs in the size are shape artifacts
+    from broadcast_shape(rv, ...) that have no role in the logp computation.
+    """
+    rv1 = pm.Normal.dist([0, 1, 2])
+    rv2 = pm.Normal.dist(0, 1, size=rv1.shape)
+    assert_no_rvs(pm.logp(rv2, 0))
+
+    # Faithful regression case for #8301
+    def logp(value, sigma):
+        inner = pm.Truncated.dist(pm.Normal.dist(sigma=sigma), lower=-5.0, upper=5.0)
+        outer = pm.Truncated.dist(inner, lower=0.1)
+        return pm.logp(outer, value)
+
+    with pm.Model() as m:
+        pm.CustomDist("x", np.ones(3), logp=logp)
+
+    assert_no_rvs(m.logp())

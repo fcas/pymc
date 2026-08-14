@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -51,6 +51,8 @@ pytestmark = pytest.mark.filterwarnings(
     "error",
     # Related to https://github.com/arviz-devs/arviz/issues/2327
     "ignore:datetime.datetime.utcnow():DeprecationWarning",
+    "ignore:.*Cannot cache.*:numba.core.errors.NumbaWarning",
+    "ignore::numba.NumbaPerformanceWarning",
 )
 
 
@@ -234,7 +236,7 @@ class TestRandomWalk:
     )
     @pytest.mark.parametrize("steps_source", ("shape", "dims", "observed"))
     def test_infer_steps(self, init_dist, innovation_dist, shape, steps, steps_source):
-        shape_source_kwargs = dict(shape=None, dims=None, observed=None)
+        shape_source_kwargs = {"shape": None, "dims": None, "observed": None}
         if steps_source == "shape":
             shape_source_kwargs["shape"] = shape
         elif steps_source == "dims":
@@ -461,22 +463,6 @@ class TestPredefinedRandomWalk:
         assert isinstance(init_dist.owner.op, Dirichlet)
         assert isinstance(innovation_dist.owner.op, MvStudentT)
 
-    @pytest.mark.parametrize(
-        "distribution, init_dist, build_kwargs",
-        [
-            (GaussianRandomWalk, Normal.dist(), dict()),
-            (MvGaussianRandomWalk, Dirichlet.dist(np.ones(3)), dict(mu=np.zeros(3), tau=np.eye(3))),
-            (
-                MvStudentTRandomWalk,
-                Dirichlet.dist(np.ones(3)),
-                dict(nu=4, mu=np.zeros(3), tau=np.eye(3)),
-            ),
-        ],
-    )
-    def test_init_deprecated_arg(self, distribution, init_dist, build_kwargs):
-        with pytest.warns(FutureWarning, match="init parameter is now called init_dist"):
-            distribution.dist(init=init_dist, steps=10, **build_kwargs)
-
 
 class TestAR:
     def test_order1_logp(self):
@@ -485,8 +471,9 @@ class TestAR:
         with Model() as t:
             y = AR("y", phi, sigma=1, init_dist=Flat.dist(), shape=len(data))
             z = Normal("z", mu=phi * data[:-1], sigma=1, shape=len(data) - 1)
-        ar_like = t.compile_logp(y)({"y": data})
-        reg_like = t.compile_logp(z)({"z": data[1:]})
+        test_dict = {"y": data, "z": data[1:]}
+        ar_like = t.compile_logp(y)(test_dict)
+        reg_like = t.compile_logp(z)(test_dict)
         np.testing.assert_allclose(ar_like, reg_like)
 
         with Model() as t_constant:
@@ -499,8 +486,8 @@ class TestAR:
                 constant=True,
             )
             z = Normal("z", mu=0.3 + phi * data[:-1], sigma=1, shape=len(data) - 1)
-        ar_like = t_constant.compile_logp(y)({"y": data})
-        reg_like = t_constant.compile_logp(z)({"z": data[1:]})
+        ar_like = t_constant.compile_logp(y)(test_dict)
+        reg_like = t_constant.compile_logp(z)(test_dict)
         np.testing.assert_allclose(ar_like, reg_like)
 
     def test_order2_logp(self):
@@ -511,8 +498,9 @@ class TestAR:
             z = Normal(
                 "z", mu=phi[0] * data[1:-1] + phi[1] * data[:-2], sigma=1, shape=len(data) - 2
             )
-        ar_like = t.compile_logp(y)({"y": data})
-        reg_like = t.compile_logp(z)({"z": data[2:]})
+        test_dict = {"y": data, "z": data[2:]}
+        ar_like = t.compile_logp(y)(test_dict)
+        reg_like = t.compile_logp(z)(test_dict)
         np.testing.assert_allclose(ar_like, reg_like)
 
     @pytest.mark.parametrize("constant", (False, True))
@@ -709,10 +697,6 @@ class TestAR:
             AR("x", rho=[0, 0], init_dist=init_dist, steps=5, size=size)
         assert_support_point_is_expected(model, expected, check_finite_logp=False)
 
-    def test_init_deprecated_arg(self):
-        with pytest.warns(FutureWarning, match="init parameter is now called init_dist"):
-            AR.dist(rho=[1, 2, 3], init=Normal.dist(), shape=(10,))
-
     def test_change_dist_size(self):
         base_dist = AR.dist(rho=[0.5, 0.5], init_dist=pm.Normal.dist(size=(2,)), shape=(3, 10))
 
@@ -769,8 +753,9 @@ class TestGARCH11:
                 shape=data.shape,
             )
             z = Normal("z", mu=0, sigma=vol, shape=data.shape)
-        garch_like = t.compile_logp(y)({"y": data})
-        reg_like = t.compile_logp(z)({"z": data})
+        test_dict = {"y": data, "z": data}
+        garch_like = t.compile_logp(y)(test_dict)
+        reg_like = t.compile_logp(z)(test_dict)
         decimal = select_by_precision(float64=7, float32=4)
         np.testing.assert_allclose(garch_like, reg_like, 10 ** (-decimal))
 
@@ -782,12 +767,12 @@ class TestGARCH11:
     def test_batched_size(self, explicit_shape, batched_param):
         steps, batch_size = 100, 5
         param_val = np.square(np.random.randn(batch_size))
-        init_kwargs = dict(
-            omega=1.25,
-            alpha_1=0.5,
-            beta_1=0.45,
-            initial_vol=2.5,
-        )
+        init_kwargs = {
+            "omega": 1.25,
+            "alpha_1": 0.5,
+            "beta_1": 0.45,
+            "initial_vol": 2.5,
+        }
         kwargs0 = init_kwargs.copy()
         kwargs0[batched_param] = init_kwargs[batched_param] * param_val
         if explicit_shape:
@@ -797,7 +782,7 @@ class TestGARCH11:
         with Model() as t0:
             y = GARCH11("y", **kwargs0)
 
-        y_eval = draw(y, draws=2)
+        y_eval = draw(y, draws=2, random_seed=800)
         assert y_eval[0].shape == (batch_size, steps)
         assert not np.any(np.isclose(y_eval[0], y_eval[1]))
 
@@ -957,7 +942,7 @@ class TestEulerMaruyama:
                 xs.append(xs[-1] + f * dt + np.sqrt(dt) * g * wt[i])
             return np.array(xs)
 
-        sde = lambda x, lam: (lam * x, sig2)  # noqa E731
+        sde = lambda x, lam: (lam * x, sig2)  # noqa: E731
         x = floatX(_gen_sde_path(sde, (lam,), dt, N, 5.0))
         z = x + numpy_rng.standard_normal(size=x.size) * sig2
         # build model

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -94,8 +94,8 @@ Examples
 >>> from lasagne.updates import sgd, apply_momentum
 >>> l_in = InputLayer((100, 20))
 >>> l1 = DenseLayer(l_in, num_units=3, nonlinearity=softmax)
->>> x = pt.matrix('x')  # shp: num_batch x num_features
->>> y = pt.ivector('y') # shp: num_batch
+>>> x = pt.matrix("x")  # shp: num_batch x num_features
+>>> y = pt.ivector("y")  # shp: num_batch
 >>> l_out = get_output(l1, x)
 >>> params = lasagne.layers.get_all_params(l1)
 >>> loss = pt.mean(pt.nnet.categorical_crossentropy(l_out, y))
@@ -119,24 +119,24 @@ import pytensor.tensor as pt
 import pymc as pm
 
 __all__ = [
-    "sgd",
-    "apply_momentum",
-    "momentum",
-    "apply_nesterov_momentum",
-    "nesterov_momentum",
+    "adadelta",
     "adagrad",
     "adagrad_window",
-    "rmsprop",
-    "adadelta",
     "adam",
     "adamax",
+    "apply_momentum",
+    "apply_nesterov_momentum",
+    "momentum",
+    "nesterov_momentum",
     "norm_constraint",
+    "rmsprop",
+    "sgd",
     "total_norm_constraint",
 ]
 
 
 def get_or_compute_grads(loss_or_grads, params):
-    """Helper function returning a list of gradients
+    """Return a list of gradients.
 
     Parameters
     ----------
@@ -170,7 +170,7 @@ def get_or_compute_grads(loss_or_grads, params):
     if isinstance(loss_or_grads, list):
         if not len(loss_or_grads) == len(params):
             raise ValueError(
-                "Got %d gradient expressions for %d parameters" % (len(loss_or_grads), len(params))
+                f"Got {len(loss_or_grads)} gradient expressions for {len(params)} parameters"
             )
         return loss_or_grads
     else:
@@ -185,7 +185,7 @@ def _get_call_kwargs(_locals_):
 
 
 def sgd(loss_or_grads=None, params=None, learning_rate=1e-3):
-    """Stochastic Gradient Descent (SGD) updates
+    """Stochastic Gradient Descent (SGD) updates.
 
     Generates update expressions of the form:
 
@@ -212,12 +212,12 @@ def sgd(loss_or_grads=None, params=None, learning_rate=1e-3):
 
     Examples
     --------
-    >>> a = pytensor.shared(1.)
-    >>> b = a*2
-    >>> updates = sgd(b, [a], learning_rate=.01)
+    >>> a = pytensor.shared(1.0)
+    >>> b = a * 2
+    >>> updates = sgd(b, [a], learning_rate=0.01)
     >>> isinstance(updates, dict)
     True
-    >>> optimizer = sgd(learning_rate=.01)
+    >>> optimizer = sgd(learning_rate=0.01)
     >>> callable(optimizer)
     True
     >>> updates = optimizer(b, [a])
@@ -238,9 +238,9 @@ def sgd(loss_or_grads=None, params=None, learning_rate=1e-3):
 
 
 def apply_momentum(updates, params=None, momentum=0.9):
-    """Returns a modified update dictionary including momentum
+    """Return a modified update dictionary including momentum.
 
-    Generates update expressions of the form:
+    Generate update expressions of the form:
 
     * ``velocity := momentum * velocity + updates[param] - param``
     * ``param := param + velocity``
@@ -285,7 +285,7 @@ def apply_momentum(updates, params=None, momentum=0.9):
 
 
 def momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momentum=0.9):
-    """Stochastic Gradient Descent (SGD) updates with momentum
+    """Stochastic Gradient Descent (SGD) updates with momentum.
 
     Generates update expressions of the form:
 
@@ -324,12 +324,12 @@ def momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momentum=0.9):
 
     Examples
     --------
-    >>> a = pytensor.shared(1.)
-    >>> b = a*2
-    >>> updates = momentum(b, [a], learning_rate=.01)
+    >>> a = pytensor.shared(1.0)
+    >>> b = a * 2
+    >>> updates = momentum(b, [a], learning_rate=0.01)
     >>> isinstance(updates, dict)
     True
-    >>> optimizer = momentum(learning_rate=.01)
+    >>> optimizer = momentum(learning_rate=0.01)
     >>> callable(optimizer)
     True
     >>> updates = optimizer(b, [a])
@@ -337,7 +337,7 @@ def momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momentum=0.9):
     True
     """
     if loss_or_grads is None and params is None:
-        return partial(pm.updates.momentum, **_get_call_kwargs(locals()))
+        return partial(pm.variational.updates.momentum, **_get_call_kwargs(locals()))
     elif loss_or_grads is None or params is None:
         raise ValueError("Please provide both `loss_or_grads` and `params` to get updates")
     updates = sgd(loss_or_grads, params, learning_rate)
@@ -345,9 +345,9 @@ def momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momentum=0.9):
 
 
 def apply_nesterov_momentum(updates, params=None, momentum=0.9):
-    """Returns a modified update dictionary including Nesterov momentum
+    """Return a modified update dictionary including Nesterov momentum.
 
-    Generates update expressions of the form:
+    Generate update expressions of the form:
 
     * ``velocity := momentum * velocity + updates[param] - param``
     * ``param := param + momentum * velocity + updates[param] - param``
@@ -398,7 +398,7 @@ def apply_nesterov_momentum(updates, params=None, momentum=0.9):
 
 
 def nesterov_momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momentum=0.9):
-    """Stochastic Gradient Descent (SGD) updates with Nesterov momentum
+    """Stochastic Gradient Descent (SGD) updates with Nesterov momentum.
 
     Generates update expressions of the form:
 
@@ -442,12 +442,12 @@ def nesterov_momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momen
 
     Examples
     --------
-    >>> a = pytensor.shared(1.)
-    >>> b = a*2
-    >>> updates = nesterov_momentum(b, [a], learning_rate=.01)
+    >>> a = pytensor.shared(1.0)
+    >>> b = a * 2
+    >>> updates = nesterov_momentum(b, [a], learning_rate=0.01)
     >>> isinstance(updates, dict)
     True
-    >>> optimizer = nesterov_momentum(learning_rate=.01)
+    >>> optimizer = nesterov_momentum(learning_rate=0.01)
     >>> callable(optimizer)
     True
     >>> updates = optimizer(b, [a])
@@ -463,7 +463,7 @@ def nesterov_momentum(loss_or_grads=None, params=None, learning_rate=1e-3, momen
 
 
 def adagrad(loss_or_grads=None, params=None, learning_rate=1.0, epsilon=1e-6):
-    """Adagrad updates
+    r"""Adagrad updates.
 
     Scale learning rates by dividing with the square root of accumulated
     squared gradients. See [1]_ for further description.
@@ -510,12 +510,12 @@ def adagrad(loss_or_grads=None, params=None, learning_rate=1.0, epsilon=1e-6):
 
     Examples
     --------
-    >>> a = pytensor.shared(1.)
-    >>> b = a*2
-    >>> updates = adagrad(b, [a], learning_rate=.01)
+    >>> a = pytensor.shared(1.0)
+    >>> b = a * 2
+    >>> updates = adagrad(b, [a], learning_rate=0.01)
     >>> isinstance(updates, dict)
     True
-    >>> optimizer = adagrad(learning_rate=.01)
+    >>> optimizer = adagrad(learning_rate=0.01)
     >>> callable(optimizer)
     True
     >>> updates = optimizer(b, [a])
@@ -540,8 +540,9 @@ def adagrad(loss_or_grads=None, params=None, learning_rate=1.0, epsilon=1e-6):
 
 
 def adagrad_window(loss_or_grads=None, params=None, learning_rate=0.001, epsilon=0.1, n_win=10):
-    """Returns a function that returns parameter updates.
-    Instead of accumulated estimate, uses running window
+    """Return a function that returns parameter updates.
+
+    Instead of accumulated estimate, uses running window.
 
     Parameters
     ----------
@@ -568,7 +569,7 @@ def adagrad_window(loss_or_grads=None, params=None, learning_rate=0.001, epsilon
     grads = get_or_compute_grads(loss_or_grads, params)
     updates = OrderedDict()
     for param, grad in zip(params, grads):
-        i = pytensor.shared(pm.floatX(0))
+        i = pytensor.shared(pm.pytensorf.floatX(0))
         i_int = i.astype("int32")
         value = param.get_value(borrow=True)
         accu = pytensor.shared(np.zeros((*value.shape, n_win), dtype=value.dtype))
@@ -585,7 +586,7 @@ def adagrad_window(loss_or_grads=None, params=None, learning_rate=0.001, epsilon
 
 
 def rmsprop(loss_or_grads=None, params=None, learning_rate=1.0, rho=0.9, epsilon=1e-6):
-    """RMSProp updates
+    r"""RMSProp updates.
 
     Scale learning rates by dividing with the moving average of the root mean
     squared (RMS) gradients. See [1]_ for further description.
@@ -666,7 +667,7 @@ def rmsprop(loss_or_grads=None, params=None, learning_rate=1.0, rho=0.9, epsilon
 
 
 def adadelta(loss_or_grads=None, params=None, learning_rate=1.0, rho=0.95, epsilon=1e-6):
-    r"""Adadelta updates
+    r"""Adadelta updates.
 
     Scale learning rates by the ratio of accumulated gradients to accumulated
     updates, see [1]_ and notes for further description.
@@ -772,7 +773,7 @@ def adadelta(loss_or_grads=None, params=None, learning_rate=1.0, rho=0.95, epsil
 def adam(
     loss_or_grads=None, params=None, learning_rate=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8
 ):
-    """Adam updates
+    """Adam updates.
 
     Adam updates implemented as in [1]_.
 
@@ -813,12 +814,12 @@ def adam(
 
     Examples
     --------
-    >>> a = pytensor.shared(1.)
-    >>> b = a*2
-    >>> updates = adam(b, [a], learning_rate=.01)
+    >>> a = pytensor.shared(1.0)
+    >>> b = a * 2
+    >>> updates = adam(b, [a], learning_rate=0.01)
     >>> isinstance(updates, dict)
     True
-    >>> optimizer = adam(learning_rate=.01)
+    >>> optimizer = adam(learning_rate=0.01)
     >>> callable(optimizer)
     True
     >>> updates = optimizer(b, [a])
@@ -859,7 +860,7 @@ def adam(
 def adamax(
     loss_or_grads=None, params=None, learning_rate=0.002, beta1=0.9, beta2=0.999, epsilon=1e-8
 ):
-    """Adamax updates
+    """Adamax updates.
 
     Adamax updates implemented as in [1]_. This is a variant of the Adam
     algorithm based on the infinity norm.
@@ -897,12 +898,12 @@ def adamax(
 
     Examples
     --------
-    >>> a = pytensor.shared(1.)
-    >>> b = a*2
-    >>> updates = adamax(b, [a], learning_rate=.01)
+    >>> a = pytensor.shared(1.0)
+    >>> b = a * 2
+    >>> updates = adamax(b, [a], learning_rate=0.01)
     >>> isinstance(updates, dict)
     True
-    >>> optimizer = adamax(learning_rate=.01)
+    >>> optimizer = adamax(learning_rate=0.01)
     >>> callable(optimizer)
     True
     >>> updates = optimizer(b, [a])
@@ -941,7 +942,7 @@ def adamax(
 
 
 def norm_constraint(tensor_var, max_norm, norm_axes=None, epsilon=1e-7):
-    """Max weight norm constraints and gradient clipping
+    """Max weight norm constraints and gradient clipping.
 
     This takes a TensorVariable and rescales it so that incoming weight
     norms are below a specified constraint value. Vectors violating the
@@ -975,8 +976,7 @@ def norm_constraint(tensor_var, max_norm, norm_axes=None, epsilon=1e-7):
 
     Examples
     --------
-    >>> param = pytensor.shared(
-    ...     np.random.randn(100, 200).astype(pytensor.config.floatX))
+    >>> param = pytensor.shared(np.random.randn(100, 200).astype(pytensor.config.floatX))
     >>> update = param + 100
     >>> update = norm_constraint(update, 10)
     >>> func = pytensor.function([], [], updates=[(param, update)])
@@ -1006,7 +1006,7 @@ def norm_constraint(tensor_var, max_norm, norm_axes=None, epsilon=1e-7):
     elif ndim in [3, 4, 5]:  # Conv{1,2,3}DLayer
         sum_over = tuple(range(1, ndim))
     else:
-        raise ValueError(f"Unsupported tensor dimensionality {ndim}." "Must specify `norm_axes`")
+        raise ValueError(f"Unsupported tensor dimensionality {ndim}. Must specify `norm_axes`")
 
     dtype = np.dtype(pytensor.config.floatX).type
     norms = pt.sqrt(pt.sum(pt.sqr(tensor_var), axis=sum_over, keepdims=True))
@@ -1017,7 +1017,7 @@ def norm_constraint(tensor_var, max_norm, norm_axes=None, epsilon=1e-7):
 
 
 def total_norm_constraint(tensor_vars, max_norm, epsilon=1e-7, return_norm=False):
-    """Rescales a list of tensors based on their combined norm
+    """Rescales a list of tensors based on their combined norm.
 
     If the combined norm of the input tensors exceeds the threshold then all
     tensors are rescaled such that the combined norm is equal to the threshold.

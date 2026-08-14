@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 import logging
-import platform
 import warnings
 
 import numpy as np
@@ -20,16 +19,16 @@ import pytensor.tensor as pt
 import pytest
 import scipy.stats as st
 
-from arviz.data.inference_data import InferenceData
+from pytensor.compile.ops import wrap_py
+from xarray import DataTree
 
 import pymc as pm
 
 from pymc.backends.base import MultiTrace
+from pymc.distributions.transforms import Ordered
 from pymc.pytensorf import floatX
 from pymc.smc.kernels import IMH, systematic_resampling
 from tests.helpers import assert_random_state_equal
-
-_IS_WINDOWS = platform.system() == "Windows"
 
 
 class TestSMC:
@@ -75,11 +74,12 @@ class TestSMC:
             x = pm.Normal("x", 0, 1)
             y = pm.Normal("y", x, 1, observed=0)
 
-    def test_sample(self):
+    @pytest.mark.parametrize("cores", [1, 2], ids=["sequential", "parallel"])
+    def test_sample(self, cores):
         initial_rng_state = np.random.get_state()
         with self.SMC_test:
             mtrace = pm.sample_smc(
-                draws=self.samples, return_inferencedata=False, progressbar=not _IS_WINDOWS
+                draws=self.samples, return_inferencedata=False, chains=2, cores=cores
             )
 
         # Verify sampling was done with a non-global random generator
@@ -133,6 +133,21 @@ class TestSMC:
 
         assert np.all(np.median(trace["mu"], axis=0) == [1, 2])
 
+    def test_parallel_custom(self):
+        def _logp(value, mu):
+            return -((value - mu) ** 2)
+
+        def _random(mu, rng=None, size=None):
+            return rng.normal(loc=mu, scale=1, size=size)
+
+        def _dist(mu, size=None):
+            return pm.Normal.dist(mu, 1, size=size)
+
+        with pm.Model():
+            mu = pm.CustomDist("mu", 0, logp=_logp, dist=_dist)
+            pm.CustomDist("y", mu, logp=_logp, class_name="", random=_random, observed=[1, 2])
+            pm.sample_smc(draws=6, cores=2)
+
     def test_marginal_likelihood(self):
         """
         Verifies that the log marginal likelihood function
@@ -147,9 +162,7 @@ class TestSMC:
             with pm.Model() as model:
                 a = pm.Beta("a", alpha, beta)
                 y = pm.Bernoulli("y", a, observed=data)
-                trace = pm.sample_smc(
-                    2000, chains=2, return_inferencedata=False, progressbar=not _IS_WINDOWS
-                )
+                trace = pm.sample_smc(2000, chains=2, return_inferencedata=False)
             # log_marginal_likelihood is found in the last value of each chain
             lml = np.mean([chain[-1] for chain in trace.report.log_marginal_likelihood])
             marginals.append(lml)
@@ -210,17 +223,15 @@ class TestSMC:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
                 warnings.filterwarnings("ignore", "More chains .* than draws .*", UserWarning)
-                idata = pm.sample_smc(
-                    chains=chains, draws=draws, progressbar=not (chains > 1 and _IS_WINDOWS)
-                )
+                idata = pm.sample_smc(chains=chains, draws=draws, progressbar=not (chains > 1))
                 mt = pm.sample_smc(
                     chains=chains,
                     draws=draws,
                     return_inferencedata=False,
-                    progressbar=not (chains > 1 and _IS_WINDOWS),
+                    progressbar=not (chains > 1),
                 )
 
-        assert isinstance(idata, InferenceData)
+        assert isinstance(idata, DataTree)
         assert "sample_stats" in idata
         assert idata.posterior.sizes["chain"] == chains
         assert idata.posterior.sizes["draw"] == draws
@@ -232,42 +243,32 @@ class TestSMC:
     def test_convergence_checks(self, caplog):
         with caplog.at_level(logging.INFO):
             with self.fast_model:
-                pm.sample_smc(draws=99, progressbar=not _IS_WINDOWS)
+                pm.sample_smc(draws=99)
         assert "The number of samples is too small" in caplog.text
 
-    def test_deprecated_parallel_arg(self):
-        with self.fast_model:
-            with pytest.warns(
-                FutureWarning,
-                match="The argument parallel is deprecated",
-            ):
-                pm.sample_smc(draws=10, chains=1, parallel=False)
+    def test_ordered(self):
+        """
+        Test that initial population respects custom initval, especially when applied
+        to the Ordered transformation. Regression test for #7438.
+        """
+        with pm.Model() as m:
+            pm.Normal(
+                "a",
+                mu=0.0,
+                sigma=1.0,
+                size=(2,),
+                transform=Ordered(),
+                initval=[-1.0, 1.0],
+            )
 
-    def test_deprecated_abc_args(self):
-        with self.fast_model:
-            with pytest.warns(
-                FutureWarning,
-                match='The kernel string argument "ABC" in sample_smc has been deprecated',
-            ):
-                pm.sample_smc(draws=10, chains=1, kernel="ABC")
+        smc = IMH(model=m)
+        out = smc.initialize_population()
 
-            with pytest.warns(
-                FutureWarning,
-                match='The kernel string argument "Metropolis" in sample_smc has been deprecated',
-            ):
-                pm.sample_smc(draws=10, chains=1, kernel="Metropolis")
+        # initial point should not include NaNs
+        assert not np.any(np.isnan(out["a_ordered__"]))
 
-            with pytest.warns(
-                FutureWarning,
-                match="save_sim_data has been deprecated",
-            ):
-                pm.sample_smc(draws=10, chains=1, save_sim_data=True)
-
-            with pytest.warns(
-                FutureWarning,
-                match="save_log_pseudolikelihood has been deprecated",
-            ):
-                pm.sample_smc(draws=10, chains=1, save_log_pseudolikelihood=True)
+        # initial point should match for all particles
+        assert np.all(out["a_ordered__"][0] == out["a_ordered__"])
 
 
 class TestMHKernel:
@@ -279,10 +280,10 @@ class TestMHKernel:
             mu = pm.Normal("mu", 0, 3)
             sigma = pm.HalfNormal("sigma", 1)
             y = pm.Normal("y", mu, sigma, observed=data)
-            idata = pm.sample_smc(draws=2000, kernel=pm.smc.MH, progressbar=not _IS_WINDOWS)
+            idata = pm.sample_smc(draws=2000, kernel=pm.smc.MH)
         assert_random_state_equal(initial_rng_state, np.random.get_state())
 
-        post = idata.posterior.stack(sample=("chain", "draw"))
+        post = idata.posterior.to_dataset().stack(sample=("chain", "draw"))
         assert np.abs(post["mu"].mean() - 10) < 0.1
         assert np.abs(post["sigma"].mean() - 0.5) < 0.05
 
@@ -306,3 +307,22 @@ def test_systematic():
     np.testing.assert_array_equal(systematic_resampling(weights, rng), [0, 1, 2])
     weights = [0.99, 0.01]
     np.testing.assert_array_equal(systematic_resampling(weights, rng), [0, 0])
+
+
+@wrap_py(itypes=[pt.dvector], otypes=[pt.dvector])
+def _twice(x):
+    # Pickle fails if this is defined inside the test function namespace.
+    return 2 * x
+
+
+def test_smc_with_custom_op():
+    # Regression test for https://github.com/pymc-devs/pymc/issues/7078
+
+    with pm.Model() as model:
+        x = pm.Normal("x", mu=[0, 0], sigma=1)
+        y = _twice(x)
+        pm.Normal(name="z", mu=y, observed=[1, 1])
+
+        trace = pm.sample_smc(10, cores=2, chains=2)
+
+    assert trace is not None

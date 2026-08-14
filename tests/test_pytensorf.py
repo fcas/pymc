@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,7 +11,6 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
-import warnings
 
 import numpy as np
 import numpy.ma as ma
@@ -23,32 +22,34 @@ import pytest
 import scipy.sparse as sps
 
 from pytensor import scan, shared
-from pytensor.compile import UnusedInputError
+from pytensor.compile import Function, UnusedInputError
 from pytensor.compile.builders import OpFromGraph
 from pytensor.graph.basic import Variable, equal_computations
-from pytensor.tensor.random.basic import normal, uniform
-from pytensor.tensor.random.var import RandomStateSharedVariable
-from pytensor.tensor.subtensor import AdvancedIncSubtensor, AdvancedIncSubtensor1
-from pytensor.tensor.variable import TensorVariable
+from pytensor.link.vm import VMLinker
+from pytensor.tensor.subtensor import AdvancedIncSubtensor
 
 import pymc as pm
 
+from pymc.data import Minibatch, MinibatchOp
 from pymc.distributions.dist_math import check_parameters
 from pymc.distributions.distribution import SymbolicRandomVariable
 from pymc.exceptions import NotConstantValueError
 from pymc.logprob.utils import ParameterValueError
 from pymc.pytensorf import (
+    PointFunc,
     collect_default_updates,
-    compile_pymc,
+    compile,
     constant_fold,
-    convert_observed_data,
+    convert_data,
     extract_obs_data,
     hessian,
     hessian_diag,
+    make_shared_replacements,
     replace_rng_nodes,
     replace_vars_in_graphs,
     reseed_rngs,
-    walk_model,
+    resolve_backend_compile_kwargs,
+    rewrite_pregrad,
 )
 from pymc.vartypes import int_types
 
@@ -63,7 +64,7 @@ from pymc.vartypes import int_types
 )
 def test_pd_dataframe_as_tensor_variable(np_array: np.ndarray) -> None:
     df = pd.DataFrame(np_array)
-    np.testing.assert_array_equal(x=pt.as_tensor_variable(x=df).eval(), y=np_array)
+    np.testing.assert_array_equal(pt.as_tensor_variable(df).eval(), np_array)
 
 
 @pytest.mark.parametrize(
@@ -72,7 +73,7 @@ def test_pd_dataframe_as_tensor_variable(np_array: np.ndarray) -> None:
 )
 def test_pd_series_as_tensor_variable(np_array: np.ndarray) -> None:
     df = pd.Series(np_array)
-    np.testing.assert_array_equal(x=pt.as_tensor_variable(x=df).eval(), y=np_array)
+    np.testing.assert_array_equal(pt.as_tensor_variable(df).eval(), np_array)
 
 
 def test_pd_as_tensor_variable_multiindex() -> None:
@@ -83,19 +84,19 @@ def test_pd_as_tensor_variable_multiindex() -> None:
     df = pd.DataFrame({"A": [12.0, 80.0, 30.0, 20.0], "B": [120.0, 700.0, 30.0, 20.0]}, index=index)
     np_array = np.array([[12.0, 80.0, 30.0, 20.0], [120.0, 700.0, 30.0, 20.0]]).T
     assert isinstance(df.index, pd.MultiIndex)
-    np.testing.assert_array_equal(x=pt.as_tensor_variable(x=df).eval(), y=np_array)
+    np.testing.assert_array_equal(pt.as_tensor_variable(df).eval(), np_array)
 
 
 class TestBroadcasting:
     def test_make_shared_replacements(self):
-        """Check if pm.make_shared_replacements preserves broadcasting."""
+        """Check if make_shared_replacements preserves broadcasting."""
 
         with pm.Model() as test_model:
             test1 = pm.Normal("test1", mu=0.0, sigma=1.0, size=(1, 10))
             test2 = pm.Normal("test2", mu=0.0, sigma=1.0, size=(10, 1))
 
         # Replace test1 with a shared variable, keep test 2 the same
-        replacement = pm.make_shared_replacements(
+        replacement = make_shared_replacements(
             test_model.initial_point(), [test_model.test2], test_model
         )
         assert (
@@ -134,63 +135,89 @@ def _make_along_axis_idx(arr_shape, indices, axis):
     return tuple(fancy_index)
 
 
-def test_extract_obs_data():
-    with pytest.raises(TypeError):
-        extract_obs_data(pt.matrix())
+class TestExtractObsData:
+    def test_root_variable(self):
+        with pytest.raises(TypeError):
+            extract_obs_data(pt.matrix())
 
-    data = np.random.normal(size=(2, 3))
-    data_at = pt.as_tensor(data)
-    mask = np.random.binomial(1, 0.5, size=(2, 3)).astype(bool)
-
-    for val_at in (data_at, pytensor.shared(data)):
-        res = extract_obs_data(val_at)
+    def test_constant_variable(self):
+        data = np.random.normal(size=(2, 3))
+        data_pt = pt.as_tensor(data)
+        res = extract_obs_data(data_pt)
 
         assert isinstance(res, np.ndarray)
-        assert np.array_equal(res, data)
+        np.testing.assert_array_equal(res, data)
 
-    # AdvancedIncSubtensor check
-    data_m = np.ma.MaskedArray(data, mask)
-    missing_values = data_at.type()[mask]
-    constant = pt.as_tensor(data_m.filled())
-    z_at = pt.set_subtensor(constant[mask.nonzero()], missing_values)
+    def test_shared_variable(self):
+        data = np.random.normal(size=(2, 3))
+        data_pt = shared(data)
 
-    assert isinstance(z_at.owner.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
+        res = extract_obs_data(data_pt)
+        assert isinstance(res, np.ndarray)
+        np.testing.assert_array_equal(res, data)
 
-    res = extract_obs_data(z_at)
+    def test_masked_variable(self):
+        # Extract data from auto-imputation graph
+        data = np.random.normal(size=(2, 3))
+        data_pt = pt.as_tensor(data)
+        mask = np.random.binomial(1, 0.5, size=(2, 3)).astype(bool)
 
-    assert isinstance(res, np.ndarray)
-    assert np.ma.allequal(res, data_m)
+        # AdvancedIncSubtensor check
+        data_m = np.ma.MaskedArray(data, mask)
+        missing_values = data_pt.type()[mask]
+        constant = pt.as_tensor(data_m.filled())
+        z_at = pt.set_subtensor(constant[mask.nonzero()], missing_values)
+        assert isinstance(z_at.owner.op, AdvancedIncSubtensor)
 
-    # AdvancedIncSubtensor1 check
-    data = np.random.normal(size=(3,))
-    data_at = pt.as_tensor(data)
-    mask = np.random.binomial(1, 0.5, size=(3,)).astype(bool)
+        res = extract_obs_data(z_at)
+        assert isinstance(res, np.ndarray)
+        assert np.ma.allequal(res, data_m)
 
-    data_m = np.ma.MaskedArray(data, mask)
-    missing_values = data_at.type()[mask]
-    constant = pt.as_tensor(data_m.filled())
-    z_at = pt.set_subtensor(constant[mask.nonzero()], missing_values)
+    def test_cast_variable(self):
+        # Cast check
+        data = np.array(5)
+        data_pt = pt.cast(pt.as_tensor(5.0), np.int64)
 
-    assert isinstance(z_at.owner.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
+        res = extract_obs_data(data_pt)
+        assert isinstance(res, np.ndarray)
+        np.testing.assert_array_equal(res, data)
 
-    res = extract_obs_data(z_at)
+    def test_minibatch_variable(self):
+        x = np.arange(5)
+        y = x * 2
 
-    assert isinstance(res, np.ndarray)
-    assert np.ma.allequal(res, data_m)
+        x_mb, y_mb = Minibatch(x, y, batch_size=2)
+        assert isinstance(x_mb.owner.op, MinibatchOp)
+        assert isinstance(y_mb.owner.op, MinibatchOp)
 
-    # Cast check
-    data = np.array(5)
-    t = pt.cast(pt.as_tensor(5.0), np.int64)
-    res = extract_obs_data(t)
+        res = extract_obs_data(x_mb)
+        assert isinstance(res, np.ndarray)
+        np.testing.assert_array_equal(res, x)
 
-    assert isinstance(res, np.ndarray)
-    assert np.array_equal(res, data)
+        res = extract_obs_data(y_mb)
+        assert isinstance(res, np.ndarray)
+        np.testing.assert_array_equal(res, y)
+
+    def test_pytensor_operations(self):
+        x = np.array([1, 2, 3])
+        target = 1 + 3 * pt.as_tensor_variable(x)
+
+        res = extract_obs_data(target)
+        assert isinstance(res, np.ndarray)
+        np.testing.assert_array_equal(res, np.array([4, 7, 10]))
+
+    def test_pytensor_operations_raises(self):
+        x = pt.scalar("x")
+        target = 1 + 3 * x
+
+        with pytest.raises(TypeError, match="Data cannot be extracted from"):
+            extract_obs_data(target)
 
 
 @pytest.mark.parametrize("input_dtype", ["int32", "int64", "float32", "float64"])
-def test_convert_observed_data(input_dtype):
+def test_convert_data(input_dtype):
     """
-    Ensure that convert_observed_data returns the dense array, masked array,
+    Ensure that convert_data returns the dense array, masked array,
     graph variable, TensorVariable, or sparse matrix as appropriate.
     """
     # Create the various inputs to the function
@@ -206,12 +233,8 @@ def test_convert_observed_data(input_dtype):
     missing_pandas_input = pd.DataFrame(missing_numpy_input)
     masked_array_input = ma.array(dense_input, mask=(np.mod(dense_input, 2) == 0))
 
-    # Create a generator object. Apparently the generator object needs to
-    # yield numpy arrays.
-    square_generator = (np.array([i**2], dtype=int) for i in range(100))
-
     # Alias the function to be tested
-    func = convert_observed_data
+    func = convert_data
 
     #####
     # Perform the various tests
@@ -255,61 +278,15 @@ def test_convert_observed_data(input_dtype):
     else:
         assert pytensor_output.dtype == intX
 
-    # Check function behavior with generator data
-    generator_output = func(square_generator)
-
-    # Output is wrapped with `pm.floatX`, and this unwraps
-    wrapped = generator_output.owner.inputs[0]
-    # Make sure the returned object has .set_gen and .set_default methods
-    assert hasattr(wrapped, "set_gen")
-    assert hasattr(wrapped, "set_default")
-    # Make sure the returned object is an PyTensor TensorVariable
-    assert isinstance(wrapped, TensorVariable)
-
 
 def test_pandas_to_array_pandas_index():
     data = pd.Index([1, 2, 3])
-    result = convert_observed_data(data)
+    result = convert_data(data)
     expected = np.array([1, 2, 3])
     np.testing.assert_array_equal(result, expected)
 
 
-def test_walk_model():
-    a = pt.vector("a")
-    b = uniform(0.0, a, name="b")
-    c = pt.log(b)
-    c.name = "c"
-    d = pt.vector("d")
-    e = normal(c, d, name="e")
-
-    test_graph = pt.exp(e + 1)
-
-    with pytest.warns(FutureWarning):
-        res = list(walk_model((test_graph,)))
-    assert a in res
-    assert b in res
-    assert c in res
-    assert d in res
-    assert e in res
-
-    with pytest.warns(FutureWarning):
-        res = list(walk_model((test_graph,), stop_at_vars={c}))
-    assert a not in res
-    assert b not in res
-    assert c in res
-    assert d in res
-    assert e in res
-
-    with pytest.warns(FutureWarning):
-        res = list(walk_model((test_graph,), stop_at_vars={b}))
-    assert a not in res
-    assert b in res
-    assert c in res
-    assert d in res
-    assert e in res
-
-
-class TestCompilePyMC:
+class TestCompile:
     def test_check_bounds_flag(self):
         """Test that CheckParameterValue Ops are replaced or removed when using compile_pymc"""
         logp = pt.ones(3)
@@ -324,23 +301,23 @@ class TestCompilePyMC:
 
         m.check_bounds = False
         with m:
-            assert np.all(compile_pymc([], bound)() == 1)
+            assert np.all(compile([], bound)() == 1)
 
         m.check_bounds = True
         with m:
-            assert np.all(compile_pymc([], bound)() == -np.inf)
+            assert np.all(compile([], bound)() == -np.inf)
 
     def test_check_parameters_can_be_replaced_by_ninf(self):
         expr = pt.vector("expr", shape=(3,))
         cond = pt.ge(expr, 0)
 
         final_expr = check_parameters(expr, cond, can_be_replaced_by_ninf=True)
-        fn = compile_pymc([expr], final_expr)
+        fn = compile([expr], final_expr)
         np.testing.assert_array_equal(fn(expr=[1, 2, 3]), [1, 2, 3])
         np.testing.assert_array_equal(fn(expr=[-1, 2, 3]), [-np.inf, -np.inf, -np.inf])
 
         final_expr = check_parameters(expr, cond, msg="test", can_be_replaced_by_ninf=False)
-        fn = compile_pymc([expr], final_expr)
+        fn = compile([expr], final_expr)
         np.testing.assert_array_equal(fn(expr=[1, 2, 3]), [1, 2, 3])
         with pytest.raises(ParameterValueError, match="test"):
             fn([-1, 2, 3])
@@ -349,17 +326,28 @@ class TestCompilePyMC:
         rng = pytensor.shared(np.random.default_rng(0))
         x = pm.Normal.dist(rng=rng)
         assert x.owner.inputs[0] is rng
-        f = compile_pymc([], x)
+        f = compile([], x)
         assert not np.isclose(f(), f())
 
-        # Check that update was not done inplace
-        assert rng.default_update is None
+        # Check that compile() didn't mutate the shared rng — a plain
+        # pytensor.function over the same graph should still be deterministic.
         f = pytensor.function([], x)
         assert f() == f()
 
+    def test_compile_pymc_return_updates(self):
+        rng = pytensor.shared(np.random.default_rng(0))
+        x = pm.Normal.dist(rng=rng)
+
+        f, updates = compile([], x, return_updates=True)
+        assert list(updates) == [rng]
+        assert not np.isclose(f(), f())  # the function itself is unchanged
+
+        # Without it the function is returned on its own.
+        assert isinstance(compile([], x), Function)
+
     def test_compile_pymc_with_updates(self):
         x = pytensor.shared(0)
-        f = compile_pymc([], x, updates={x: x + 1})
+        f = compile([], x, updates={x: x + 1})
         assert f() == 0
         assert f() == 1
 
@@ -368,22 +356,14 @@ class TestCompilePyMC:
         x = pm.Normal.dist(rng=rng)
 
         # By default, compile_pymc should update the rng of x
-        f = compile_pymc([], x)
+        f = compile([], x)
         assert f() != f()
 
-        # An explicit update should override the default_update, like pytensor.function does
-        # For testing purposes, we use an update that leaves the rng unchanged
-        f = compile_pymc([], x, updates={rng: rng})
+        # An explicit update should override the inferred default update, like
+        # pytensor.function does. For testing purposes, we use an update that
+        # leaves the rng unchanged.
+        f = compile([], x, updates={rng: rng})
         assert f() == f()
-
-        # If we specify a custom default_update directly it should use that instead.
-        rng.default_update = rng
-        f = compile_pymc([], x)
-        assert f() == f()
-
-        # And again, it should be overridden by an explicit update
-        f = compile_pymc([], x, updates={rng: x.owner.outputs[0]})
-        assert f() != f()
 
     def test_compile_pymc_updates_inputs(self):
         """Test that compile_pymc does not include rngs updates of variables that are inputs
@@ -401,7 +381,7 @@ class TestCompilePyMC:
             ([x, y], 1),
             ([x, y, z], 0),
         ):
-            fn = compile_pymc(inputs, z, on_unused_input="ignore")
+            fn = compile(inputs, z, on_unused_input="ignore")
             fn_fgraph = fn.maker.fgraph
             # Each RV adds a shared input for its rng
             assert len(fn_fgraph.inputs) == len(inputs) + rvs_in_graph
@@ -428,7 +408,7 @@ class TestCompilePyMC:
             [dummy_rng1],
             pt.random.normal(rng=dummy_rng1).owner.outputs,
         )(rng1)
-        fn = compile_pymc(inputs=[], outputs=dummy_x1, random_seed=433)
+        fn = compile(inputs=[], outputs=dummy_x1, random_seed=433)
         assert fn() != fn()
 
         # Now there's a problem as there is no update rule for rng2
@@ -442,9 +422,9 @@ class TestCompilePyMC:
             ],
         )(rng1, rng2)
         with pytest.raises(
-            ValueError, match="No update found for at least one RNG used in SymbolicRandomVariable"
+            ValueError, match="No update found for at least one RNG used in SymbolicRV"
         ):
-            compile_pymc(inputs=[], outputs=[dummy_x1, dummy_x2])
+            compile(inputs=[], outputs=[dummy_x1, dummy_x2])
 
     def test_random_seed(self):
         seedx = pytensor.shared(np.random.default_rng(1))
@@ -458,49 +438,54 @@ class TestCompilePyMC:
         assert x0_eval == y0_eval
 
         # The variables will be reseeded with new seeds by default
-        f1 = compile_pymc([], [x, y])
+        f1 = compile([], [x, y])
         x1_eval, y1_eval = f1()
         assert x1_eval != y1_eval
 
         # Check that seeding works
-        f2 = compile_pymc([], [x, y], random_seed=1)
+        f2 = compile([], [x, y], random_seed=1)
         x2_eval, y2_eval = f2()
         assert x2_eval != x1_eval
         assert y2_eval != y1_eval
 
-        f3 = compile_pymc([], [x, y], random_seed=1)
+        f3 = compile([], [x, y], random_seed=1)
         x3_eval, y3_eval = f3()
         assert x3_eval == x2_eval
         assert y3_eval == y2_eval
 
+    @pytest.mark.filterwarnings("error")
     def test_multiple_updates_same_variable(self):
-        # Raise if unexpected warning is issued
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        rng = pytensor.shared(np.random.default_rng(), name="rng")
+        _, x = pt.random.normal(0, rng=rng, return_next_rng=True)
+        _, y = pt.random.normal(1, rng=rng, return_next_rng=True)
 
-            rng = pytensor.shared(np.random.default_rng(), name="rng")
-            x = pt.random.normal(rng=rng)
-            y = pt.random.normal(rng=rng)
+        # No warnings if only one variable is used
+        assert compile([], [x])
+        assert compile([], [y])
 
-            # No warnings if only one variable is used
-            assert compile_pymc([], [x])
-            assert compile_pymc([], [y])
+        user_warn_msg = "RNG Variable rng has multiple distinct clients"
+        with pytest.warns(UserWarning, match=user_warn_msg):
+            f = compile([], [x, y], random_seed=456)
+        assert f() == f()
 
-            user_warn_msg = "RNG Variable rng has multiple clients"
-            with pytest.warns(UserWarning, match=user_warn_msg):
-                f = compile_pymc([], [x, y], random_seed=456)
-            assert f() == f()
+        # The user can provide an explicit update, but we will still issue a warning
+        with pytest.warns(UserWarning, match=user_warn_msg):
+            f = compile([], [x, y], updates={rng: y.owner.outputs[0]}, random_seed=456)
+        assert f() != f()
 
-            # The user can provide an explicit update, but we will still issue a warning
-            with pytest.warns(UserWarning, match=user_warn_msg):
-                f = compile_pymc([], [x, y], updates={rng: y.owner.outputs[0]}, random_seed=456)
-            assert f() != f()
+    @pytest.mark.filterwarnings("error")
+    def test_duplicated_client_nodes(self):
+        """Test compile_pymc can handle duplicated (mergeable) RV updates."""
+        rng = pytensor.shared(np.random.default_rng(1))
+        _, x = pt.random.normal(rng=rng, return_next_rng=True)
+        y = x.owner.clone().default_output()
 
-            # Same with default update
-            rng.default_update = x.owner.outputs[0]
-            with pytest.warns(UserWarning, match=user_warn_msg):
-                f = compile_pymc([], [x, y], updates={rng: y.owner.outputs[0]}, random_seed=456)
-            assert f() != f()
+        fn = compile([], [x, y], random_seed=1)
+        res_x1, res_y1 = fn()
+        assert res_x1 == res_y1
+        res_x2, res_y2 = fn()
+        assert res_x2 == res_y2
+        assert res_x1 != res_x2
 
     def test_nested_updates(self):
         rng = pytensor.shared(np.random.default_rng())
@@ -510,12 +495,12 @@ class TestCompilePyMC:
 
         collect_default_updates(inputs=[], outputs=[x, y, z]) == {rng: next_rng3}
 
-        fn = compile_pymc([], [x, y, z], random_seed=514)
-        assert not set(list(np.array(fn()))) & set(list(np.array(fn())))
+        fn = compile([], [x, y, z], random_seed=514)
+        assert not set(np.array(fn())) & set(np.array(fn()))
 
         # A local myopic rule (as PyMC used before, would not work properly)
         fn = pytensor.function([], [x, y, z], updates={rng: next_rng1})
-        assert set(list(np.array(fn()))) & set(list(np.array(fn())))
+        assert set(np.array(fn())) & set(np.array(fn()))
 
     def test_collect_default_updates_must_be_shared(self):
         shared_rng = pytensor.shared(np.random.default_rng())
@@ -533,22 +518,21 @@ class TestCompilePyMC:
     def test_scan_updates(self):
         def step_with_update(x, rng):
             next_rng, x = pm.Normal.dist(x, rng=rng).owner.outputs
-            return x, {rng: next_rng}
+            return x, next_rng
 
         def step_wo_update(x, rng):
             return step_with_update(x, rng)[0]
 
         rng = pytensor.shared(np.random.default_rng())
 
-        xs, next_rng = scan(
+        xs = scan(
             fn=step_wo_update,
             outputs_info=[pt.zeros(())],
             non_sequences=[rng],
             n_steps=10,
             name="test_scan",
+            return_updates=False,
         )
-
-        assert not next_rng
 
         with pytest.raises(
             ValueError,
@@ -558,31 +542,70 @@ class TestCompilePyMC:
 
         ys, next_rng = scan(
             fn=step_with_update,
-            outputs_info=[pt.zeros(())],
-            non_sequences=[rng],
+            outputs_info=[pt.zeros(()), rng],
             n_steps=10,
+            return_updates=False,
         )
 
-        assert collect_default_updates([ys]) == {rng: next(iter(next_rng.values()))}
+        assert collect_default_updates([ys]) == {rng: next_rng}
 
-        fn = compile_pymc([], ys, random_seed=1)
+        fn = compile([], ys, random_seed=1)
         assert not (set(fn()) & set(fn()))
 
     def test_op_from_graph_updates(self):
         rng = pytensor.shared(np.random.default_rng())
         next_rng_, x_ = pt.random.normal(size=(10,), rng=rng).owner.outputs
 
-        x = OpFromGraph([], [x_])()
+        x = OpFromGraph([rng], [x_])(rng)
         with pytest.raises(
             ValueError,
             match="No update found for at least one RNG used in OpFromGraph Op",
         ):
             collect_default_updates([x])
 
-        next_rng, x = OpFromGraph([], [next_rng_, x_])()
+        next_rng, x = OpFromGraph([rng], [next_rng_, x_])(rng)
         assert collect_default_updates([x]) == {rng: next_rng}
-        fn = compile_pymc([], x, random_seed=1)
+        fn = compile([], x, random_seed=1)
         assert not (set(fn()) & set(fn()))
+
+    def test_unused_ofg_rng(self):
+        rng = pytensor.shared(np.random.default_rng())
+        next_rng, x = pt.random.normal(rng=rng).owner.outputs
+        ofg1 = OpFromGraph([rng], [next_rng, x])
+        ofg2 = OpFromGraph([rng, x], [x + 1])
+
+        next_rng, x = ofg1(rng)
+        y = ofg2(rng, x)
+
+        # In all these cases the update should be the same
+        assert collect_default_updates([x]) == {rng: next_rng}
+        assert collect_default_updates([y]) == {rng: next_rng}
+        assert collect_default_updates([x, y]) == {rng: next_rng}
+
+
+class TestResolveBackendCompileKwargs:
+    def test_backend_materializes_as_mode(self):
+        out = resolve_backend_compile_kwargs("numba", None)
+        assert isinstance(out["mode"], pytensor.compile.Mode)
+
+    def test_passthrough_when_backend_none(self):
+        assert resolve_backend_compile_kwargs(None, None) == {}
+        assert resolve_backend_compile_kwargs(None, {"profile": True}) == {"profile": True}
+
+    def test_does_not_mutate_caller(self):
+        original = {"profile": True}
+        resolve_backend_compile_kwargs("numba", original)
+        assert original == {"profile": True}
+
+    def test_raises_when_backend_conflicts_with_mode(self):
+        with pytest.raises(ValueError, match="Can only define one of"):
+            resolve_backend_compile_kwargs("numba", {"mode": "FAST_RUN"})
+
+    def test_backend_c_aliases_cvm(self):
+        out = resolve_backend_compile_kwargs("c", None)
+        linker = out["mode"].linker
+        assert isinstance(linker, VMLinker)
+        assert linker.use_cloop is True
 
 
 def test_replace_rng_nodes():
@@ -624,43 +647,47 @@ def test_reseed_rngs():
 
     bit_generators = [default_rng(sub_seed) for sub_seed in np.random.SeedSequence(seed).spawn(2)]
 
-    rngs = [
-        pytensor.shared(rng_type(default_rng()))
-        for rng_type in (np.random.Generator, np.random.RandomState)
-    ]
+    rngs = [pytensor.shared(np.random.Generator(default_rng())) for _ in range(2)]
     for rng, bit_generator in zip(rngs, bit_generators):
-        if isinstance(rng, RandomStateSharedVariable):
-            assert rng.get_value()._bit_generator.state != bit_generator.state
-        else:
-            assert rng.get_value().bit_generator.state != bit_generator.state
+        assert rng.get_value().bit_generator.state != bit_generator.state
 
     reseed_rngs(rngs, seed)
     for rng, bit_generator in zip(rngs, bit_generators):
-        if isinstance(rng, RandomStateSharedVariable):
-            assert rng.get_value()._bit_generator.state == bit_generator.state
-        else:
-            assert rng.get_value().bit_generator.state == bit_generator.state
+        assert rng.get_value().bit_generator.state == bit_generator.state
 
 
-def test_constant_fold():
-    x = pt.random.normal(size=(5,))
-    y = pt.arange(x.size)
+class TestConstantFold:
+    def test_constant_fold(self):
+        x = pt.random.normal(size=(5,))
+        y = pt.arange(x.size)
 
-    res = constant_fold((y, y.shape))
-    assert np.array_equal(res[0], np.arange(5))
-    assert tuple(res[1]) == (5,)
+        res = constant_fold((y, y.shape))
+        assert np.array_equal(res[0], np.arange(5))
+        assert tuple(res[1]) == (5,)
 
+    def test_constant_fold_raises(self):
+        size = pytensor.shared(5)
+        x = pt.random.normal(size=(size,))
+        y = pt.arange(x.size)
 
-def test_constant_fold_raises():
-    size = pytensor.shared(5)
-    x = pt.random.normal(size=(size,))
-    y = pt.arange(x.size)
+        with pytest.raises(NotConstantValueError):
+            constant_fold((y, y.shape))
 
-    with pytest.raises(NotConstantValueError):
-        constant_fold((y, y.shape))
+        res = constant_fold((y, y.shape), raise_not_constant=False)
+        assert tuple(res[1].eval()) == (5,)
 
-    res = constant_fold((y, y.shape), raise_not_constant=False)
-    assert tuple(res[1].eval()) == (5,)
+    def test_inputs_preserved(self):
+        # Make sure constant_folded graph depends on original graph inputs (not copies)
+        # Regression test for #7387
+        a = pt.scalar("a", dtype="int")
+        out = pt.empty((a,))
+        (out_shape,) = constant_fold((out.shape[0],), raise_not_constant=False)
+        assert out_shape is a
+
+    def test_constant_fold_alloc(self):
+        # By default, Alloc outputs cannot be constant folded
+        x = pt.alloc(pt.arange(5), 2, 5)
+        np.testing.assert_allclose(constant_fold([x])[0], np.broadcast_to(np.arange(5), (2, 5)))
 
 
 def test_replace_vars_in_graphs():
@@ -742,3 +769,85 @@ def test_hessian_sign_change_warning(func):
         res_neg = func(f, vars=[x])
     res = func(f, vars=[x], negate_output=False)
     assert equal_computations([res_neg], [-res])
+
+
+def test_point_func(capsys):
+    x, y = pt.vectors("x", "y")
+    outs = x * 2 + y**2
+    f = compile([x, y], outs)
+
+    point_f = PointFunc(f)
+    np.testing.assert_allclose(point_f({"y": [3], "x": [2]}), [4 + 9])
+
+    # Check we can access other methods of the wrapped pytensor function
+    dprint_res = point_f.dprint(file="str")
+    expected_dprint_res = point_f.f.dprint(file="str")
+    assert dprint_res == expected_dprint_res
+
+    point_f.dprint(print_shape=True)
+    captured = capsys.readouterr()
+
+    # The shape=(?,) arises because the inputs are dvector. This checks that the dprint works, and the print_shape
+    # kwargs was correctly forwarded
+    assert "shape=(?,)" in captured.out
+
+
+def test_pickle_point_func():
+    """
+    Regression test for https://github.com/pymc-devs/pymc/issues/7857
+    """
+    import cloudpickle
+
+    x, y = pt.vectors("x", "y")
+    outs = x * 2 + y**2
+    f = compile([x, y], outs)
+
+    point_f = PointFunc(f)
+    point_f_pickled = cloudpickle.dumps(point_f)
+    point_f_unpickled = cloudpickle.loads(point_f_pickled)
+
+    # Check that the function survived the round-trip
+    np.testing.assert_allclose(
+        point_f_unpickled({"y": [3], "x": [2]}), point_f({"y": [3], "x": [2]})
+    )
+
+
+def test_rewrite_pregrad_inner_graphs():
+    """`rewrite_pregrad` must reach the inner graph of `Scan` and `OpFromGraph` nodes.
+
+    Regression test for https://github.com/pymc-devs/pymc-extras/issues/720
+    """
+
+    def naive_logsumexp(x, axis=None):
+        return pt.log(pt.sum(pt.exp(x), axis=axis))
+
+    logP = pt.matrix("logP")
+    init = pt.vector("init")
+    n_steps = pt.scalar("n_steps", dtype=int)
+    alphas = scan(
+        lambda alpha, logP: 2.0 + naive_logsumexp(alpha[:, None] + logP, axis=0),
+        outputs_info=[init],
+        non_sequences=[logP],
+        n_steps=n_steps,
+        return_updates=False,
+    )
+    cost = naive_logsumexp(alphas)
+    # Test stabilization can go inside an OpFromGraph as well
+    cost_ofg = OpFromGraph([logP, init, n_steps], [cost])(logP, init, n_steps)
+
+    dcost_naive_ofg = pt.grad(cost_ofg, logP)
+    dcost_stable_ofg = pt.grad(rewrite_pregrad(cost_ofg), logP)
+
+    dcost_naive_fn = pytensor.function([logP, init, n_steps], dcost_naive_ofg)
+    dcost_stable_fn = pytensor.function([logP, init, n_steps], dcost_stable_ofg)
+    point = {
+        "logP": np.log([[0.95, 0.05], [0.15, 0.85]]),
+        "init": np.log([0.8, 0.2]),
+    }
+    # Sanity check that before overflow results are similar
+    np.testing.assert_allclose(
+        dcost_naive_fn(**point, n_steps=100),
+        dcost_stable_fn(**point, n_steps=100),
+    )
+    assert not np.isfinite(dcost_naive_fn(**point, n_steps=1000)).all(), "Test lost sensitivity"
+    assert np.isfinite(dcost_stable_fn(**point, n_steps=1000)).all()

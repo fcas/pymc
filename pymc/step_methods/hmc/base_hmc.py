@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -22,18 +22,24 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
-from pymc.blocking import DictToArrayBijection, RaveledVars, StatsType
+from pymc.blocking import DictToArrayBijection, PointType, RaveledVars, StatsType
 from pymc.exceptions import SamplingError
 from pymc.model import Point, modelcontext
 from pymc.pytensorf import floatX
 from pymc.stats.convergence import SamplerWarning, WarningType
-from pymc.step_methods import step_sizes
 from pymc.step_methods.arraystep import GradientSharedStep
+from pymc.step_methods.compound import StepMethodState
 from pymc.step_methods.hmc import integration
 from pymc.step_methods.hmc.integration import IntegrationError, State
-from pymc.step_methods.hmc.quadpotential import QuadPotentialDiagAdapt, quad_potential
+from pymc.step_methods.hmc.quadpotential import (
+    PotentialState,
+    QuadPotentialDiagAdapt,
+    quad_potential,
+)
+from pymc.step_methods.state import dataclass_state
+from pymc.step_methods.step_sizes import DualAverageAdaptation, StepSizeState
 from pymc.tuning import guess_scaling
-from pymc.util import get_value_vars_from_user_vars
+from pymc.util import RandomGenerator, get_value_vars_from_user_vars
 
 logger = logging.getLogger(__name__)
 
@@ -52,20 +58,36 @@ class HMCStepData(NamedTuple):
     stats: dict[str, Any]
 
 
+@dataclass_state
+class BaseHMCState(StepMethodState):
+    adapt_step_size: bool
+    Emax: float
+    iter_count: int
+    step_size: np.ndarray
+    step_adapt: StepSizeState
+    target_accept: float
+    tune: bool
+    potential: PotentialState
+    _num_divs_sample: int
+
+
 class BaseHMC(GradientSharedStep):
     """Superclass to implement Hamiltonian/hybrid monte carlo."""
 
     integrator: integration.CpuLeapfrogIntegrator
     default_blocked = True
 
+    _state_class = BaseHMCState
+
     def __init__(
         self,
         vars=None,
+        *,
         scaling=None,
         step_scale=0.25,
         is_cov=False,
         model=None,
-        blocked=True,
+        blocked: bool = True,
         potential=None,
         dtype=None,
         Emax=1000,
@@ -75,6 +97,8 @@ class BaseHMC(GradientSharedStep):
         t0=10,
         adapt_step_size=True,
         step_rand=None,
+        rng=None,
+        initial_point: PointType | None = None,
         **pytensor_kwargs,
     ):
         """Set up Hamiltonian samplers with common structures.
@@ -98,6 +122,14 @@ class BaseHMC(GradientSharedStep):
         potential: Potential, optional
             An object that represents the Hamiltonian with methods `velocity`,
             `energy`, and `random` methods.
+        rng: RandomGenerator
+            An object that can produce be used to produce the step method's
+            :py:class:`~numpy.random.Generator` object. Refer to
+            :py:func:`pymc.util.get_random_generator` for more information. The
+            resulting ``Generator`` object will be used stored in the step method
+            and used for accept/reject random selections. The step's ``Generator``
+            will also be used to spawn independent ``Generators`` that will be used
+            by the ``potential`` attribute.
         **pytensor_kwargs: passed to PyTensor functions
         """
         self._model = modelcontext(model)
@@ -106,32 +138,35 @@ class BaseHMC(GradientSharedStep):
             vars = self._model.continuous_value_vars
         else:
             vars = get_value_vars_from_user_vars(vars, self._model)
-        super().__init__(vars, blocked=blocked, model=self._model, dtype=dtype, **pytensor_kwargs)
+        super().__init__(
+            vars,
+            blocked=blocked,
+            model=self._model,
+            dtype=dtype,
+            rng=rng,
+            initial_point=initial_point,
+            **pytensor_kwargs,
+        )
 
         self.adapt_step_size = adapt_step_size
         self.Emax = Emax
         self.iter_count = 0
 
-        # We're using the initial/test point to determine the (initial) step
-        # size.
-        # XXX: If the dimensions of these terms change, the step size
-        # dimension-scaling should change as well, no?
-        test_point = self._model.initial_point()
+        if initial_point is None:
+            initial_point = self._model.initial_point()
 
-        nuts_vars = [test_point[v.name] for v in vars]
+        nuts_vars = [initial_point[v.name] for v in vars]
         size = sum(v.size for v in nuts_vars)
 
         self.step_size = step_scale / (size**0.25)
-        self.step_adapt = step_sizes.DualAverageAdaptation(
-            self.step_size, target_accept, gamma, k, t0
-        )
+        self.step_adapt = DualAverageAdaptation(self.step_size, target_accept, gamma, k, t0)
         self.target_accept = target_accept
         self.tune = True
 
         if scaling is None and potential is None:
             mean = floatX(np.zeros(size))
             var = floatX(np.ones(size))
-            potential = QuadPotentialDiagAdapt(size, mean, var, 10)
+            potential = QuadPotentialDiagAdapt(size, mean, var, 10, rng=self.rng.spawn(1)[0])
 
         if isinstance(scaling, dict):
             point = Point(scaling, model=self._model)
@@ -143,12 +178,13 @@ class BaseHMC(GradientSharedStep):
         if potential is not None:
             self.potential = potential
         else:
-            self.potential = quad_potential(scaling, is_cov)
+            self.potential = quad_potential(scaling, is_cov, rng=self.rng.spawn(1)[0])
 
         self.integrator = integration.CpuLeapfrogIntegrator(self.potential, self._logp_dlogp_func)
 
         self._step_rand = step_rand
         self._num_divs_sample = 0
+        self.divergences = 0
 
     @abstractmethod
     def _hamiltonian_step(self, start, p0, step_size) -> HMCStepData:
@@ -163,8 +199,6 @@ class BaseHMC(GradientSharedStep):
         process_start = time.process_time()
 
         p0 = self.potential.random()
-        p0 = RaveledVars(p0, q0.point_map_info)
-
         start = self.integrator.compute_state(q0, p0)
 
         warning: SamplerWarning | None = None
@@ -178,7 +212,8 @@ class BaseHMC(GradientSharedStep):
             self.potential.raise_ok(q0.point_map_info)
             message_energy = (
                 "Bad initial energy, check any log probabilities that "
-                f"are inf or -inf, nan or very small:\n{error_logp}"
+                f"are inf or -inf, nan or very small:\n{error_logp}\n."
+                f"Try model.debug() to identify parametrization problems."
             )
             warning = SamplerWarning(
                 WarningType.BAD_ENERGY,
@@ -193,15 +228,15 @@ class BaseHMC(GradientSharedStep):
         self.step_size = step_size
 
         if self._step_rand is not None:
-            step_size = self._step_rand(step_size)
+            step_size = self._step_rand(step_size, rng=self.rng)
 
-        hmc_step = self._hamiltonian_step(start, p0.data, step_size)
+        hmc_step = self._hamiltonian_step(start, p0, step_size)
 
         perf_end = time.perf_counter()
         process_end = time.process_time()
 
         self.step_adapt.update(hmc_step.accept_stat, adapt_step)
-        self.potential.update(hmc_step.end.q, hmc_step.end.q_grad, self.tune)
+        self.potential.update(hmc_step.end.q.data, hmc_step.end.q_grad, self.tune)
         if hmc_step.divergence_info:
             info = hmc_step.divergence_info
             point = None
@@ -232,11 +267,14 @@ class BaseHMC(GradientSharedStep):
                 divergence_info=info_store,
             )
 
+        diverging = bool(hmc_step.divergence_info)
+        if not self.tune:
+            self.divergences += diverging
         self.iter_count += 1
 
         stats: dict[str, Any] = {
-            "tune": self.tune,
-            "diverging": bool(hmc_step.divergence_info),
+            "diverging": diverging,
+            "divergences": self.divergences,
             "perf_counter_diff": perf_end - perf_start,
             "process_time_diff": process_end - process_start,
             "perf_counter_start": perf_start,
@@ -254,5 +292,11 @@ class BaseHMC(GradientSharedStep):
         self.reset(start=None)
 
     def reset(self, start=None):
+        self.iter_count = 0
+        self.divergences = 0
         self.tune = True
         self.potential.reset()
+
+    def setup_chain(self, rng: RandomGenerator, tune: int, draws: int) -> None:
+        super().setup_chain(rng, tune, draws)
+        self.potential.set_rng(self.rng.spawn(1)[0])

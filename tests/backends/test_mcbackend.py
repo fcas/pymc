@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,13 +13,15 @@
 #   limitations under the License.
 import logging
 
-import arviz
 import numpy as np
 import pytest
+import xarray as xr
 
 import pymc as pm
 
 from pymc.backends import init_traces
+from pymc.pytensorf import make_shared_replacements
+from pymc.step_methods import CompoundStep
 from pymc.step_methods.arraystep import ArrayStepShared
 
 try:
@@ -119,7 +121,8 @@ def test_make_runmeta_and_point_fn(simple_model):
     assert not vars["vector"].is_deterministic
     assert not vars["vector_interval__"].is_deterministic
     assert vars["matrix"].is_deterministic
-    assert len(rmeta.sample_stats) == len(step.stats_dtypes[0])
+    assert "in_warmup" in {s.name for s in rmeta.sample_stats}
+    assert len(rmeta.sample_stats) == len(step.stats_dtypes[0]) + 1
 
     with simple_model:
         step = pm.NUTS()
@@ -183,7 +186,7 @@ class TestChainRecordAdapter:
             b = pm.Uniform("b")
             c = pm.Deterministic("c", a + b)
             ip = pmodel.initial_point()
-            shared = pm.make_shared_replacements(ip, [a, b], pmodel)
+            shared = make_shared_replacements(ip, [a, b], pmodel)
             run, traces = init_traces(
                 backend=mcb.NumPyBackend(),
                 chains=1,
@@ -200,8 +203,8 @@ class TestChainRecordAdapter:
         rng = np.random.RandomState(2023)
         for i in range(N):
             draw = {"a": rng.normal(), "b_interval__": rng.normal()}
-            stats = [dict(tune=(i <= 5), s1=i, accepted=bool(rng.randint(0, 2)))]
-            cra.record(draw, stats)
+            stats = [{"tune": (i <= 5), "s1": i, "accepted": bool(rng.randint(0, 2))}]
+            cra.record(draw, stats, in_warmup=i <= 5)
 
         # Check final state of the chain
         assert len(cra) == N
@@ -230,15 +233,15 @@ class TestChainRecordAdapter:
             b = pm.Uniform("b")
             c = pm.Deterministic("c", a + b)
             ip = pmodel.initial_point()
-            shared_a = pm.make_shared_replacements(ip, [a], pmodel)
-            shared_b = pm.make_shared_replacements(ip, [b], pmodel)
+            shared_a = make_shared_replacements(ip, [a], pmodel)
+            shared_b = make_shared_replacements(ip, [b], pmodel)
             stepA = ToyStepper([a], shared_a)
             stepB = ToyStepperWithOtherStats([b], shared_b)
             run, traces = init_traces(
                 backend=mcb.NumPyBackend(),
                 chains=1,
                 expected_length=N,
-                step=pm.CompoundStep([stepA, stepB]),
+                step=CompoundStep([stepA, stepB]),
                 initial_point=pmodel.initial_point(),
                 model=pmodel,
             )
@@ -251,10 +254,10 @@ class TestChainRecordAdapter:
             tune = i <= 5
             draw = {"a": rng.normal(), "b_interval__": rng.normal()}
             stats = [
-                dict(tune=tune, s1=i, accepted=bool(rng.randint(0, 2))),
-                dict(tune=tune, s2=i, accepted=bool(rng.randint(0, 2))),
+                {"tune": tune, "s1": i, "accepted": bool(rng.randint(0, 2))},
+                {"tune": tune, "s2": i, "accepted": bool(rng.randint(0, 2))},
             ]
-            cra.record(draw, stats)
+            cra.record(draw, stats, in_warmup=tune)
 
         # The 'accepted' stat was emitted by both samplers
         assert cra.get_sampler_stats("accepted", sampler_idx=None).shape == (N, 2)
@@ -293,13 +296,20 @@ class TestMcBackendSampling:
                 return_inferencedata=False,
             )
         assert isinstance(mtrace, pm.backends.base.MultiTrace)
-        tune = mtrace._straces[0].get_sampler_stats("tune")
-        assert isinstance(tune, np.ndarray)
+        in_warmup = mtrace.get_sampler_stats("in_warmup", combine=False, squeeze=False)
+        assert len(in_warmup) == 3
+        assert all(s.dtype == np.dtype(bool) for s in in_warmup)
+
+        # Warmup is tracked by the sampling driver and persisted via `in_warmup`.
         if discard_warmup:
-            assert tune.shape == (7, 3)
+            assert len(mtrace) == 7
+            assert all(len(s) == 7 for s in in_warmup)
+            assert all(not np.any(s) for s in in_warmup)
         else:
-            assert tune.shape == (12, 3)
-        pass
+            assert len(mtrace) == 12
+            assert all(len(s) == 12 for s in in_warmup)
+            assert all(np.all(s[:5]) for s in in_warmup)
+            assert all(not np.any(s[5:]) for s in in_warmup)
 
     @pytest.mark.parametrize("cores", [1, 3])
     def test_return_inferencedata(self, simple_model, cores):
@@ -312,7 +322,7 @@ class TestMcBackendSampling:
                 chains=3,
                 discard_tuned_samples=False,
             )
-        assert isinstance(idata, arviz.InferenceData)
+        assert isinstance(idata, xr.DataTree)
         assert idata.warmup_posterior.sizes["draw"] == 5
         assert idata.posterior.sizes["draw"] == 7
         pass

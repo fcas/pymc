@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 #   limitations under the License.
 
 """
-Created on Mar 7, 2011
+Created on Mar 7, 2011.
 
 @author: johnsalvatier
 """
@@ -22,6 +22,7 @@ import warnings
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import field
 from enum import IntEnum, unique
 from typing import Any
 
@@ -31,6 +32,13 @@ from pytensor.graph.basic import Variable
 
 from pymc.blocking import PointType, StatDtype, StatsDict, StatShape, StatsType
 from pymc.model import modelcontext
+from pymc.step_methods.state import (
+    DataClassState,
+    RandomGeneratorState,
+    WithSamplingState,
+    dataclass_state,
+)
+from pymc.util import RandomGenerator, get_random_generator
 
 __all__ = ("Competence", "CompoundStep")
 
@@ -38,6 +46,7 @@ __all__ = ("Competence", "CompoundStep")
 @unique
 class Competence(IntEnum):
     """Enum for characterizing competence classes of step methods.
+
     Values include:
     0: INCOMPATIBLE
     1: COMPATIBLE
@@ -56,7 +65,7 @@ def infer_warn_stats_info(
     sds: dict[str, tuple[StatDtype, StatShape]],
     stepname: str,
 ) -> tuple[list[dict[str, StatDtype]], dict[str, tuple[StatDtype, StatShape]]]:
-    """Helper function to get `stats_dtypes` and `stats_dtypes_shapes` from either of them."""
+    """Get `stats_dtypes` and `stats_dtypes_shapes` from either of them."""
     # Avoid side-effects on the original lists/dicts
     stats_dtypes = [d.copy() for d in stats_dtypes]
     sds = sds.copy()
@@ -83,10 +92,20 @@ def infer_warn_stats_info(
                 sds[sname] = (dtype, None)
     elif sds:
         stats_dtypes.append({sname: dtype for sname, (dtype, _) in sds.items()})
+
+    # Even when a step method does not emit any stats, downstream components still assume one stats "slot" per step method. represent that with a single empty dict.
+    if not stats_dtypes:
+        stats_dtypes.append({})
     return stats_dtypes, sds
 
 
-class BlockedStep(ABC):
+@dataclass_state
+class StepMethodState(DataClassState):
+    var_names: list[str] = field(metadata={"tensor_name": True, "frozen": True})
+    rng: RandomGeneratorState
+
+
+class BlockedStep(ABC, WithSamplingState):
     stats_dtypes: list[dict[str, type]] = []
     """A list containing <=1 dictionary that maps stat names to dtypes.
 
@@ -106,6 +125,9 @@ class BlockedStep(ABC):
 
     vars: list[Variable] = []
     """Variables that the step method is assigned to."""
+
+    default_tune_steps: int | None = None
+    """Number of default tuning steps this step method needs."""
 
     def __new__(cls, *args, **kwargs):
         blocked = kwargs.get("blocked")
@@ -143,15 +165,18 @@ class BlockedStep(ABC):
             # In this case we create a separate sampler for each var
             # and append them to a CompoundStep
             steps = []
-            for var in vars:
+            rngs = get_random_generator(kwargs.pop("rng", None)).spawn(len(vars))
+            for var, rng in zip(vars, rngs):
                 step = super().__new__(cls)
                 step.stats_dtypes = stats_dtypes
                 step.stats_dtypes_shapes = stats_dtypes_shapes
                 # If we don't return the instance we have to manually
                 # call __init__
-                step.__init__([var], *args, **kwargs)
+                _kwargs = kwargs.copy()
+                _kwargs["rng"] = rng
+                step.__init__([var], *args, **_kwargs)
                 # Hack for creating the class correctly when unpickling.
-                step.__newargs = ([var], *args), kwargs
+                step.__newargs = ([var], *args), _kwargs
                 steps.append(step)
 
             return CompoundStep(steps)
@@ -162,6 +187,20 @@ class BlockedStep(ABC):
             # Hack for creating the class correctly when unpickling.
             step.__newargs = (vars, *args), kwargs
             return step
+
+    @staticmethod
+    def _progressbar_config(n_chains=1):
+        columns = []
+        stats = {}
+
+        return columns, stats
+
+    @staticmethod
+    def _make_progressbar_update_functions():
+        def update_stats(step_stats):
+            return step_stats
+
+        return (update_stats,)
 
     # Hack for creating the class correctly when unpickling.
     def __getnewargs_ex__(self):
@@ -191,6 +230,25 @@ class BlockedStep(ABC):
         if hasattr(self, "tune"):
             self.tune = False
 
+    def setup_chain(self, rng: RandomGenerator, tune: int, draws: int) -> None:
+        """Prepare the step method for sampling one chain.
+
+        Called once per chain, right before that chain starts sampling.
+        The same instance may be reused across chains, so implementations
+        must reset any per-chain state instead of accumulating it.
+
+        Parameters
+        ----------
+        rng : RandomGenerator
+            Random generator for this chain.
+        tune : int
+            Number of tuning iterations. Zero if the chain does not tune.
+        draws : int
+            Number of iterations after tuning. The chain runs ``tune + draws``
+            iterations in total.
+        """
+        self.rng = get_random_generator(rng, copy=False)
+
 
 def flat_statname(sampler_idx: int, sname: str) -> str:
     """Get the flat-stats name for a samplers stat."""
@@ -200,7 +258,7 @@ def flat_statname(sampler_idx: int, sname: str) -> str:
 def get_stats_dtypes_shapes_from_steps(
     steps: Iterable[BlockedStep],
 ) -> dict[str, tuple[StatDtype, StatShape]]:
-    """Combines stats dtype shape dictionaries from multiple step methods.
+    """Combine stats dtype shape dictionaries from multiple step methods.
 
     In the resulting stats dict, each sampler stat is prefixed by `sampler_#__`.
     """
@@ -211,9 +269,18 @@ def get_stats_dtypes_shapes_from_steps(
     return result
 
 
-class CompoundStep:
-    """Step method composed of a list of several other step
-    methods applied in sequence."""
+@dataclass_state
+class CompoundStepState(DataClassState):
+    methods: list[StepMethodState]
+
+    def __init__(self, methods: list[StepMethodState]):
+        self.methods = methods
+
+
+class CompoundStep(WithSamplingState):
+    """Step method composed of a list of several other step methods applied in sequence."""
+
+    _state_class = CompoundStepState
 
     def __init__(self, methods):
         self.methods = list(methods)
@@ -246,9 +313,54 @@ class CompoundStep:
             if hasattr(method, "reset_tuning"):
                 method.reset_tuning()
 
+    def setup_chain(self, rng: RandomGenerator, tune: int, draws: int) -> None:
+        """Set up each wrapped step method with its own spawned random generator."""
+        rngs = get_random_generator(rng, copy=False).spawn(len(self.methods))
+        for method, method_rng in zip(self.methods, rngs):
+            method.setup_chain(method_rng, tune, draws)
+
+    @property
+    def sampling_state(self) -> DataClassState:
+        return CompoundStepState(methods=[method.sampling_state for method in self.methods])
+
+    @sampling_state.setter
+    def sampling_state(self, state: DataClassState):
+        assert isinstance(state, self._state_class), (
+            f"Invalid sampling state class {type(state)}. Expected {self._state_class}"
+        )
+        for method, state_method in zip(self.methods, state.methods):
+            method.sampling_state = state_method
+
     @property
     def vars(self) -> list[Variable]:
         return [var for method in self.methods for var in method.vars]
+
+    def _progressbar_config(self, n_chains=1):
+        from functools import reduce
+
+        column_lists, stat_dict_list = zip(
+            *[method._progressbar_config(n_chains) for method in self.methods]
+        )
+        flat_list = reduce(lambda left_list, right_list: left_list + right_list, column_lists)
+
+        columns = []
+        headers = []
+
+        for col in flat_list:
+            name = col.get_table_column().header
+            if name not in headers:
+                headers.append(name)
+                columns.append(col)
+
+        stats = reduce(lambda left_dict, right_dict: left_dict | right_dict, stat_dict_list)
+
+        return columns, stats
+
+    def _make_progressbar_update_functions(self):
+        update_functions = []
+        for method in self.methods:
+            update_functions.extend(method._make_progressbar_update_functions())
+        return update_functions
 
 
 def flatten_steps(step: BlockedStep | CompoundStep) -> list[BlockedStep]:
@@ -261,16 +373,6 @@ def flatten_steps(step: BlockedStep | CompoundStep) -> list[BlockedStep]:
     for sm in step.methods:
         steps += flatten_steps(sm)
     return steps
-
-
-def check_step_emits_tune(step: CompoundStep | BlockedStep):
-    if isinstance(step, BlockedStep) and "tune" not in step.stats_dtypes_shapes:
-        raise TypeError(f"{type(step)} does not emit the required 'tune' stat.")
-    elif isinstance(step, CompoundStep):
-        for sstep in step.methods:
-            if "tune" not in sstep.stats_dtypes_shapes:
-                raise TypeError(f"{type(sstep)} does not emit the required 'tune' stat.")
-    return
 
 
 class StatsBijection:

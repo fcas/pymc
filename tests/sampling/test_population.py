@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -65,7 +65,7 @@ class TestPopulationSamplers:
                     cores=1,
                     draws=20,
                     tune=0,
-                    step=DEMetropolis(),
+                    step=step,
                     compute_convergence_checks=False,
                 )
                 samples = idata.posterior["x"].values[:, 5]
@@ -82,7 +82,7 @@ class TestPopulationSamplers:
                     cores=4,
                     draws=20,
                     tune=0,
-                    step=DEMetropolis(),
+                    step=step,
                     compute_convergence_checks=False,
                 )
                 samples = idata.posterior["x"].values[:, 5]

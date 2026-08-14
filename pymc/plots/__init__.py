@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,52 +19,21 @@ Plots are delegated to the ArviZ library, a general purpose library for
 See https://arviz-devs.github.io/arviz/ for details on plots.
 """
 
-import functools
 import sys
-import warnings
-
-import arviz as az
-
-# Makes this module as identical to arviz.plots as possible
-for attr in az.plots.__all__:
-    obj = getattr(az.plots, attr)
-    if not attr.startswith("__"):
-        setattr(sys.modules[__name__], attr, obj)
 
 
-def alias_deprecation(func, alias: str):
-    original = func.__name__
+def __getattr__(name):
+    import arviz_plots as azp
 
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        raise FutureWarning(
-            f"The function `{alias}` from PyMC was an alias for `{original}` from ArviZ. "
-            "It was removed in PyMC 4.0. "
-            f"Switch to `pymc.{original}` or `arviz.{original}`."
-        )
-
-    return wrapped
+    try:
+        value = getattr(azp, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    setattr(sys.modules[__name__], name, value)
+    return value
 
 
-# Aliases of ArviZ functions
-autocorrplot = alias_deprecation(az.plot_autocorr, alias="autocorrplot")
-forestplot = alias_deprecation(az.plot_forest, alias="forestplot")
-kdeplot = alias_deprecation(az.plot_kde, alias="kdeplot")
-energyplot = alias_deprecation(az.plot_energy, alias="energyplot")
-densityplot = alias_deprecation(az.plot_density, alias="densityplot")
-pairplot = alias_deprecation(az.plot_pair, alias="pairplot")
-traceplot = alias_deprecation(az.plot_trace, alias="traceplot")
-compareplot = alias_deprecation(az.plot_compare, alias="compareplot")
+def __dir__():
+    import arviz_plots as azp
 
-
-__all__ = (
-    *az.plots.__all__,
-    "autocorrplot",
-    "compareplot",
-    "forestplot",
-    "kdeplot",
-    "traceplot",
-    "energyplot",
-    "densityplot",
-    "pairplot",
-)
+    return [attr for attr in dir(azp) if not attr.startswith("_")]

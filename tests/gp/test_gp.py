@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,84 +17,12 @@ from operator import add
 
 import numpy as np
 import numpy.testing as npt
+import pytensor.tensor as pt
 import pytest
 
 import pymc as pm
 
 from pymc.math import cartesian
-
-
-class TestSigmaParams:
-    def setup_method(self):
-        """Common setup."""
-        self.x = np.linspace(-5, 5, 30)[:, None]
-        self.xu = np.linspace(-5, 5, 10)[:, None]
-        self.y = np.random.normal(0.25 * self.x, 0.1)
-
-        with pm.Model() as self.model:
-            cov_func = pm.gp.cov.Linear(1, c=0.0)
-            c = pm.Normal("c", mu=20.0, sigma=100.0)
-            mean_func = pm.gp.mean.Constant(c)
-            self.gp = self.gp_implementation(mean_func=mean_func, cov_func=cov_func)
-            self.sigma = pm.HalfNormal("sigma", sigma=100)
-
-
-class TestMarginalSigmaParams(TestSigmaParams):
-    R"""Tests for the deprecation warnings and raising ValueError."""
-
-    gp_implementation = pm.gp.Marginal
-
-    def test_catch_warnings(self):
-        """Warning from using the old noise parameter."""
-        with self.model:
-            with pytest.warns(FutureWarning):
-                self.gp.marginal_likelihood("lik_noise", X=self.x, y=self.y, noise=self.sigma)
-
-            with pytest.warns(FutureWarning):
-                self.gp.conditional(
-                    "cond_noise",
-                    Xnew=self.x,
-                    given={
-                        "noise": self.sigma,
-                    },
-                )
-
-    def test_raise_value_error(self):
-        """Either both or neither parameter is specified."""
-        with self.model:
-            with pytest.raises(ValueError):
-                self.gp.marginal_likelihood(
-                    "like_both", X=self.x, y=self.y, noise=self.sigma, sigma=self.sigma
-                )
-
-            with pytest.raises(ValueError):
-                self.gp.marginal_likelihood("like_neither", X=self.x, y=self.y)
-
-
-class TestMarginalApproxSigmaParams(TestSigmaParams):
-    R"""Tests for the deprecation warnings and raising ValueError"""
-
-    gp_implementation = pm.gp.MarginalApprox
-
-    @pytest.mark.xfail(reason="Possible shape problem, see #6366")
-    def test_catch_warnings(self):
-        """Warning from using the old noise parameter."""
-        with self.model:
-            with pytest.warns(FutureWarning):
-                self.gp.marginal_likelihood(
-                    "lik_noise", X=self.x, Xu=self.xu, y=self.y, noise=self.sigma
-                )
-
-    def test_raise_value_error(self):
-        """Either both or neither parameter is specified."""
-        with self.model:
-            with pytest.raises(ValueError):
-                self.gp.marginal_likelihood(
-                    "like_both", X=self.x, Xu=self.xu, y=self.y, noise=self.sigma, sigma=self.sigma
-                )
-
-            with pytest.raises(ValueError):
-                self.gp.marginal_likelihood("like_neither", X=self.x, Xu=self.xu, y=self.y)
 
 
 class TestMarginalVsMarginalApprox:
@@ -177,7 +105,11 @@ class TestGPAdditive:
             pm.gp.cov.ExpQuad(3, [0.1, 0.2, 0.3]),
             pm.gp.cov.ExpQuad(3, [0.1, 0.2, 0.3]),
         )
-        self.means = (pm.gp.mean.Constant(0.5), pm.gp.mean.Constant(0.5), pm.gp.mean.Constant(0.5))
+        self.means = (
+            pm.gp.mean.Constant(0.5),
+            pm.gp.mean.Constant(0.5),
+            pm.gp.mean.Constant(0.5),
+        )
 
     def testAdditiveMarginal(self):
         with pm.Model() as model1:
@@ -199,7 +131,9 @@ class TestGPAdditive:
 
         with model1:
             fp1 = gpsum.conditional(
-                "fp1", self.Xnew, given={"X": self.X, "y": self.y, "sigma": self.noise, "gp": gpsum}
+                "fp1",
+                self.Xnew,
+                given={"X": self.X, "y": self.y, "sigma": self.noise, "gp": gpsum},
             )
         with model2:
             fp2 = gptot.conditional("fp2", self.Xnew)
@@ -230,7 +164,9 @@ class TestGPAdditive:
 
         with pm.Model() as model2:
             gptot = pm.gp.MarginalApprox(
-                mean_func=reduce(add, self.means), cov_func=reduce(add, self.covs), approx=approx
+                mean_func=reduce(add, self.means),
+                cov_func=reduce(add, self.covs),
+                approx=approx,
             )
             fsum = gptot.marginal_likelihood("f", self.X, Xu, self.y, sigma=sigma)
             model2_logp = model2.compile_logp()({})
@@ -352,6 +288,53 @@ class TestMarginalVsLatent:
         latent_logp = model.compile_logp()({"f_rotated_": y_rotated, "p": self.pnew})
         npt.assert_allclose(latent_logp, self.logp, atol=5)
 
+    def testLatentMultioutput(self):
+        n_outputs = 2
+        rng = np.random.default_rng(123)
+        X = rng.standard_normal((20, 3))
+        y = rng.standard_normal((n_outputs, 20))
+        Xnew = rng.standard_normal((30, 3))
+        pnew = rng.standard_normal((n_outputs, 30))
+        with pm.Model() as latent_model:
+            cov_func = pm.gp.cov.ExpQuad(3, [0.1, 0.2, 0.3])
+            mean_func = pm.gp.mean.Constant(0.5)
+            latent_gp = pm.gp.Latent(mean_func=mean_func, cov_func=cov_func)
+            latent_f = latent_gp.prior("f", X, n_outputs=n_outputs, reparameterize=True)
+            latent_p = latent_gp.conditional("p", Xnew)
+
+        with pm.Model() as marginal_model:
+            cov_func = pm.gp.cov.ExpQuad(3, [0.1, 0.2, 0.3])
+            mean_func = pm.gp.mean.Constant(0.5)
+            marginal_gp = pm.gp.Marginal(mean_func=mean_func, cov_func=cov_func)
+            marginal_f = marginal_gp.marginal_likelihood("f", X, y, sigma=0.0)
+            marginal_p = marginal_gp.conditional("p", Xnew)
+
+        assert tuple(latent_f.shape.eval()) == tuple(marginal_f.shape.eval()) == y.shape
+        assert tuple(latent_p.shape.eval()) == tuple(marginal_p.shape.eval()) == pnew.shape
+
+        chol = np.linalg.cholesky(cov_func(X).eval())
+        v = np.linalg.solve(chol, (y - 0.5).T)
+        A = np.linalg.solve(chol, cov_func(X, Xnew).eval()).T
+        mu_cond = mean_func(Xnew).eval() + (A @ v).T
+        cov_cond = cov_func(Xnew, Xnew).eval() - A @ A.T
+
+        with pm.Model() as numpy_model:
+            numpy_p = pm.MvNormal.dist(mu=pt.as_tensor(mu_cond), cov=pt.as_tensor(cov_cond))
+
+        latent_rv_logp = pm.logp(latent_p, pnew)
+        marginal_rv_logp = pm.logp(marginal_p, pnew)
+        numpy_rv_logp = pm.logp(numpy_p, pnew)
+
+        assert (
+            latent_rv_logp.shape.eval()
+            == marginal_rv_logp.shape.eval()
+            == numpy_rv_logp.shape.eval()
+        )
+
+        npt.assert_allclose(latent_rv_logp.eval({"f": y}), marginal_rv_logp.eval(), rtol=1e-4)
+        npt.assert_allclose(latent_rv_logp.eval({"f": y}), numpy_rv_logp.eval(), rtol=1e-4)
+        npt.assert_allclose(marginal_rv_logp.eval(), numpy_rv_logp.eval(), rtol=1e-4)
+
 
 class TestTP:
     R"""
@@ -471,6 +454,15 @@ class TestLatentKron:
         with pytest.raises(ValueError):
             gp.prior("f", Xs=[np.linspace(0, 1, 7)[:, None], np.linspace(0, 1, 5)[:, None]])
 
+    def testLatentKronDims(self):
+        """Test that LatentKron.prior correctly passes dims to the Deterministic GP variable."""
+        n_points = int(np.prod([len(X) for X in self.Xs]))
+        with pm.Model(coords={"gp_dim": np.arange(n_points)}) as kron_model:
+            kron_gp = pm.gp.LatentKron(mean_func=self.mean, cov_funcs=self.cov_funcs)
+            f = kron_gp.prior("f", self.Xs, dims="gp_dim")
+        assert f.name == "f"
+        assert kron_model.named_vars_to_dims["f"] == ("gp_dim",)
+
 
 class TestMarginalKron:
     """
@@ -486,7 +478,11 @@ class TestMarginalKron:
         self.X = cartesian(*self.Xs)
         self.N = np.prod([len(X) for X in self.Xs])
         self.y = np.random.randn(self.N) * 0.1
-        self.Xnews = (np.random.randn(5, 1), np.random.randn(5, 1), np.random.randn(5, 1))
+        self.Xnews = (
+            np.random.randn(5, 1),
+            np.random.randn(5, 1),
+            np.random.randn(5, 1),
+        )
         self.Xnew = np.concatenate(self.Xnews, axis=1)
         self.sigma = 0.2
         self.pnew = np.random.randn(len(self.Xnew))

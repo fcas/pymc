@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@ import warnings
 import numpy as np
 import pytensor
 import pytest
+
+from numba.core.errors import NumbaPerformanceWarning, NumbaWarning
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -51,4 +53,6 @@ def seeded_test():
 def fail_on_warning():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
+        warnings.filterwarnings("ignore", ".*Cannot cache.*", NumbaWarning)
         yield

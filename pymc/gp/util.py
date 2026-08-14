@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -20,14 +20,9 @@ import pytensor.tensor as pt
 from pytensor.compile import SharedVariable
 from pytensor.graph import ancestors
 from pytensor.tensor.variable import TensorConstant
-from scipy.cluster.vq import kmeans
 
-# Avoid circular dependency when importing modelcontext
-from pymc.distributions.distribution import Distribution
-from pymc.model import modelcontext
-from pymc.pytensorf import compile_pymc
-
-_ = Distribution
+from pymc.model.core import modelcontext
+from pymc.pytensorf import compile
 
 JITTER_DEFAULT = 1e-6
 
@@ -35,6 +30,7 @@ JITTER_DEFAULT = 1e-6
 def replace_with_values(vars_needed, replacements=None, model=None):
     R"""
     Replace random variable nodes in the graph with values given by the replacements dict.
+
     Uses untransformed versions of the inputs, performs some basic input validation.
 
     Parameters
@@ -58,7 +54,7 @@ def replace_with_values(vars_needed, replacements=None, model=None):
     if len(inputs) == 0:
         return tuple(v.eval() for v in vars_needed)
 
-    fn = compile_pymc(
+    fn = compile(
         inputs,
         vars_needed,
         allow_input_downcast=True,
@@ -80,7 +76,7 @@ def replace_with_values(vars_needed, replacements=None, model=None):
 
 def stabilize(K, jitter=JITTER_DEFAULT):
     R"""
-    Adds small diagonal to a covariance matrix.
+    Add small diagonal to a covariance matrix.
 
     Often the matrices calculated from covariance functions, `K = cov_func(X)`
     do not appear numerically to be positive semi-definite.  Adding a small
@@ -98,8 +94,7 @@ def stabilize(K, jitter=JITTER_DEFAULT):
 
 def kmeans_inducing_points(n_inducing, X, **kmeans_kwargs):
     R"""
-    Use the K-means algorithm to initialize the locations `X` for the inducing
-    points `fu`.
+    Use the K-means algorithm to initialize the locations `X` for the inducing points `fu`.
 
     Parameters
     ----------
@@ -130,12 +125,14 @@ def kmeans_inducing_points(n_inducing, X, **kmeans_kwargs):
     if "k_or_guess" in kmeans_kwargs:
         warnings.warn("Use `n_inducing` to set the `k_or_guess` parameter instead.")
 
+    from scipy.cluster.vq import kmeans
+
     Xu, distortion = kmeans(Xw, k_or_guess=n_inducing, **kmeans_kwargs)
     return Xu * scaling
 
 
 def conditioned_vars(varnames):
-    """Decorator for validating attrs that are conditioned on."""
+    """Validate attrs that are conditioned on."""
 
     def gp_wrapper(cls):
         def make_getter(name):
@@ -143,9 +140,8 @@ def conditioned_vars(varnames):
                 value = getattr(self, name, None)
                 if value is None:
                     raise AttributeError(
-                        "'{}' not set.  Provide as argument "
-                        "to condition, or call 'prior' "
-                        "first".format(name.lstrip("_"))
+                        f"'{name.lstrip('_')}' not set.  Provide as argument "
+                        "to condition, or call 'prior' first"
                     )
                 else:
                     return value
@@ -179,34 +175,34 @@ def plot_gp_dist(
     fill_kwargs=None,
     samples_kwargs=None,
 ):
-    """A helper function for plotting 1D GP posteriors from trace
+    """Plot 1D GP posteriors from trace.
 
     Parameters
     ----------
-    ax: axes
+    ax : axes
         Matplotlib axes.
-    samples: numpy.ndarray
+    samples : numpy.ndarray
         Array of S posterior predictive sample from a GP.
         Expected shape: (S, X)
-    x: numpy.ndarray
+    x : numpy.ndarray
         Grid of X values corresponding to the samples.
         Expected shape: (X,) or (X, 1), or (1, X)
-    plot_samples: bool
+    plot_samples : bool
         Plot the GP samples along with posterior (defaults True).
-    palette: str
+    palette : str
         Palette for coloring output (defaults to "Reds").
-    fill_alpha: float
+    fill_alpha : float
         Alpha value for the posterior interval fill (defaults to 0.8).
-    samples_alpha: float
+    samples_alpha : float
         Alpha value for the sample lines (defaults to 0.1).
-    fill_kwargs: dict
+    fill_kwargs : dict
         Additional arguments for posterior interval fill (fill_between).
-    samples_kwargs: dict
+    samples_kwargs : dict
         Additional keyword arguments for samples plot.
 
     Returns
     -------
-    ax: Matplotlib axes
+    ax : Matplotlib axes
     """
     import matplotlib.pyplot as plt
 
@@ -216,8 +212,7 @@ def plot_gp_dist(
         samples_kwargs = {}
     if np.any(np.isnan(samples)):
         warnings.warn(
-            "There are `nan` entries in the [samples] arguments. "
-            "The plot will not contain a band!",
+            "There are `nan` entries in the [samples] arguments. The plot will not contain a band!",
             UserWarning,
         )
 

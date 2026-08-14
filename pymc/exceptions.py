@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,12 +13,18 @@
 #   limitations under the License.
 
 __all__ = [
-    "SamplingError",
-    "IncorrectArgumentsError",
-    "TraceDirectoryError",
+    "BlockModelAccessError",
+    "DtypeError",
+    "ImplicitFreezeWarning",
     "ImputationWarning",
-    "ShapeWarning",
+    "IncorrectArgumentsError",
+    "NotConstantValueError",
+    "SamplingError",
     "ShapeError",
+    "ShapeWarning",
+    "TraceDirectoryError",
+    "TruncationError",
+    "UndefinedMomentException",
 ]
 
 
@@ -31,13 +37,24 @@ class IncorrectArgumentsError(ValueError):
 
 
 class TraceDirectoryError(ValueError):
-    """Error from trying to load a trace from an incorrectly-structured directory,"""
+    """Error from trying to load a trace from an incorrectly-structured directory."""
 
     pass
 
 
 class ImputationWarning(UserWarning):
     """Warning that there are missing values that will be imputed."""
+
+    pass
+
+
+class ImplicitFreezeWarning(UserWarning):
+    """Warning that trace values are being reused instead of resampled.
+
+    Emitted by ``sample_posterior_predictive`` when a trace basic RV has a
+    volatile upstream (changed Data/coords or a resampled ancestor) but is not
+    listed in ``sample_vars``.
+    """
 
     pass
 
@@ -77,7 +94,7 @@ class DtypeError(TypeError):
 
 
 class TruncationError(RuntimeError):
-    """Exception for errors generated from truncated graphs"""
+    """Exception for errors generated from truncated graphs."""
 
 
 class NotConstantValueError(ValueError):
@@ -85,4 +102,8 @@ class NotConstantValueError(ValueError):
 
 
 class BlockModelAccessError(RuntimeError):
+    pass
+
+
+class UndefinedMomentException(Exception):
     pass

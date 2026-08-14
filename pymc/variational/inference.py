@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -23,7 +23,8 @@ from rich.progress import Progress, TextColumn, track
 
 import pymc as pm
 
-from pymc.util import CustomProgress, default_progress_theme
+from pymc.progress_bar import CustomProgress, default_progress_theme
+from pymc.pytensorf import resolve_backend_compile_kwargs
 from pymc.variational import test_functions
 from pymc.variational.approximations import Empirical, FullRank, MeanField
 from pymc.variational.operators import KL, KSD
@@ -32,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ADVI",
-    "FullRankADVI",
-    "SVGD",
     "ASVGD",
-    "Inference",
+    "SVGD",
+    "FullRankADVI",
     "ImplicitGradient",
+    "Inference",
     "KLqp",
     "fit",
 ]
@@ -45,7 +46,7 @@ State = collections.namedtuple("State", "i,step,callbacks,score")
 
 
 class Inference:
-    r"""**Base class for Variational Inference**
+    r"""**Base class for Variational Inference**.
 
     Communicates Operator, Approximation and Test Function to build Objective Function
 
@@ -72,19 +73,29 @@ class Inference:
             score = returns_loss
         elif score and not returns_loss:
             warnings.warn(
-                "method `fit` got `score == True` but %s "
-                "does not return loss. Ignoring `score` argument" % self.objective.op
+                f"method `fit` got `score == True` but {self.objective.op} "
+                "does not return loss. Ignoring `score` argument"
             )
             score = False
         else:
             pass
         return score
 
-    def run_profiling(self, n=1000, score=None, **kwargs):
+    def run_profiling(self, n=1000, score=None, *, backend=None, **kwargs):
         score = self._maybe_score(score)
-        fn_kwargs = kwargs.pop("fn_kwargs", dict())
-        fn_kwargs["profile"] = True
-        step_func = self.objective.step_function(score=score, fn_kwargs=fn_kwargs, **kwargs)
+        if "fn_kwargs" in kwargs:
+            warnings.warn(
+                "fn_kwargs is deprecated, please use compile_kwargs instead", DeprecationWarning
+            )
+            compile_kwargs = kwargs.pop("fn_kwargs")
+        else:
+            compile_kwargs = kwargs.pop("compile_kwargs", None)
+
+        compile_kwargs = resolve_backend_compile_kwargs(backend, compile_kwargs)
+        compile_kwargs["profile"] = True
+        step_func = self.objective.step_function(
+            score=score, compile_kwargs=compile_kwargs, **kwargs
+        )
         try:
             for _ in track(range(n)):
                 step_func()
@@ -99,9 +110,12 @@ class Inference:
         callbacks=None,
         progressbar=True,
         progressbar_theme=default_progress_theme,
+        *,
+        backend=None,
+        include_transformed=False,
         **kwargs,
     ):
-        """Perform Operator Variational Inference
+        """Perform Operator Variational Inference.
 
         Parameters
         ----------
@@ -115,6 +129,8 @@ class Inference:
             whether to show progressbar or not
         progressbar_theme : Theme
             Custom theme for the progress bar
+        backend : str, optional
+            Which computational backend to use. Recommended to be one of "numba", "c", and "jax".
 
         Other Parameters
         ----------------
@@ -134,8 +150,9 @@ class Inference:
             Add custom updates to resulting updates
         total_grad_norm_constraint: `float`
             Bounds gradient norm, prevents exploding gradient problem
-        fn_kwargs: `dict`
-            Add kwargs to pytensor.function (e.g. `{'profile': True}`)
+        compile_kwargs: `dict`
+            Add kwargs to pytensor.function (e.g. `{'profile': True}`).
+            ``compile_kwargs["mode"]`` cannot be combined with ``backend``.
         more_replacements: `dict`
             Apply custom replacements before calculating gradients
 
@@ -146,6 +163,9 @@ class Inference:
         if callbacks is None:
             callbacks = []
         score = self._maybe_score(score)
+        kwargs["compile_kwargs"] = resolve_backend_compile_kwargs(
+            backend, kwargs.get("compile_kwargs")
+        )
         step_func = self.objective.step_function(score=score, **kwargs)
 
         if score:
@@ -160,6 +180,9 @@ class Inference:
         # hack to allow pm.fit() access to loss hist
         self.approx.hist = self.hist
         self.state = state
+
+        for group in self.approx.groups:
+            group.include_transformed = include_transformed
 
         return self.approx
 
@@ -206,7 +229,7 @@ class Inference:
 
     def _iterate_with_loss(self, s, n, step_func, progressbar, progressbar_theme, callbacks):
         def _infmean(input_array):
-            """Return the mean of the finite values of the array"""
+            """Return the mean of the finite values of the array."""
             input_array = input_array[np.isfinite(input_array)].astype("float64")
             if len(input_array) == 0:
                 return np.nan
@@ -285,7 +308,7 @@ class Inference:
         return State(i + s, step=step_func, callbacks=callbacks, score=True)
 
     def refine(self, n, progressbar=True, progressbar_theme=default_progress_theme):
-        """Refine the solution using the last compiled step function"""
+        """Refine the solution using the last compiled step function."""
         if self.state is None:
             raise TypeError("Need to call `.fit` first")
         i, step, callbacks, score = self.state
@@ -299,7 +322,7 @@ class Inference:
 
 
 class KLqp(Inference):
-    r"""**Kullback Leibler Divergence Inference**
+    r"""**Kullback Leibler Divergence Inference**.
 
     General approach to fit Approximations that define :math:`logq`
     by maximizing ELBO (Evidence Lower Bound). In some cases
@@ -328,7 +351,7 @@ class KLqp(Inference):
 
 
 class ADVI(KLqp):
-    r"""**Automatic Differentiation Variational Inference (ADVI)**
+    r"""**Automatic Differentiation Variational Inference (ADVI)**.
 
     This class implements the meanfield ADVI, where the variational
     posterior distribution is assumed to be spherical Gaussian without
@@ -472,7 +495,7 @@ class ADVI(KLqp):
 
 
 class FullRankADVI(KLqp):
-    r"""**Full Rank Automatic Differentiation Variational Inference (ADVI)**
+    r"""**Full Rank Automatic Differentiation Variational Inference (ADVI)**.
 
     Parameters
     ----------
@@ -501,7 +524,7 @@ class FullRankADVI(KLqp):
 
 
 class ImplicitGradient(Inference):
-    """**Implicit Gradient for Variational Inference**
+    """**Implicit Gradient for Variational Inference**.
 
     **not suggested to use**
 
@@ -517,7 +540,7 @@ class ImplicitGradient(Inference):
 
 
 class SVGD(ImplicitGradient):
-    r"""**Stein Variational Gradient Descent**
+    r"""**Stein Variational Gradient Descent**.
 
     This inference is based on Kernelized Stein Discrepancy
     it's main idea is to move initial noisy particles so that
@@ -585,7 +608,7 @@ class SVGD(ImplicitGradient):
 
 
 class ASVGD(ImplicitGradient):
-    r"""**Amortized Stein Variational Gradient Descent**
+    r"""**Amortized Stein Variational Gradient Descent**.
 
     **not suggested to use**
 
@@ -677,9 +700,12 @@ def fit(
     start=None,
     start_sigma=None,
     inf_kwargs=None,
+    *,
+    backend=None,
+    include_transformed=False,
     **kwargs,
 ):
-    r"""Handy shortcut for using inference methods in functional way
+    r"""Handy shortcut for using inference methods in functional way.
 
     Parameters
     ----------
@@ -702,6 +728,12 @@ def fit(
         starting point for inference
     start_sigma: `dict[str, np.ndarray]`
         starting standard deviation for inference, only available for method 'advi'
+    backend: str, optional
+        Which computational backend to use. Recommended to be one of "numba", "c", and "jax".
+    include_transformed: bool, default False
+        If True, the :meth:`~Approximation.state` will also include the
+        unconstrained (transformed) variables alongside the original model
+        variables, similar to ``pm.sample(idata_kwargs={'include_transformed': True})``.
 
     Other Parameters
     ----------------
@@ -729,8 +761,9 @@ def fit(
         Add custom updates to resulting updates
     total_grad_norm_constraint: `float`
         Bounds gradient norm, prevents exploding gradient problem
-    fn_kwargs: `dict`
-        Add kwargs to pytensor.function (e.g. `{'profile': True}`)
+    compile_kwargs: `dict`
+        Add kwargs to pytensor.function (e.g. `{'profile': True}`).
+        ``compile_kwargs["mode"]`` cannot be combined with ``backend``.
     more_replacements: `dict`
         Apply custom replacements before calculating gradients
 
@@ -739,7 +772,7 @@ def fit(
     :class:`Approximation`
     """
     if inf_kwargs is None:
-        inf_kwargs = dict()
+        inf_kwargs = {}
     else:
         inf_kwargs = inf_kwargs.copy()
     if random_seed is not None:
@@ -752,7 +785,7 @@ def fit(
         inf_kwargs["start_sigma"] = start_sigma
     if model is None:
         model = pm.modelcontext(model)
-    _select = dict(advi=ADVI, fullrank_advi=FullRankADVI, svgd=SVGD, asvgd=ASVGD)
+    _select = {"advi": ADVI, "fullrank_advi": FullRankADVI, "svgd": SVGD, "asvgd": ASVGD}
     if isinstance(method, str):
         method = method.lower()
         if method in _select:
@@ -763,4 +796,4 @@ def fit(
         inference = method
     else:
         raise TypeError(f"method should be one of {set(_select.keys())} or Inference instance")
-    return inference.fit(n, **kwargs)
+    return inference.fit(n, backend=backend, include_transformed=include_transformed, **kwargs)

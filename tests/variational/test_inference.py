@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,18 +16,19 @@ import io
 import operator
 import warnings
 
-from contextlib import nullcontext
-
 import cloudpickle
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
 import pytest
 
+from xarray import Dataset
+
 import pymc as pm
 import pymc.variational.opvi as opvi
 
-from pymc.pytensorf import intX
+from pymc.model.transform.basic import remove_minibatched_nodes
+from pymc.pytensorf import floatX
 from pymc.variational.inference import ADVI, ASVGD, SVGD, FullRankADVI
 from pymc.variational.opvi import NotImplementedInference
 from tests import models
@@ -37,8 +38,8 @@ pytestmark = pytest.mark.usefixtures("strict_float32", "seeded_test", "fail_on_w
 
 @pytest.mark.parametrize("score", [True, False])
 def test_fit_with_nans(score):
-    X_mean = pm.floatX(np.linspace(0, 10, 10))
-    y = pm.floatX(np.random.normal(X_mean * 4, 0.05))
+    X_mean = floatX(np.linspace(0, 10, 10))
+    y = floatX(np.random.normal(X_mean * 4, 0.05))
     with pm.Model():
         inp = pm.Normal("X", X_mean, size=X_mean.shape)
         coef = pm.Normal("b", 4.0)
@@ -66,15 +67,15 @@ def simple_model_data(use_minibatch):
     mu_post = (n * np.mean(data) / sigma**2 + mu0 / sigma0**2) / d
     if use_minibatch:
         data = pm.Minibatch(data, batch_size=128)
-    return dict(
-        n=n,
-        data=data,
-        mu_post=mu_post,
-        d=d,
-        mu0=mu0,
-        sigma0=sigma0,
-        sigma=sigma,
-    )
+    return {
+        "n": n,
+        "data": data,
+        "mu_post": mu_post,
+        "d": d,
+        "mu0": mu0,
+        "sigma0": sigma0,
+        "sigma": sigma,
+    }
 
 
 @pytest.fixture
@@ -99,10 +100,10 @@ def simple_model(simple_model_data):
 @pytest.fixture(
     scope="module",
     params=[
-        dict(cls=ADVI, init=dict()),
-        dict(cls=FullRankADVI, init=dict()),
-        dict(cls=SVGD, init=dict(n_particles=500, jitter=1)),
-        dict(cls=ASVGD, init=dict(temperature=1.0)),
+        {"cls": ADVI, "init": {}},
+        {"cls": FullRankADVI, "init": {}},
+        {"cls": SVGD, "init": {"n_particles": 500, "jitter": 1}},
+        {"cls": ASVGD, "init": {"temperature": 1.0}},
     ],
     ids=["ADVI", "FullRankADVI", "SVGD", "ASVGD"],
 )
@@ -132,24 +133,40 @@ def inference(inference_spec, simple_model):
 @pytest.fixture(scope="function")
 def fit_kwargs(inference, use_minibatch):
     _select = {
-        (ADVI, "full"): dict(obj_optimizer=pm.adagrad_window(learning_rate=0.02, n_win=50), n=5000),
-        (ADVI, "mini"): dict(
-            obj_optimizer=pm.adagrad_window(learning_rate=0.01, n_win=50), n=12000
-        ),
-        (FullRankADVI, "full"): dict(
-            obj_optimizer=pm.adagrad_window(learning_rate=0.015, n_win=50), n=6000
-        ),
-        (FullRankADVI, "mini"): dict(
-            obj_optimizer=pm.adagrad_window(learning_rate=0.007, n_win=50), n=12000
-        ),
-        (SVGD, "full"): dict(obj_optimizer=pm.adagrad_window(learning_rate=0.075, n_win=7), n=300),
-        (SVGD, "mini"): dict(obj_optimizer=pm.adagrad_window(learning_rate=0.075, n_win=7), n=300),
-        (ASVGD, "full"): dict(
-            obj_optimizer=pm.adagrad_window(learning_rate=0.07, n_win=10), n=500, obj_n_mc=300
-        ),
-        (ASVGD, "mini"): dict(
-            obj_optimizer=pm.adagrad_window(learning_rate=0.07, n_win=10), n=500, obj_n_mc=300
-        ),
+        (ADVI, "full"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.02, n_win=50),
+            "n": 5000,
+        },
+        (ADVI, "mini"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.01, n_win=50),
+            "n": 12000,
+        },
+        (FullRankADVI, "full"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.015, n_win=50),
+            "n": 6000,
+        },
+        (FullRankADVI, "mini"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.007, n_win=50),
+            "n": 12000,
+        },
+        (SVGD, "full"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.075, n_win=7),
+            "n": 300,
+        },
+        (SVGD, "mini"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.075, n_win=7),
+            "n": 300,
+        },
+        (ASVGD, "full"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.07, n_win=10),
+            "n": 500,
+            "obj_n_mc": 300,
+        },
+        (ASVGD, "mini"): {
+            "obj_optimizer": pm.adagrad_window(learning_rate=0.07, n_win=10),
+            "n": 500,
+            "obj_n_mc": 300,
+        },
     }
     if use_minibatch:
         key = "mini"
@@ -162,23 +179,9 @@ def fit_kwargs(inference, use_minibatch):
     return _select[(type(inference), key)]
 
 
-def test_fit_oo(inference, fit_kwargs, simple_model_data):
-    # Minibatch data can't be extracted into the `observed_data` group in the final InferenceData
-    if getattr(simple_model_data["data"], "name", "").startswith("minibatch"):
-        warn_ctxt = pytest.warns(
-            UserWarning, match="Could not extract data from symbolic observation"
-        )
-    else:
-        warn_ctxt = nullcontext()
-
-    with warn_ctxt:
-        with warnings.catch_warnings():
-            # Related to https://github.com/arviz-devs/arviz/issues/2327
-            warnings.filterwarnings(
-                "ignore", message="datetime.datetime.utcnow()", category=DeprecationWarning
-            )
-
-            trace = inference.fit(**fit_kwargs).sample(10000)
+def test_fit_oo(inference, fit_kwargs, simple_model, simple_model_data):
+    with simple_model:
+        trace = inference.fit(**fit_kwargs).sample(10000)
     mu_post = simple_model_data["mu_post"]
     d = simple_model_data["d"]
     np.testing.assert_allclose(np.mean(trace.posterior["mu"]), mu_post, rtol=0.05)
@@ -190,10 +193,10 @@ def test_fit_start(inference_spec, simple_model):
     mu_sigma_init = 13
 
     with simple_model:
-        if type(inference_spec()) == ASVGD:
+        if type(inference_spec()) is ASVGD:
             # ASVGD doesn't support the start argument
             return
-        elif type(inference_spec()) == ADVI:
+        elif type(inference_spec()) is ADVI:
             has_start_sigma = True
         else:
             has_start_sigma = False
@@ -204,33 +207,11 @@ def test_fit_start(inference_spec, simple_model):
     with simple_model:
         inference = inference_spec(**kw)
 
-    # Minibatch data can't be extracted into the `observed_data` group in the final InferenceData
-    [observed_value] = [simple_model.rvs_to_values[obs] for obs in simple_model.observed_RVs]
-
-    # We can`t use pytest.warns here because after version 8.0 it`s still check for warning when
-    # exception raised and test failed instead being skipped
-    warning_raised = False
-    expected_warning = observed_value.name.startswith("minibatch")
-    with warnings.catch_warnings(record=True) as record:
-        warnings.simplefilter("always")
-        with warnings.catch_warnings():
-            # Related to https://github.com/arviz-devs/arviz/issues/2327
-            warnings.filterwarnings(
-                "ignore", message="datetime.datetime.utcnow()", category=DeprecationWarning
-            )
-
-            try:
-                trace = inference.fit(n=0).sample(10000)
-            except NotImplementedInference as e:
-                pytest.skip(str(e))
-
-    if expected_warning:
-        assert len(record) > 0
-        for item in record:
-            assert issubclass(item.category, UserWarning)
-            assert "Could not extract data from symbolic observation" in str(item.message)
-    if not expected_warning:
-        assert not record
+    try:
+        with simple_model:
+            trace = inference.fit(n=0).sample(10000)
+    except NotImplementedInference as e:
+        pytest.skip(str(e))
 
     np.testing.assert_allclose(np.mean(trace.posterior["mu"]), mu_init, rtol=0.05)
     if has_start_sigma:
@@ -240,16 +221,16 @@ def test_fit_start(inference_spec, simple_model):
 @pytest.mark.parametrize(
     ["method", "kwargs", "error"],
     [
-        ("undefined", dict(), KeyError),
-        (1, dict(), TypeError),
-        ("advi", dict(total_grad_norm_constraint=10), None),
-        ("fullrank_advi", dict(), None),
-        ("svgd", dict(total_grad_norm_constraint=10), None),
-        ("svgd", dict(start={}), None),
+        ("undefined", {}, KeyError),
+        (1, {}, TypeError),
+        ("advi", {"total_grad_norm_constraint": 10}, None),
+        ("fullrank_advi", {}, None),
+        ("svgd", {"total_grad_norm_constraint": 10}, None),
+        ("svgd", {"start": {}}, None),
         # start argument is not allowed for ASVGD
-        ("asvgd", dict(start={}, total_grad_norm_constraint=10), TypeError),
-        ("asvgd", dict(total_grad_norm_constraint=10), None),
-        ("nfvi=bad-formula", dict(start={}), KeyError),
+        ("asvgd", {"start": {}, "total_grad_norm_constraint": 10}, TypeError),
+        ("asvgd", {"total_grad_norm_constraint": 10}, None),
+        ("nfvi=bad-formula", {"start": {}}, KeyError),
     ],
 )
 def test_fit_fn_text(method, kwargs, error):
@@ -278,7 +259,7 @@ def test_profile(inference):
 @pytest.fixture(scope="module")
 def binomial_model():
     n_samples = 100
-    xs = intX(np.random.binomial(n=1, p=0.2, size=n_samples))
+    xs = np.random.binomial(n=1, p=0.2, size=n_samples)
     with pm.Model() as model:
         p = pm.Beta("p", alpha=1, beta=1)
         pm.Binomial("xs", n=1, p=p, observed=xs)
@@ -303,8 +284,6 @@ def test_replacements(binomial_model_inference):
         for n in pytensor.graph.ancestors([p_s])
         if n.owner
     ), "p should be replaced"
-    if pytensor.config.compute_test_value != "off":
-        assert p_s.tag.test_value.shape == p_t.tag.test_value.shape
     sampled = [pm.draw(p_s) for _ in range(100)]
     assert any(map(operator.ne, sampled[1:], sampled[:-1]))  # stochastic
     p_z = approx.sample_node(p_t, deterministic=False, size=10)
@@ -333,13 +312,10 @@ def test_replacements(binomial_model_inference):
 
 def test_sample_replacements(binomial_model_inference):
     i = pt.iscalar()
-    i.tag.test_value = 1
     approx = binomial_model_inference.approx
     p = approx.model.p
     p_t = p**3
     p_s = approx.sample_node(p_t, size=100)
-    if pytensor.config.compute_test_value != "off":
-        assert p_s.tag.test_value.shape == (100, *p_t.tag.test_value.shape)
     sampled = p_s.eval()
     assert any(map(operator.ne, sampled[1:], sampled[:-1]))  # stochastic
     assert sampled.shape[0] == 100
@@ -363,8 +339,8 @@ def test_remove_scan_op():
 
 
 def test_var_replacement():
-    X_mean = pm.floatX(np.linspace(0, 10, 10))
-    y = pm.floatX(np.random.normal(X_mean * 4, 0.05))
+    X_mean = floatX(np.linspace(0, 10, 10))
+    y = floatX(np.random.normal(X_mean * 4, 0.05))
     inp_size = pytensor.shared(np.array(10, dtype="int64"), name="inp_size")
     with pm.Model():
         inp = pm.Normal("X", X_mean, size=(inp_size,))
@@ -375,7 +351,7 @@ def test_var_replacement():
         assert advi.sample_node(mean).eval().shape == (10,)
 
         inp_size.set_value(11)
-        x_new = pm.floatX(np.linspace(0, 10, 11))
+        x_new = floatX(np.linspace(0, 10, 11))
         assert advi.sample_node(mean, more_replacements={inp: x_new}).eval().shape == (11,)
 
 
@@ -390,7 +366,7 @@ def test_clear_cache():
         assert all(len(c) == 0 for c in inference.approx._cache.values())
         new_a = cloudpickle.loads(cloudpickle.dumps(inference.approx))
         assert not hasattr(new_a, "_cache")
-        inference_new = pm.KLqp(new_a)
+        inference_new = pm.variational.KLqp(new_a)
         inference_new.fit(n=10)
         assert any(len(c) != 0 for c in inference_new.approx._cache.values())
         inference_new.approx._cache.clear()
@@ -425,17 +401,17 @@ def hierarchical_model_data():
 
     data = sigma * np.random.randn(*data_shape) + group_mu + mu
 
-    return dict(
-        group_coords=group_coords,
-        group_shape=group_shape,
-        data_coords=data_coords,
-        data_shape=data_shape,
-        mu=mu,
-        sigma_group_mu=sigma_group_mu,
-        sigma=sigma,
-        group_mu=group_mu,
-        data=data,
-    )
+    return {
+        "group_coords": group_coords,
+        "group_shape": group_shape,
+        "data_coords": data_coords,
+        "data_shape": data_shape,
+        "mu": mu,
+        "sigma_group_mu": sigma_group_mu,
+        "sigma": sigma,
+        "group_mu": group_mu,
+        "data": data,
+    }
 
 
 @pytest.fixture
@@ -472,4 +448,226 @@ def test_fit_data_coords(hierarchical_model, hierarchical_model_data):
         assert list(data["group_mu"].coords.keys()) == list(
             hierarchical_model_data["group_coords"].keys()
         )
-        assert data["mu"].shape == tuple()
+        assert data["mu"].shape == ()
+
+
+def test_sample_posterior_after_minibatch():
+    with pm.Model(coords={"obs_id": [0, 1, 2]}) as model:
+        x = pm.Data("x", [1.0, 2.0, 3.0], dims="obs_id")
+        y = pm.Data("y", [1.0, 2.0, 3.0], dims="obs_id")
+        x_mini, y_mini = pm.Minibatch(x, y, batch_size=2)
+        beta = pm.Normal("beta", 0, 10.0)
+        y_hat = pm.Deterministic("y_hat", beta * x_mini, dims="obs_id")
+        pm.Normal("obs", y_hat, np.sqrt(1e-2), observed=y_mini, total_size=3, dims="obs_id")
+        approx = pm.fit(
+            10,
+            method="advi",
+            progressbar=False,
+        )
+
+    model_post = remove_minibatched_nodes(model)
+    with model_post:
+        trace = approx.sample(500)
+
+    assert trace.posterior["beta"].shape == (1, 500)
+    assert trace.constant_data["x"].shape == (3,)
+    assert trace.observed_data["obs"].shape == (3,)
+
+    with model_post, warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Numba will use object mode", UserWarning)
+        x_test = [5, 6, 9, 12, 15]
+        pm.set_data(
+            new_data={"x": x_test, "y": [0.0] * len(x_test)},
+            coords={"obs_id": list(range(len(x_test)))},
+        )
+        y_test = pm.sample_posterior_predictive(trace, predictions=True, progressbar=False)
+
+    assert y_test.predictions["obs"].shape == (1, 500, 5)
+
+
+def test_multiple_minibatch_variables():
+    """Regression test for bug reported in
+    https://discourse.pymc.io/t/verifying-that-minibatch-is-actually-randomly-sampling/14308
+    """
+    true_weights = np.array([-5, 5] * 5)
+    feature = np.repeat(np.eye(10), 10_000, axis=0)
+    y = feature @ true_weights
+
+    with pm.Model() as model:
+        minibatch_feature, minibatch_y = pm.Minibatch(feature, y, batch_size=1)
+        weights = pm.Normal("weights", 0, 10, shape=10)
+        pm.Normal(
+            "y",
+            mu=minibatch_feature @ weights,
+            sigma=0.01,
+            observed=minibatch_y,
+            total_size=len(y),
+        )
+        mean_field = pm.fit(10_000, obj_optimizer=pm.adam(learning_rate=0.01), progressbar=False)
+    np.testing.assert_allclose(mean_field.mean.get_value(), true_weights, rtol=1e-1)
+
+
+def test_sample_outside_model_context():
+    with pm.Model() as model:
+        mu = pm.Normal("mu", 0, 1)
+
+    approx = pm.fit(10, method="advi", model=model, progressbar=False)
+    trace = approx.sample(50)
+    assert trace.posterior["mu"].shape == (1, 50)
+
+
+class TestUntransformedData:
+    def test_state_mean_field(self):
+        """ADVI state has family='mean_field', mean and std in constrained space."""
+        rng = np.random.default_rng(42)
+        with pm.Model():
+            pm.HalfNormal("sigma", sigma=5.0)
+            pm.Normal("mu", 0, 1)
+            pm.Normal("y", rng.normal(size=3), observed=rng.normal(size=3))
+            fitted = pm.fit(100, method="advi", progressbar=False, random_seed=42)
+
+        s = fitted.state
+        assert set(s.mean.keys()) == {"sigma", "mu"}
+        assert set(s.std.keys()) == {"sigma", "mu"}
+        assert s.std is not None
+        assert s.mean["sigma"].values > 0
+        assert s.std["sigma"].values > 0
+
+    def test_state_full_rank(self):
+        """FullRankADVI state has mean and std."""
+        rng = np.random.default_rng(42)
+        with pm.Model():
+            pm.HalfNormal("sigma", sigma=5.0)
+            pm.Normal("mu", 0, 1)
+            pm.Normal("y", rng.normal(size=3), observed=rng.normal(size=3))
+            fitted = pm.fit(100, method="fullrank_advi", progressbar=False, random_seed=42)
+
+        s = fitted.state
+        assert s.mean.keys() == {"sigma", "mu"}
+        assert s.std is not None
+        assert s.mean["sigma"].values > 0
+
+    def test_state_empirical_std_is_none(self):
+        """Empirical state has std=None."""
+        rng = np.random.default_rng(42)
+        with pm.Model():
+            pm.Normal("mu", 0, 1)
+            pm.Normal("y", rng.normal(size=10), observed=rng.normal(size=10))
+            inference = pm.SVGD(n_particles=50, random_seed=42)
+            fitted = inference.fit(100, progressbar=False)
+
+        s = fitted.state
+        assert s.std is None
+        assert "mu" in s.mean
+
+    def test_state_is_single_group_approx_attr(self):
+        """state is accessible from SingleGroupApproximation via __getattr__ proxy."""
+        with pm.Model():
+            pm.Normal("mu", 0, 1)
+            inference = pm.ADVI(random_seed=42)
+            fitted = inference.fit(10, progressbar=False)
+
+        s = fitted.state
+        assert "mu" in s.mean
+
+    def test_state_in_callback(self):
+        """Callbacks can access state during training."""
+        rng = np.random.default_rng(42)
+        snapshots = []
+
+        def callback(approx, losses, i):
+            s = approx.state
+            snapshots.append(
+                {
+                    "i": i,
+                    "mean": s.mean,
+                    "std": s.std,
+                }
+            )
+
+        with pm.Model():
+            pm.HalfNormal("sigma", sigma=5.0)
+            pm.Normal("mu", 0, 1)
+            pm.Normal("y", rng.normal(size=3), observed=rng.normal(size=3))
+            inference = pm.ADVI(random_seed=42)
+            fitted = inference.fit(50, callbacks=[callback], progressbar=False)
+
+        assert len(snapshots) == 50
+        for snap in snapshots:
+            assert isinstance(snap["mean"], Dataset)
+            assert set(snap["mean"].keys()) == {"sigma", "mu"}
+            assert snap["std"] is not None
+            assert set(snap["std"].keys()) == {"sigma", "mu"}
+        # The last snapshot should match the final state
+        final = fitted.state
+        np.testing.assert_allclose(
+            snapshots[-1]["mean"]["sigma"].values, final.mean["sigma"].values
+        )
+        # Parameters should have moved from their initial values
+        first_mean = snapshots[0]["mean"]["mu"].values
+        last_mean = snapshots[-1]["mean"]["mu"].values
+        assert not np.allclose(first_mean, last_mean), "parameters should change during training"
+
+    def test_state_dirichlet(self):
+        """State works with Dirichlet (simplex transform changes dimensionality)."""
+        with pm.Model():
+            pm.Dirichlet("p", a=[1, 2, 3])
+            fitted = pm.fit(50, method="advi", progressbar=False, random_seed=42)
+
+        s = fitted.state
+        # Dirichlet with K=3 has K-1=2 unconstrained dims, 3 constrained dims
+        assert "p" in s.mean
+        assert s.mean["p"].values.shape == (3,)
+        # Values should be on the simplex (sum to 1)
+        np.testing.assert_allclose(s.mean["p"].values.sum(), 1.0, atol=1e-6)
+        assert (s.mean["p"].values >= 0).all()
+        assert (s.mean["p"].values <= 1).all()
+        # std should also be in constrained space
+        assert s.std is not None
+        assert "p" in s.std
+        assert s.std["p"].values.shape == (3,)
+
+    def test_state_include_transformed(self):
+        """include_transformed=True adds unconstrained variables to state."""
+        with pm.Model():
+            pm.HalfNormal("sigma", sigma=5.0)
+            pm.Normal("mu", 0, 1)
+            fitted = pm.fit(
+                50,
+                method="advi",
+                progressbar=False,
+                random_seed=42,
+                include_transformed=True,
+            )
+
+        s = fitted.state
+        # Constrained variables always present
+        assert "sigma" in s.mean
+        assert "mu" in s.mean
+        # Unconstrained variables included when include_transformed=True
+        assert "sigma_log__" in s.mean
+        # mu has no transform, so it appears only once
+        assert list(s.mean.data_vars) == ["sigma", "mu", "sigma_log__"]
+        assert s.std is not None
+        assert "sigma_log__" in s.std
+
+    def test_state_include_transformed_dirichlet(self):
+        """include_transformed=True with Dirichlet (dimensionality-changing transform)."""
+        with pm.Model():
+            pm.Dirichlet("p", a=[1, 2, 3])
+            fitted = pm.fit(
+                50,
+                method="advi",
+                progressbar=False,
+                random_seed=42,
+                include_transformed=True,
+            )
+
+        s = fitted.state
+        # Constrained: p (shape 3, on simplex)
+        assert "p" in s.mean
+        assert s.mean["p"].values.shape == (3,)
+        np.testing.assert_allclose(s.mean["p"].values.sum(), 1.0, atol=1e-6)
+        # Unconstrained: p_simplex__ (shape 2, K-1 dims)
+        assert "p_simplex__" in s.mean
+        assert s.mean["p_simplex__"].values.shape == (2,)

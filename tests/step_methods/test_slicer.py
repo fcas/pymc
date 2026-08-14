@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,11 +12,14 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+import numpy as np
 import pytest
 
 from pymc.step_methods.slicer import Slice
 from tests import sampler_fixtures as sf
 from tests.helpers import RVsAssignmentStepsTester, StepMethodTester
+
+SEED = 20240920
 
 
 class TestSliceUniform(sf.SliceFixture, sf.UniformFixture):
@@ -27,6 +30,7 @@ class TestSliceUniform(sf.SliceFixture, sf.UniformFixture):
     min_n_eff = 5000
     rtol = 0.1
     atol = 0.05
+    step_args = {"rng": np.random.default_rng(SEED)}
 
 
 class TestStepSlicer(StepMethodTester):

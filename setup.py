@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,9 +16,9 @@
 from codecs import open
 from os.path import dirname, join, realpath
 
-from setuptools import find_packages, setup
-
 import versioneer
+
+from setuptools import find_packages, setup
 
 DESCRIPTION = "Probabilistic Programming in Python: Bayesian Modeling and Probabilistic Machine Learning with PyTensor"
 AUTHOR = "PyMC Developers"
@@ -30,9 +30,9 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: Apache Software License",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
@@ -53,6 +53,10 @@ with open(REQUIREMENTS_FILE) as f:
 
 test_reqs = ["pytest", "pytest-cov"]
 
+extras_require = {
+    "nutpie": ["nutpie>=0.16.10,<1"],
+}
+
 if __name__ == "__main__":
     setup(
         name="pymc",
@@ -70,7 +74,8 @@ if __name__ == "__main__":
         # Also see MANIFEST.in
         # package_data={'docs': ['*']},
         classifiers=classifiers,
-        python_requires=">=3.10",
+        python_requires=">=3.12",
         install_requires=install_reqs,
+        extras_require=extras_require,
         tests_require=test_reqs,
     )

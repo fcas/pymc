@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,22 +11,21 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+import re
 import warnings
 
 import numpy as np
-import pytensor.tensor as pt
 import pytest
 import xarray
 
-from arviz import InferenceData
-from arviz.tests.helpers import check_multiple_attrs
+from arviz_base.testing import check_multiple_attrs
 from numpy import ma
-from pytensor.tensor.subtensor import AdvancedIncSubtensor, AdvancedIncSubtensor1
+from pytensor.tensor.subtensor import AdvancedIncSubtensor
 
 import pymc as pm
 
 from pymc.backends.arviz import (
-    InferenceDataConverter,
+    DataTreeConverter,
     dataset_to_point_list,
     predictions_to_inference_data,
     to_inference_data,
@@ -38,6 +37,8 @@ pytestmark = pytest.mark.filterwarnings(
     "error",
     # Related to https://github.com/arviz-devs/arviz/issues/2327
     "ignore:datetime.datetime.utcnow():DeprecationWarning",
+    r"ignore::numba.NumbaPerformanceWarning",
+    r"ignore:This process .* is multi-threaded:DeprecationWarning",
 )
 
 
@@ -69,8 +70,9 @@ class TestDataPyMC:
             self.model = model
             self.obj = trace
 
+    @staticmethod
     @pytest.fixture(scope="class")
-    def data(self, eight_schools_params, draws, chains):
+    def data(eight_schools_params, draws, chains):
         with pm.Model() as model:
             mu = pm.Normal("mu", mu=0, sigma=5)
             tau = pm.HalfCauchy("tau", beta=5)
@@ -82,13 +84,14 @@ class TestDataPyMC:
                 sigma=eight_schools_params["sigma"],
                 observed=eight_schools_params["y"],
             )
-            trace = pm.sample(
-                draws,
-                chains=chains,
-                return_inferencedata=False,
-            )
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                trace = pm.sample(
+                    draws,
+                    chains=chains,
+                    return_inferencedata=False,
+                )
 
-        return self.Data(model, trace)
+        return TestDataPyMC.Data(model, trace)
 
     def get_inference_data(self, data, eight_schools_params):
         with data.model:
@@ -109,7 +112,7 @@ class TestDataPyMC:
 
     def get_predictions_inference_data(
         self, data, eight_schools_params, inplace
-    ) -> tuple[InferenceData, dict[str, np.ndarray]]:
+    ) -> tuple[xarray.DataTree, dict[str, np.ndarray]]:
         with data.model:
             prior = pm.sample_prior_predictive(return_inferencedata=False)
             posterior_predictive = pm.sample_posterior_predictive(
@@ -122,17 +125,17 @@ class TestDataPyMC:
                 coords={"school": np.arange(eight_schools_params["J"])},
                 dims={"theta": ["school"], "eta": ["school"]},
             )
-            assert isinstance(idata, InferenceData)
+            assert isinstance(idata, xarray.DataTree)
             extended = predictions_to_inference_data(
                 posterior_predictive, idata_orig=idata, inplace=inplace
             )
-            assert isinstance(extended, InferenceData)
+            assert isinstance(extended, xarray.DataTree)
             assert (id(idata) == id(extended)) == inplace
         return (extended, posterior_predictive)
 
     def make_predictions_inference_data(
         self, data, eight_schools_params
-    ) -> tuple[InferenceData, dict[str, np.ndarray]]:
+    ) -> tuple[xarray.DataTree, dict[str, np.ndarray]]:
         with data.model:
             posterior_predictive = pm.sample_posterior_predictive(
                 data.obj, return_inferencedata=False
@@ -143,7 +146,7 @@ class TestDataPyMC:
                 coords={"school": np.arange(eight_schools_params["J"])},
                 dims={"theta": ["school"], "eta": ["school"]},
             )
-            assert isinstance(idata, InferenceData)
+            assert isinstance(idata, xarray.DataTree)
         return idata, posterior_predictive
 
     def test_to_idata(self, data, eight_schools_params, chains, draws):
@@ -165,7 +168,7 @@ class TestDataPyMC:
         assert inference_data.log_likelihood["obs"].shape == (chains, draws, *obs.shape)
 
     def test_predictions_to_idata(self, data, eight_schools_params):
-        "Test that we can add predictions to a previously-existing InferenceData."
+        "Test that we can add predictions to a previously-existing xarray.DataTree."
         test_dict = {
             "posterior": ["mu", "tau", "eta", "theta"],
             "sample_stats": ["diverging", "lp"],
@@ -235,10 +238,10 @@ class TestDataPyMC:
                 warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
                 idata = pm.sample(tune=5, draws=draws, chains=2, return_inferencedata=True)
             thinned_idata = idata.sel(draw=slice(None, None, thin_by))
-            idata.extend(pm.sample_posterior_predictive(thinned_idata))
+            idata.update(pm.sample_posterior_predictive(thinned_idata))
         test_dict = {
             "posterior": ["mu", "tau", "eta", "theta"],
-            "sample_stats": ["diverging", "lp", "~log_likelihood"],
+            "sample_stats": ["diverging", "~log_likelihood"],
             "posterior_predictive": ["obs"],
             "observed_data": ["obs"],
         }
@@ -275,15 +278,16 @@ class TestDataPyMC:
                 "likelihood", mu=city_temperature, sigma=0.5, observed=data, dims=data_dims
             )
 
-            trace = pm.sample(
-                return_inferencedata=False,
-                compute_convergence_checks=False,
-                cores=1,
-                chains=1,
-                tune=20,
-                draws=30,
-                step=pm.Metropolis(),
-            )
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                trace = pm.sample(
+                    return_inferencedata=False,
+                    compute_convergence_checks=False,
+                    cores=1,
+                    chains=1,
+                    tune=20,
+                    draws=30,
+                    step=pm.Metropolis(),
+                )
             if use_context:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", "More chains .* than draws.*", UserWarning)
@@ -312,7 +316,8 @@ class TestDataPyMC:
             x = pm.Data("x", x_data, dims=("dim1", "dim2"))
             beta = pm.Normal("beta", 0, 1, dims="dim1")
             _ = pm.Normal("obs", x * beta, 1, observed=y, dims=("dim1", "dim2"))
-            trace = pm.sample(100, tune=100, return_inferencedata=False)
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                trace = pm.sample(100, tune=100, return_inferencedata=False)
             idata1 = to_inference_data(trace)
             idata2 = to_inference_data(trace, coords={"dim1": new_dim1}, dims={"beta": ["dim2"]})
 
@@ -336,9 +341,13 @@ class TestDataPyMC:
             x = pm.Normal("x", 1, 1)
             with pytest.warns(ImputationWarning):
                 y = pm.Normal("y", x, 1, observed=data)
-            inference_data = pm.sample(
-                100, chains=2, return_inferencedata=True, idata_kwargs=dict(log_likelihood=True)
-            )
+            with pytest.warns(FutureWarning, match="Passing `log_likelihood` via `idata_kwargs`"):
+                inference_data = pm.sample(
+                    100,
+                    chains=2,
+                    return_inferencedata=True,
+                    idata_kwargs={"log_likelihood": True},
+                )
 
         # make sure that data is really missing
         assert "y_unobserved" in model.named_vars
@@ -365,16 +374,17 @@ class TestDataPyMC:
             chol, *_ = pm.LKJCholeskyCov("chol_cov", n=2, eta=1, sd_dist=sd_dist)
             with pytest.warns(ImputationWarning):
                 y = pm.MvNormal("y", mu=mu, chol=chol, observed=data)
-            inference_data = pm.sample(
-                tune=10,
-                draws=10,
-                chains=2,
-                step=pm.Metropolis(),
-                idata_kwargs=dict(log_likelihood=True),
-            )
+            with pytest.warns(FutureWarning, match="Passing `log_likelihood` via `idata_kwargs`"):
+                inference_data = pm.sample(
+                    tune=10,
+                    draws=10,
+                    chains=2,
+                    step=pm.Metropolis(),
+                    idata_kwargs={"log_likelihood": True},
+                )
 
         # make sure that data is really missing
-        assert isinstance(y.owner.inputs[0].owner.op, AdvancedIncSubtensor | AdvancedIncSubtensor1)
+        assert isinstance(y.owner.inputs[0].owner.op, AdvancedIncSubtensor)
 
         test_dict = {
             "posterior": ["mu", "chol_cov"],
@@ -392,17 +402,18 @@ class TestDataPyMC:
             x = pm.Normal("x", 1, 1)
             pm.Normal("y1", x, 1, observed=y1_data)
             pm.Normal("y2", x, 1, observed=y2_data)
-            inference_data = pm.sample(
-                100,
-                chains=2,
-                return_inferencedata=True,
-                idata_kwargs={"log_likelihood": log_likelihood},
-            )
+            with pytest.warns(FutureWarning, match="Passing `log_likelihood` via `idata_kwargs`"):
+                inference_data = pm.sample(
+                    100,
+                    chains=2,
+                    return_inferencedata=True,
+                    idata_kwargs={"log_likelihood": log_likelihood},
+                )
         test_dict = {
             "posterior": ["x"],
             "observed_data": ["y1", "y2"],
             "log_likelihood": ["y1", "y2"],
-            "sample_stats": ["diverging", "lp", "~log_likelihood"],
+            "sample_stats": ["diverging", "~log_likelihood"],
         }
         if not log_likelihood:
             test_dict.pop("log_likelihood")
@@ -421,9 +432,13 @@ class TestDataPyMC:
         with pm.Model():
             p = pm.Uniform("p", 0, 1)
             pm.Binomial("w", p=p, n=2, observed=[1])
-            inference_data = pm.sample(
-                500, chains=2, return_inferencedata=True, idata_kwargs=dict(log_likelihood=True)
-            )
+            with pytest.warns(FutureWarning, match="Passing `log_likelihood` via `idata_kwargs`"):
+                inference_data = pm.sample(
+                    500,
+                    chains=2,
+                    return_inferencedata=True,
+                    idata_kwargs={"log_likelihood": True},
+                )
 
         assert inference_data
         assert inference_data.log_likelihood["w"].shape == (2, 500, 1)
@@ -445,7 +460,8 @@ class TestDataPyMC:
             beta_sigma = pm.Data("beta_sigma", 1)
             beta = pm.Normal("beta", 0, beta_sigma)
             obs = pm.Normal("obs", x * beta, 1, observed=y)
-            trace = pm.sample(100, chains=2, tune=100, return_inferencedata=False)
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                trace = pm.sample(100, chains=2, tune=100, return_inferencedata=False)
             if use_context:
                 inference_data = to_inference_data(trace=trace, log_likelihood=True)
 
@@ -492,7 +508,8 @@ class TestDataPyMC:
             y = pm.Data("y", [1.0, 2.0, 3.0])
             beta = pm.Normal("beta", 0, 1)
             obs = pm.Normal("obs", x * beta, 1, observed=y)
-            trace = pm.sample(100, tune=100, return_inferencedata=False)
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                trace = pm.sample(100, tune=100, return_inferencedata=False)
             inference_data = to_inference_data(trace)
 
         test_dict = {"posterior": ["beta"], "observed_data": ["obs"], "constant_data": ["x"]}
@@ -600,18 +617,21 @@ class TestDataPyMC:
             p = pm.Beta("p", 1, 1, size=(3,))
             p = p / p.sum()
             pm.Multinomial("y", 20, p, dims=("experiment", "direction"), observed=data)
-            with warnings.catch_warnings():
+            with (
+                warnings.catch_warnings(),
+                pytest.warns(FutureWarning, match="Passing `log_likelihood` via `idata_kwargs`"),
+            ):
                 warnings.filterwarnings("ignore", ".*number of samples.*", UserWarning)
                 idata = pm.sample(
                     draws=50,
                     chains=2,
                     tune=100,
                     return_inferencedata=True,
-                    idata_kwargs=dict(log_likelihood=True),
+                    idata_kwargs={"log_likelihood": True},
                 )
         test_dict = {
             "posterior": ["p"],
-            "sample_stats": ["lp"],
+            "sample_stats": ["diverging"],
             "log_likelihood": ["y"],
             "observed_data": ["y"],
         }
@@ -638,7 +658,12 @@ class TestDataPyMC:
             assert len(data[k].shape) == len(dims[k])
 
         ds = pm.backends.arviz.dict_to_dataset(
-            data=data, library=pm, coords=coords, dims=dims, default_dims=[], index_origin=0
+            data=data,
+            inference_library=pm,
+            coords=coords,
+            dims=dims,
+            sample_dims=[],
+            index_origin=0,
         )
         for dname, cvals in coords.items():
             np.testing.assert_array_equal(ds[dname].values, cvals)
@@ -650,24 +675,25 @@ class TestDataPyMC:
             # The model tracks coord values as (immutable) tuples
             assert isinstance(pmodel.coords["city"], tuple)
             pm.Normal("x", dims="city")
-            mtrace = pm.sample(
-                return_inferencedata=False,
-                compute_convergence_checks=False,
-                step=pm.Metropolis(),
-                cores=1,
-                tune=7,
-                draws=15,
-            )
+            with pytest.warns(FutureWarning, match="return_inferencedata=False"):
+                mtrace = pm.sample(
+                    return_inferencedata=False,
+                    compute_convergence_checks=False,
+                    step=pm.Metropolis(),
+                    cores=1,
+                    tune=7,
+                    draws=15,
+                )
             # The converter must convert coord values them to numpy arrays
             # because tuples as coordinate values causes problems with xarray.
-            converter = InferenceDataConverter(trace=mtrace)
+            converter = DataTreeConverter(trace=mtrace)
             assert isinstance(converter.coords["city"], np.ndarray)
             converter.to_inference_data()
 
             # We're not automatically converting things other than tuple,
-            # so advanced use cases remain supported at the InferenceData level.
+            # so advanced use cases remain supported at the DataTree level.
             # They just can't be used in the model construction already.
-            converter = InferenceDataConverter(
+            converter = DataTreeConverter(
                 trace=mtrace,
                 coords={
                     "city": pd.MultiIndex.from_tuples(
@@ -677,20 +703,18 @@ class TestDataPyMC:
             )
             assert isinstance(converter.coords["city"], pd.MultiIndex)
 
-    def test_variable_dimension_name_collision(self):
-        with pytest.raises(ValueError, match="same name as its dimension"):
-            with pm.Model() as pmodel:
-                var = pt.as_tensor([1, 2, 3])
-                pmodel.register_rv(var, name="time", dims=("time",))
-
     def test_include_transformed(self):
         with pm.Model():
             pm.Uniform("p", 0, 1)
 
             # First check that the default is to exclude the transformed variables
-            sample_kwargs = dict(
-                tune=5, draws=7, chains=2, cores=1, compute_convergence_checks=False
-            )
+            sample_kwargs = {
+                "tune": 5,
+                "draws": 7,
+                "chains": 2,
+                "cores": 1,
+                "compute_convergence_checks": False,
+            }
             inference_data = pm.sample(**sample_kwargs, step=pm.Metropolis())
             assert "p_interval__" not in inference_data.posterior
 
@@ -743,9 +767,9 @@ class TestPyMCWarmupHandling:
         post_prefix = "" if draws > 0 else "~"
         test_dict = {
             f"{post_prefix}posterior": ["u1", "n1"],
-            f"{post_prefix}sample_stats": ["~tune", "accept"],
+            f"{post_prefix}sample_stats": ["~in_warmup", "accept"],
             f"{warmup_prefix}warmup_posterior": ["u1", "n1"],
-            f"{warmup_prefix}warmup_sample_stats": ["~tune"],
+            f"{warmup_prefix}warmup_sample_stats": ["~in_warmup"],
             "~warmup_log_likelihood": [],
             "~log_likelihood": [],
         }
@@ -762,7 +786,10 @@ class TestPyMCWarmupHandling:
         with pm.Model():
             pm.Uniform("u1")
             pm.Normal("n1")
-            with warnings.catch_warnings():
+            with (
+                warnings.catch_warnings(),
+                pytest.warns(FutureWarning, match="return_inferencedata=False"),
+            ):
                 warnings.filterwarnings("ignore", "Tuning samples will be included.*", UserWarning)
                 trace = pm.sample(
                     tune=100,
@@ -780,9 +807,9 @@ class TestPyMCWarmupHandling:
             idata = to_inference_data(trace, save_warmup=True)
             test_dict = {
                 "posterior": ["u1", "n1"],
-                "sample_stats": ["~tune", "accept"],
+                "sample_stats": ["~in_warmup", "accept"],
                 "warmup_posterior": ["u1", "n1"],
-                "warmup_sample_stats": ["~tune", "accept"],
+                "warmup_sample_stats": ["~in_warmup", "accept"],
             }
             fails = check_multiple_attrs(test_dict, idata)
             assert not fails
@@ -794,7 +821,7 @@ class TestPyMCWarmupHandling:
                 idata = to_inference_data(trace[-30:], save_warmup=True)
             test_dict = {
                 "posterior": ["u1", "n1"],
-                "sample_stats": ["~tune", "accept"],
+                "sample_stats": ["~in_warmup", "accept"],
                 "~warmup_posterior": [],
                 "~warmup_sample_stats": [],
             }
@@ -833,3 +860,40 @@ class TestDatasetToPointList:
         ds[3] = xarray.DataArray([1, 2, 3])
         with pytest.raises(ValueError, match="must be str"):
             dataset_to_point_list(ds, sample_dims=["chain", "draw"])
+
+    def test_zero_size(self):
+        ds = xarray.Dataset()
+        ds["x"] = xarray.DataArray(
+            np.zeros((4, 10, 0, 5)), dims=("chain", "draw", "dim_0", "dim_5")
+        )
+        pl, _ = dataset_to_point_list(ds, sample_dims=("chain", "draw"))
+        assert len(pl) == 40
+        assert tuple(pl[0]) == ("x",)
+        assert pl[0]["x"].shape == (0, 5)
+        assert pl[0]["x"].dtype == np.float64
+
+
+def test_incompatible_coordinate_lengths():
+    with pm.Model(coords={"a": [-1, -2, -3]}) as m:
+        x = pm.Normal("x", dims="a")
+        y = pm.Deterministic("y", x[1:], dims=("a",))
+
+        with pytest.warns(
+            UserWarning,
+            match=re.escape(
+                "Incompatible coordinate length of 3 for dimension 'a' of variable 'y'"
+            ),
+        ):
+            prior = (
+                pm.sample_prior_predictive(draws=1).prior.to_dataset().squeeze(("chain", "draw"))
+            )
+        assert prior.x.dims == prior.y.dims == ("a",)
+        assert prior.x.shape == prior.y.shape == (3,)
+        assert np.isnan(prior.y.values[-1])
+        assert list(prior.coords["a"]) == [-1, -2, -3]
+
+        pm.backends.arviz.RAISE_ON_INCOMPATIBLE_COORD_LENGTHS = True
+        with pytest.raises(ValueError):
+            pm.sample_prior_predictive(draws=1)
+
+        pm.backends.arviz.RAISE_ON_INCOMPATIBLE_COORD_LENGTHS = False

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+from __future__ import annotations
 
 import ctypes
 import logging
@@ -19,21 +20,34 @@ import multiprocessing.sharedctypes
 import platform
 import time
 import traceback
+import warnings
 
 from collections import namedtuple
 from collections.abc import Sequence
+from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import cloudpickle
 import numpy as np
 
-from rich.console import Console
-from rich.progress import BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from pytensor.compile import get_mode
+from pytensor.link.jax.linker import JAXLinker
 from rich.theme import Theme
 from threadpoolctl import threadpool_limits
 
+from pymc.backends import _ZarrChainBase
 from pymc.blocking import DictToArrayBijection
+
+if TYPE_CHECKING:
+    from pymc.backends.zarr import ZarrChain
+
 from pymc.exceptions import SamplingError
-from pymc.util import CustomProgress, RandomSeed, default_progress_theme
+from pymc.progress_bar import MCMCProgressBarManager, default_progress_theme
+from pymc.util import (
+    RandomGeneratorState,
+    get_state_from_generator,
+    random_generator_from_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +64,7 @@ class RemoteTraceback(Exception):
         self.tb = tb
 
     def __str__(self):
+        """Return a string representation of the object."""
         return self.tb
 
 
@@ -58,15 +73,59 @@ class ExceptionWithTraceback:
         tb = traceback.format_exception(type(exc), exc, tb)
         tb = "".join(tb)
         self.exc = exc
-        self.tb = '\n"""\n%s"""' % tb
+        self.tb = f'\n"""\n{tb}"""'
 
     def __reduce__(self):
+        """Return a tuple to pickle."""
         return rebuild_exc, (self.exc, self.tb)
 
 
 def rebuild_exc(exc, tb):
     exc.__cause__ = RemoteTraceback(tb)
     return exc
+
+
+def _initialize_multiprocessing_context(
+    mp_ctx: str | multiprocessing.context.BaseContext | None,
+    *,
+    mode=None,
+    quiet: bool = False,
+) -> multiprocessing.context.BaseContext:
+    user_specified = mp_ctx is not None
+    jax_mode = mode is not None and isinstance(get_mode(mode).linker, JAXLinker)
+
+    if mp_ctx is None or isinstance(mp_ctx, str):
+        # Closes issue https://github.com/pymc-devs/pymc/issues/3849
+        # Related issue https://github.com/pymc-devs/pymc/issues/5339
+        if mp_ctx is None and platform.system() == "Darwin":
+            if platform.processor() == "arm":
+                mp_ctx = "fork"
+                if not quiet:
+                    logger.debug(
+                        "mp_ctx is set to 'fork' for MacOS with ARM architecture. "
+                        + "This might cause unexpected behavior with JAX, which is inherently multithreaded."
+                    )
+            else:
+                mp_ctx = "forkserver"
+
+        mp_ctx = multiprocessing.get_context(mp_ctx)
+
+    if jax_mode and mp_ctx.get_start_method() == "fork":
+        if user_specified:
+            warnings.warn(
+                "Using a JAX backend with multiprocessing start method 'fork' is unsafe "
+                "and may deadlock. Consider passing `mp_ctx='forkserver'` or `mp_ctx='spawn'`.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            # JAX is not fork-safe: pick a non-fork default when user didn't specify.
+            new_method = (
+                "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
+            )
+            mp_ctx = multiprocessing.get_context(new_method)
+
+    return mp_ctx
 
 
 # Messages
@@ -80,6 +139,7 @@ def rebuild_exc(exc, tb):
 
 class _Process:
     """Separate process for each chain.
+
     We communicate with the main process using a pipe,
     and send finished samples using shared memory.
     """
@@ -93,18 +153,36 @@ class _Process:
         shared_point,
         draws: int,
         tune: int,
-        seed,
+        rng_state: RandomGeneratorState,
         blas_cores,
+        chain: int,
+        mp_start_method: str,
+        zarr_chains: list[ZarrChain] | bytes | None = None,
+        zarr_chains_is_pickled: bool = False,
     ):
+        # Because of https://github.com/numpy/numpy/issues/27727, we can't send
+        # the rng instance to the child process because pickling (copying) looses
+        # the seed sequence state information. For this reason, we send a
+        # RandomGeneratorState instead.
+        rng = random_generator_from_state(rng_state)
         self._msg_pipe = msg_pipe
         self._step_method = step_method
         self._step_method_is_pickled = step_method_is_pickled
+        self.chain = chain
+        self._zarr_recording = False
+        self._zarr_chain: ZarrChain | None = None
+        if zarr_chains_is_pickled:
+            self._zarr_chain = cloudpickle.loads(zarr_chains)[self.chain]
+        elif zarr_chains is not None:
+            self._zarr_chain = zarr_chains[self.chain]  # type: ignore[assignment]
+        self._zarr_recording = self._zarr_chain is not None
+
         self._shared_point = shared_point
-        self._seed = seed
-        self._at_seed = seed + 1
+        self._rng = rng
         self._draws = draws
         self._tune = tune
         self._blas_cores = blas_cores
+        self._mp_start_method = mp_start_method
 
     def _unpickle_step_method(self):
         unpickle_error = (
@@ -119,11 +197,17 @@ class _Process:
                 raise ValueError(unpickle_error)
 
     def run(self):
-        with threadpool_limits(limits=self._blas_cores):
+        # Only apply threadpool_limits for non-fork methods.
+        with (
+            nullcontext()
+            if self._mp_start_method == "fork"
+            else threadpool_limits(limits=self._blas_cores)
+        ):
             try:
                 # We do not create this in __init__, as pickling this
                 # would destroy the shared memory.
                 self._unpickle_step_method()
+                self._link_step_to_zarrchain()
                 self._point = self._make_numpy_refs()
                 self._start_loop()
             except KeyboardInterrupt:
@@ -136,6 +220,10 @@ class _Process:
                 self._wait_for_abortion()
             finally:
                 self._msg_pipe.close()
+
+    def _link_step_to_zarrchain(self):
+        if self._zarr_recording:
+            self._zarr_chain.link_stepper(self._step_method)
 
     def _wait_for_abortion(self):
         while True:
@@ -159,7 +247,9 @@ class _Process:
         return self._msg_pipe.recv()
 
     def _start_loop(self):
-        np.random.seed(self._seed)
+        zarr_recording = self._zarr_recording
+        # `_draws` already excludes tuning (see `draws -= tune` in `_mp_sample`)
+        self._step_method.setup_chain(self._rng, self._tune, self._draws)
 
         draw = 0
         tuning = True
@@ -188,6 +278,8 @@ class _Process:
             if msg[0] == "abort":
                 raise KeyboardInterrupt()
             elif msg[0] == "write_next":
+                if zarr_recording:
+                    self._zarr_chain.record(point, stats, in_warmup=tuning)
                 self._write_point(point)
                 is_last = draw + 1 == self._draws + self._tune
                 self._msg_pipe.send(("writing_done", is_last, draw, tuning, stats))
@@ -210,27 +302,26 @@ class ProcessAdapter:
         step_method,
         step_method_pickled,
         chain: int,
-        seed,
+        rng: np.random.Generator,
         start: dict[str, np.ndarray],
         blas_cores,
         mp_ctx,
+        zarr_chains: list[ZarrChain] | None = None,
+        zarr_chains_pickled: bytes | None = None,
     ):
         self.chain = chain
-        process_name = "worker_chain_%s" % chain
+        process_name = f"worker_chain_{chain}"
         self._msg_pipe, remote_conn = multiprocessing.Pipe()
 
         self._shared_point = {}
         self._point = {}
 
-        for name, shape, dtype in DictToArrayBijection.map(start).point_map_info:
-            size = 1
-            for dim in shape:
-                size *= int(dim)
-            size *= dtype.itemsize
-            if size != ctypes.c_size_t(size).value:
-                raise ValueError("Variable %s is too large" % name)
+        for name, shape, size, dtype in DictToArrayBijection.map(start).point_map_info:
+            byte_size = size * dtype.itemsize
+            if byte_size != ctypes.c_size_t(byte_size).value:
+                raise ValueError(f"Variable {name} is too large")
 
-            array = mp_ctx.RawArray("c", size)
+            array = mp_ctx.RawArray("c", byte_size)
             self._shared_point[name] = (array, shape, dtype)
             array_np = np.frombuffer(array, dtype).reshape(shape)
             array_np[...] = start[name]
@@ -238,6 +329,16 @@ class ProcessAdapter:
 
         self._readable = True
         self._num_samples = 0
+
+        zarr_chains_send: list[ZarrChain] | bytes | None = None
+        if zarr_chains_pickled is not None:
+            zarr_chains_send = zarr_chains_pickled
+        elif zarr_chains is not None:
+            if mp_ctx.get_start_method() == "spawn":
+                raise ValueError(
+                    "please provide a pre-pickled zarr_chains when multiprocessing start method is 'spawn'"
+                )
+            zarr_chains_send = zarr_chains
 
         if step_method_pickled is not None:
             step_method_send = step_method_pickled
@@ -260,8 +361,12 @@ class ProcessAdapter:
                 self._shared_point,
                 draws,
                 tune,
-                seed,
+                get_state_from_generator(rng),
                 blas_cores,
+                self.chain,
+                mp_ctx.get_start_method(),
+                zarr_chains_send,
+                zarr_chains_pickled is not None,
             ),
         )
         self._process.start()
@@ -271,9 +376,7 @@ class ProcessAdapter:
 
     @property
     def shared_point_view(self):
-        """May only be written to or read between a `recv_draw`
-        call from the process and a `write_next` or `abort` call.
-        """
+        """May only be written to or read between a `recv_draw` call from the process and a `write_next` or `abort` call."""
         if not self._readable:
             raise RuntimeError()
         return self._point
@@ -359,8 +462,8 @@ class ProcessAdapter:
                     raise multiprocessing.TimeoutError()
                 process.join(timeout)
         except multiprocessing.TimeoutError:
-            logger.warn(
-                "Chain processes did not terminate as expected. " "Terminating forcefully..."
+            logger.warning(
+                "Chain processes did not terminate as expected. Terminating forcefully..."
             )
             for process in processes:
                 process.terminate()
@@ -379,35 +482,29 @@ class ParallelSampler:
         tune: int,
         chains: int,
         cores: int,
-        seeds: Sequence["RandomSeed"],
+        rngs: Sequence[np.random.Generator],
         start_points: Sequence[dict[str, np.ndarray]],
         step_method,
         progressbar: bool = True,
         progressbar_theme: Theme | None = default_progress_theme,
         blas_cores: int | None = None,
         mp_ctx=None,
+        zarr_chains: list[ZarrChain] | None = None,
     ):
-        if any(len(arg) != chains for arg in [seeds, start_points]):
-            raise ValueError("Number of seeds and start_points must be %s." % chains)
-
+        if any(len(arg) != chains for arg in [rngs, start_points]):
+            raise ValueError(f"Number of rngs and start_points must be {chains}.")
         if mp_ctx is None or isinstance(mp_ctx, str):
-            # Closes issue https://github.com/pymc-devs/pymc/issues/3849
-            # Related issue https://github.com/pymc-devs/pymc/issues/5339
-            if mp_ctx is None and platform.system() == "Darwin":
-                if platform.processor() == "arm":
-                    mp_ctx = "fork"
-                    logger.debug(
-                        "mp_ctx is set to 'fork' for MacOS with ARM architecture. "
-                        + "This might cause unexpected behavior with JAX, which is inherently multithreaded."
-                    )
-                else:
-                    mp_ctx = "forkserver"
-
-            mp_ctx = multiprocessing.get_context(mp_ctx)
-
+            mp_ctx = _initialize_multiprocessing_context(mp_ctx)
         step_method_pickled = None
+        zarr_chains_pickled = None
+        self.zarr_recording = False
+        if zarr_chains is not None:
+            assert all(isinstance(zarr_chain, _ZarrChainBase) for zarr_chain in zarr_chains)
+            self.zarr_recording = True
         if mp_ctx.get_start_method() != "fork":
             step_method_pickled = cloudpickle.dumps(step_method, protocol=-1)
+            if zarr_chains is not None:
+                zarr_chains_pickled = cloudpickle.dumps(zarr_chains, protocol=-1)
 
         self._samplers = [
             ProcessAdapter(
@@ -416,12 +513,14 @@ class ParallelSampler:
                 step_method,
                 step_method_pickled,
                 chain,
-                seed,
+                rng,
                 start,
                 blas_cores,
                 mp_ctx,
+                zarr_chains=zarr_chains,
+                zarr_chains_pickled=zarr_chains_pickled,
             )
-            for chain, seed, start in zip(range(chains), seeds, start_points)
+            for chain, rng, start in zip(range(chains), rngs, start_points)
         ]
 
         self._inactive = self._samplers.copy()
@@ -430,23 +529,14 @@ class ParallelSampler:
         self._max_active = cores
 
         self._in_context = False
-
-        self._progress = CustomProgress(
-            "[progress.description]{task.description}",
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TimeRemainingColumn(),
-            TextColumn("/"),
-            TimeElapsedColumn(),
-            console=Console(theme=progressbar_theme),
-            disable=not progressbar,
+        self._progress = MCMCProgressBarManager(
+            step_method=step_method,
+            chains=chains,
+            draws=draws,
+            tune=tune,
+            progressbar=progressbar,
+            progressbar_theme=progressbar_theme,
         )
-        self._show_progress = progressbar
-        self._divergences = 0
-        self._completed_draws = 0
-        self._total_draws = chains * (draws + tune)
-        self._desc = "Sampling {0._chains:d} chains, {0._divergences:,d} divergences"
-        self._chains = chains
 
     def _make_active(self):
         while self._inactive and len(self._active) < self._max_active:
@@ -456,28 +546,18 @@ class ParallelSampler:
             self._active.append(proc)
 
     def __iter__(self):
+        """Return an iterator over draws."""
         if not self._in_context:
             raise ValueError("Use ParallelSampler as context manager.")
         self._make_active()
 
-        with self._progress as progress:
-            task = progress.add_task(
-                self._desc.format(self),
-                completed=self._completed_draws,
-                total=self._total_draws,
-            )
-
+        with self._progress:
             while self._active:
                 draw = ProcessAdapter.recv_draw(self._active)
                 proc, is_last, draw, tuning, stats = draw
-                self._completed_draws += 1
-                if not tuning and stats and stats[0].get("diverging"):
-                    self._divergences += 1
-                progress.update(
-                    task,
-                    completed=self._completed_draws,
-                    total=self._total_draws,
-                    description=self._desc.format(self),
+
+                self._progress.update(
+                    chain_idx=proc.chain, is_last=is_last, draw=draw, tuning=tuning, stats=stats
                 )
 
                 if is_last:
@@ -485,7 +565,6 @@ class ParallelSampler:
                     self._active.remove(proc)
                     self._finished.append(proc)
                     self._make_active()
-                    progress.update(task, description=self._desc.format(self), refresh=True)
 
                 # We could also yield proc.shared_point_view directly,
                 # and only call proc.write_next() after the yield returns.
@@ -500,10 +579,12 @@ class ParallelSampler:
                 yield Draw(proc.chain, is_last, draw, tuning, stats, point)
 
     def __enter__(self):
+        """Enter the context manager."""
         self._in_context = True
         return self
 
     def __exit__(self, *args):
+        """Exit the context manager."""
         ProcessAdapter.terminate_all(self._samplers)
 
 

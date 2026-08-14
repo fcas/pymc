@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,12 +13,9 @@
 #   limitations under the License.
 
 import io
-import itertools as it
-import re
 
 from os import path
 
-import cloudpickle
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
@@ -29,8 +26,8 @@ from pytensor.tensor.variable import TensorVariable
 
 import pymc as pm
 
-from pymc.data import is_minibatch
-from pymc.pytensorf import GeneratorOp, floatX
+from pymc.data import MinibatchOp
+from pymc.pytensorf import floatX
 
 
 class TestData:
@@ -319,8 +316,8 @@ class TestData:
         N_cols = 7
         data = np.random.uniform(size=(N_rows, N_cols))
         coords = {
-            "rows": [f"R{r+1}" for r in range(N_rows)],
-            "columns": [f"C{c+1}" for c in range(N_cols)],
+            "rows": [f"R{r + 1}" for r in range(N_rows)],
+            "columns": [f"C{c + 1}" for c in range(N_cols)],
         }
         # pass coordinates explicitly, use numpy array in Data container
         with pm.Model(coords=coords) as pmodel:
@@ -376,7 +373,7 @@ class TestData:
         pd = pytest.importorskip("pandas")
         ser_sales = pd.Series(
             data=np.random.randint(low=0, high=30, size=22),
-            index=pd.date_range(start="2020-05-01", periods=22, freq="24H", name="date"),
+            index=pd.date_range(start="2020-05-01", periods=22, freq="24h", name="date"),
             name="sales",
         )
         with pm.Model() as pmodel:
@@ -392,7 +389,7 @@ class TestData:
         N_cols = 7
         df_data = pd.DataFrame()
         for c in range(N_cols):
-            df_data[f"Column {c+1}"] = np.random.normal(size=(N_rows,))
+            df_data[f"Column {c + 1}"] = np.random.normal(size=(N_rows,))
         df_data.index.name = "rows"
         df_data.columns.name = "columns"
 
@@ -451,7 +448,7 @@ def test_data_naming():
 
 def test_get_data():
     data = pm.get_data("radon.csv")
-    assert type(data) == io.BytesIO
+    assert isinstance(data, io.BytesIO)
 
 
 class _DataSampler:
@@ -485,7 +482,7 @@ def datagen():
 def integers():
     i = 0
     while True:
-        yield pm.floatX(i)
+        yield floatX(i)
         i += 1
 
 
@@ -497,140 +494,63 @@ def integers_ndim(ndim):
 
 
 @pytest.mark.usefixtures("strict_float32")
-class TestGenerator:
-    def test_basic(self):
-        generator = pm.GeneratorAdapter(integers())
-        gop = GeneratorOp(generator)()
-        assert gop.tag.test_value == np.float32(0)
-        f = pytensor.function([], gop)
-        assert f() == np.float32(0)
-        assert f() == np.float32(1)
-        for _ in range(2, 100):
-            f()
-        assert f() == np.float32(100)
-
-    def test_ndim(self):
-        for ndim in range(10):
-            res = list(it.islice(integers_ndim(ndim), 0, 2))
-            generator = pm.GeneratorAdapter(integers_ndim(ndim))
-            gop = GeneratorOp(generator)()
-            f = pytensor.function([], gop)
-            assert ndim == res[0].ndim
-            np.testing.assert_equal(f(), res[0])
-            np.testing.assert_equal(f(), res[1])
-
-    def test_cloning_available(self):
-        gop = pm.generator(integers())
-        res = gop**2
-        shared = pytensor.shared(pm.floatX(10))
-        res1 = pytensor.clone_replace(res, {gop: shared})
-        f = pytensor.function([], res1)
-        assert f() == np.float32(100)
-
-    def test_default_value(self):
-        def gen():
-            for i in range(2):
-                yield pm.floatX(np.ones((10, 10)) * i)
-
-        gop = pm.generator(gen(), np.ones((10, 10)) * 10)
-        f = pytensor.function([], gop)
-        np.testing.assert_equal(np.ones((10, 10)) * 0, f())
-        np.testing.assert_equal(np.ones((10, 10)) * 1, f())
-        np.testing.assert_equal(np.ones((10, 10)) * 10, f())
-        with pytest.raises(ValueError):
-            gop.set_default(1)
-
-    def test_set_gen_and_exc(self):
-        def gen():
-            for i in range(2):
-                yield pm.floatX(np.ones((10, 10)) * i)
-
-        gop = pm.generator(gen())
-        f = pytensor.function([], gop)
-        np.testing.assert_equal(np.ones((10, 10)) * 0, f())
-        np.testing.assert_equal(np.ones((10, 10)) * 1, f())
-        with pytest.raises(StopIteration):
-            f()
-        gop.set_gen(gen())
-        np.testing.assert_equal(np.ones((10, 10)) * 0, f())
-        np.testing.assert_equal(np.ones((10, 10)) * 1, f())
-
-    def test_pickling(self, datagen):
-        gen = pm.generator(datagen)
-        cloudpickle.loads(cloudpickle.dumps(gen))
-        bad_gen = pm.generator(integers())
-        with pytest.raises(TypeError):
-            cloudpickle.dumps(bad_gen)
-
-    def test_gen_cloning_with_shape_change(self, datagen):
-        gen = pm.generator(datagen)
-        gen_r = pt.random.normal(size=gen.shape).T
-        X = gen.dot(gen_r)
-        res, _ = pytensor.scan(lambda x: x.sum(), X, n_steps=X.shape[0])
-        assert res.eval().shape == (50,)
-        shared = pytensor.shared(datagen.data.astype(gen.dtype))
-        res2 = pytensor.clone_replace(res, {gen: shared**2})
-        assert res2.eval().shape == (1000,)
-
-
-def gen1():
-    i = 0
-    while True:
-        yield np.ones((10, 100)) * i
-        i += 1
-
-
-def gen2():
-    i = 0
-    while True:
-        yield np.ones((20, 100)) * i
-        i += 1
-
-
-@pytest.mark.usefixtures("strict_float32")
 class TestMinibatch:
     data = np.random.rand(30, 10)
 
     def test_1d(self):
         mb = pm.Minibatch(self.data, batch_size=20)
-        assert is_minibatch(mb)
-        assert mb.eval().shape == (20, 10)
+        assert isinstance(mb.owner.op, MinibatchOp)
+        draw1, draw2 = pm.draw(mb, draws=2)
+        assert draw1.shape == (20, 10)
+        assert draw2.shape == (20, 10)
+        assert not np.all(draw1 == draw2)
 
     def test_allowed(self):
         mb = pm.Minibatch(pt.as_tensor(self.data).astype(int), batch_size=20)
-        assert is_minibatch(mb)
+        assert isinstance(mb.owner.op, MinibatchOp)
+
+        mb = pm.Minibatch(pt.as_tensor(self.data) * 2, batch_size=20)
+        assert isinstance(mb.owner.op, MinibatchOp)
+
+        for mb in pm.Minibatch(self.data, pt.as_tensor(self.data) * 2, batch_size=20):
+            assert isinstance(mb.owner.op, MinibatchOp)
 
     def test_not_allowed(self):
-        with pytest.raises(ValueError, match="not valid for Minibatch"):
-            mb = pm.Minibatch(pt.as_tensor(self.data) * 2, batch_size=20)
+        data = pt.random.normal(loc=self.data, scale=1)
 
-    def test_not_allowed2(self):
-        with pytest.raises(ValueError, match="not valid for Minibatch"):
-            mb = pm.Minibatch(self.data, pt.as_tensor(self.data) * 2, batch_size=20)
+        with pytest.raises(ValueError):
+            pm.Minibatch(data, batch_size=20)
 
     def test_assert(self):
+        d1, d2 = pm.Minibatch(self.data, self.data[::2], batch_size=20)
         with pytest.raises(
             AssertionError, match=r"All variables shape\[0\] in Minibatch should be equal"
         ):
-            d1, d2 = pm.Minibatch(self.data, self.data[::2], batch_size=20)
             d1.eval()
 
     def test_multiple_vars(self):
         A = np.arange(1000)
-        B = np.arange(1000)
+        B = -np.arange(1000)
         mA, mB = pm.Minibatch(A, B, batch_size=10)
 
         [draw_mA, draw_mB] = pm.draw([mA, mB])
         assert draw_mA.shape == (10,)
-        np.testing.assert_allclose(draw_mA, draw_mB)
+        np.testing.assert_allclose(draw_mA, -draw_mB)
 
-        # Check invalid dims
-        A = np.arange(1000)
-        C = np.arange(999)
-        mA, mC = pm.Minibatch(A, C, batch_size=10)
 
-        with pytest.raises(
-            AssertionError,
-            match=re.escape("All variables shape[0] in Minibatch should be equal"),
-        ):
-            pm.draw([mA, mC])
+def test_scaling_data_works_in_likelihood() -> None:
+    data = np.array([10, 11, 12, 13, 14, 15])
+
+    with pm.Model():
+        target = pm.Data("target", data)
+        scale = 12
+        scaled_target = target / scale
+        mu = pm.Normal("mu", mu=0, sigma=1)
+        pm.Normal("x", mu=mu, sigma=1, observed=scaled_target)
+
+        idata = pm.sample(10, chains=1, tune=100)
+
+    np.testing.assert_allclose(
+        idata.observed_data["x"].values,
+        data / scale,
+    )

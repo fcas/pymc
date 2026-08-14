@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -180,7 +180,7 @@ class ModelBackendSampledTestCase:
                 cls.expected_stats[0].append(stats)
                 cls.expected_stats[1].append(stats)
                 for key, dtype in vars.items():
-                    if dtype == bool:
+                    if dtype is bool:
                         stats[key] = np.zeros(cls.draws, dtype=dtype)
                     else:
                         stats[key] = np.arange(cls.draws, dtype=dtype)
@@ -195,11 +195,11 @@ class ModelBackendSampledTestCase:
                 stats2 = [
                     {key: val[idx] for key, val in stats.items()} for stats in cls.expected_stats[1]
                 ]
-                strace0.record(point=point0, sampler_stats=stats1)
-                strace1.record(point=point1, sampler_stats=stats2)
+                strace0.record(point=point0, sampler_stats=stats1, in_warmup=False)
+                strace1.record(point=point1, sampler_stats=stats2, in_warmup=False)
             else:
-                strace0.record(point=point0)
-                strace1.record(point=point1)
+                strace0.record(point=point0, in_warmup=False)
+                strace1.record(point=point1, in_warmup=False)
         strace0.close()
         strace1.close()
         cls.mtrace = base.MultiTrace([strace0, strace1])
@@ -238,12 +238,15 @@ class SamplingTestCase(ModelBackendSetupTestCase):
     """
 
     def record_point(self, val):
-        point = {varname: np.tile(val, value.shape) for varname, value in self.test_point.items()}
+        point = {
+            varname: np.tile(val, value.shape).astype(value.dtype)
+            for varname, value in self.test_point.items()
+        }
         if self.sampler_vars is not None:
             stats = [{key: dtype(val) for key, dtype in vars.items()} for vars in self.sampler_vars]
-            self.strace.record(point=point, sampler_stats=stats)
+            self.strace.record(point=point, sampler_stats=stats, in_warmup=False)
         else:
-            self.strace.record(point=point)
+            self.strace.record(point=point, in_warmup=False)
 
     def test_standard_close(self):
         for idx in range(self.draws):
@@ -267,7 +270,7 @@ class SamplingTestCase(ModelBackendSetupTestCase):
     def test_missing_stats(self):
         if self.sampler_vars is not None:
             with pytest.raises(ValueError):
-                self.strace.record(point=self.test_point)
+                self.strace.record(point=self.test_point, in_warmup=False)
 
     def test_clean_interrupt(self):
         self.record_point(0)
@@ -459,8 +462,8 @@ class DumpLoadTestCase(ModelBackendSampledTestCase):
         assert self.mtrace.nchains == self.dumped.nchains
 
     def test_varnames(self):
-        trace_names = list(sorted(self.mtrace.varnames))
-        dumped_names = list(sorted(self.dumped.varnames))
+        trace_names = sorted(self.mtrace.varnames)
+        dumped_names = sorted(self.dumped.varnames)
         assert trace_names == dumped_names
 
     def test_values(self):

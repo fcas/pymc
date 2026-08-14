@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,12 +13,11 @@
 #   limitations under the License.
 
 """
-Created on Mar 12, 2011
+Created on Mar 12, 2011.
 
 @author: johnsalvatier
 """
 
-import sys
 import warnings
 
 from collections.abc import Sequence
@@ -27,23 +26,25 @@ import numpy as np
 import pytensor.gradient as tg
 
 from numpy import isfinite
-from pytensor import Variable
+from pytensor.graph.basic import Variable
+from pytensor.utils import lazy_scipy_module
 from rich.console import Console
 from rich.progress import Progress, TextColumn
-from scipy.optimize import minimize
 
 import pymc as pm
 
 from pymc.blocking import DictToArrayBijection, RaveledVars
 from pymc.initial_point import make_initial_point_fn
 from pymc.model import modelcontext
+from pymc.progress_bar import CustomProgress, default_progress_theme
+from pymc.pytensorf import floatX, inputvars
 from pymc.util import (
-    CustomProgress,
-    default_progress_theme,
     get_default_varnames,
     get_value_vars_from_user_vars,
 )
 from pymc.vartypes import discrete_types, typefilter
+
+optimize = lazy_scipy_module("optimize")
 
 __all__ = ["find_MAP"]
 
@@ -62,7 +63,7 @@ def find_MAP(
     seed: int | None = None,
     **kwargs,
 ):
-    """Finds the local maximum a posteriori point given a model.
+    """Find the local maximum a posteriori point given a model.
 
     `find_MAP` should not be used to initialize the NUTS sampler. Simply call
     ``pymc.sample()`` and it will automatically initialize NUTS in a better
@@ -114,7 +115,7 @@ def find_MAP(
             vars = get_value_vars_from_user_vars(vars, model)
         except ValueError as exc:
             # Accommodate case where user passed non-pure RV nodes
-            vars = pm.inputvars(model.replace_rvs_by_values(vars))
+            vars = inputvars(model.replace_rvs_by_values(vars))
             if vars:
                 warnings.warn(
                     "Intermediate variables (such as Deterministic or Potential) were passed. "
@@ -142,16 +143,16 @@ def find_MAP(
     # TODO: If the mapping is fixed, we can simply create graphs for the
     # mapping and avoid all this bijection overhead
     compiled_logp_func = DictToArrayBijection.mapf(model.compile_logp(jacobian=False), start)
-    logp_func = lambda x: compiled_logp_func(RaveledVars(x, x0.point_map_info))  # noqa E731
+    logp_func = lambda x: compiled_logp_func(RaveledVars(x, x0.point_map_info))  # noqa: E731
 
-    rvs = [model.values_to_rvs[vars_dict[name]] for name, _, _ in x0.point_map_info]
+    rvs = [model.values_to_rvs[vars_dict[name]] for name, _, _, _ in x0.point_map_info]
     try:
         # This might be needed for calls to `dlogp_func`
         # start_map_info = tuple((v.name, v.shape, v.dtype) for v in vars)
         compiled_dlogp_func = DictToArrayBijection.mapf(
             model.compile_dlogp(rvs, jacobian=False), start
         )
-        dlogp_func = lambda x: compiled_dlogp_func(RaveledVars(x, x0.point_map_info))  # noqa E731
+        dlogp_func = lambda x: compiled_dlogp_func(RaveledVars(x, x0.point_map_info))  # noqa: E731
         compute_gradient = True
     except (AttributeError, NotImplementedError, tg.NullTypeGradError):
         compute_gradient = False
@@ -174,7 +175,7 @@ def find_MAP(
 
     with cost_func.progress:
         try:
-            opt_result = minimize(
+            opt_result = optimize.minimize(
                 cost_func, x0.data, method=method, jac=compute_gradient, *args, **kwargs
             )
             mx0 = opt_result["x"]  # r -> opt_result
@@ -184,11 +185,10 @@ def find_MAP(
                 pm._log.info(e)
         finally:
             cost_func.progress.update(cost_func.task, completed=cost_func.n_eval, refresh=True)
-            print(file=sys.stdout)
 
     mx0 = RaveledVars(mx0, x0.point_map_info)
     unobserved_vars = get_default_varnames(model.unobserved_value_vars, include_transformed)
-    unobserved_vars_values = model.compile_fn(unobserved_vars)(
+    unobserved_vars_values = model.compile_fn(inputs=model.value_vars, outs=unobserved_vars)(
         DictToArrayBijection.rmap(mx0, start)
     )
     mx = {var.name: value for var, value in zip(unobserved_vars, unobserved_vars_values)}
@@ -233,10 +233,10 @@ class CostFuncWrapper:
         self.task = self.progress.add_task("MAP", total=maxeval, loss="")
 
     def __call__(self, x):
-        neg_value = np.float64(self.logp_func(pm.floatX(x)))
+        neg_value = np.float64(self.logp_func(floatX(x)))
         value = -1.0 * neg_value
         if self.use_gradient:
-            neg_grad = self.dlogp_func(pm.floatX(x))
+            neg_grad = self.dlogp_func(floatX(x))
             if np.all(np.isfinite(neg_grad)):
                 self.previous_x = x
             grad = -1.0 * neg_grad

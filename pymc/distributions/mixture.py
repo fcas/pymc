@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -15,10 +15,9 @@ import itertools
 import warnings
 
 import numpy as np
-import pytensor
 import pytensor.tensor as pt
 
-from pytensor.graph.basic import Node, equal_computations
+from pytensor.graph.basic import Apply, equal_computations
 from pytensor.tensor import TensorVariable
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.utils import normalize_size_param
@@ -56,15 +55,13 @@ __all__ = [
 ]
 
 
-class MarginalMixtureRV(SymbolicRandomVariable):
-    """A placeholder used to specify a log-likelihood for a mixture sub-graph."""
-
-    _print_name = ("MarginalMixture", "\\operatorname{MarginalMixture}")
+class _BaseMixtureRV(SymbolicRandomVariable):
+    """Base class SymbolicRandomVariable for Mixture and Hurdle RVs."""
 
     @classmethod
     def rv_op(cls, weights, *components, size=None):
         # We don't allow passing `rng` because we don't fully control the rng of the components!
-        mix_indexes_rng = pytensor.shared(np.random.default_rng())
+        mix_indexes_rng = pt.random.shared_rng(seed=None)
 
         single_component = len(components) == 1
         ndim_supp = components[0].owner.op.ndim_supp
@@ -123,8 +120,8 @@ class MarginalMixtureRV(SymbolicRandomVariable):
 
         # Draw mixture indexes and append (stack + ndim_supp) broadcastable dimensions to the right
         mix_indexes_rng_next, mix_indexes = pt.random.categorical(
-            weights_broadcasted, rng=mix_indexes_rng
-        ).owner.outputs
+            weights_broadcasted, rng=mix_indexes_rng, return_next_rng=True
+        )
         mix_indexes_padded = pt.shape_padright(mix_indexes, ndim_supp + 1)
 
         # Index components and squeeze mixture dimension
@@ -134,15 +131,15 @@ class MarginalMixtureRV(SymbolicRandomVariable):
         s = ",".join(f"s{i}" for i in range(components[0].owner.op.ndim_supp))
         if len(components) == 1:
             comp_s = ",".join((*s, "w"))
-            signature = f"[rng],(w),({comp_s})->[rng],({s})"
+            extended_signature = f"[rng],(w),({comp_s})->[rng],({s})"
         else:
             comps_s = ",".join(f"({s})" for _ in components)
-            signature = f"[rng],(w),{comps_s}->[rng],({s})"
+            extended_signature = f"[rng],(w),{comps_s}->[rng],({s})"
 
-        return MarginalMixtureRV(
+        return cls(
             inputs=[mix_indexes_rng, weights, *components],
             outputs=[mix_indexes_rng_next, mix_out],
-            signature=signature,
+            extended_signature=extended_signature,
         )(mix_indexes_rng, weights, *components)
 
     @classmethod
@@ -156,122 +153,13 @@ class MarginalMixtureRV(SymbolicRandomVariable):
 
         return [change_dist_size(component, size) for component in components]
 
-    def update(self, node: Node):
+    def update(self, node: Apply):
         # Update for the internal mix_indexes RV
         return {node.inputs[0]: node.outputs[0]}
 
 
-class Mixture(Distribution):
-    R"""
-    Mixture log-likelihood
-
-    Often used to model subpopulation heterogeneity
-
-    .. math:: f(x \mid w, \theta) = \sum_{i = 1}^n w_i f_i(x \mid \theta_i)
-
-    ========  ============================================
-    Support   :math:`\cup_{i = 1}^n \textrm{support}(f_i)`
-    Mean      :math:`\sum_{i = 1}^n w_i \mu_i`
-    ========  ============================================
-
-    Parameters
-    ----------
-    w : tensor_like of float
-        w >= 0 and w <= 1
-        the mixture weights
-    comp_dists : iterable of unnamed distributions or single batched distribution
-        Distributions should be created via the `.dist()` API. If a single distribution
-        is passed, the last size dimension (not shape) determines the number of mixture
-        components (e.g. `pm.Poisson.dist(..., size=components)`)
-        :math:`f_1, \ldots, f_n`
-
-        .. warning:: comp_dists will be cloned, rendering them independent of the ones passed as input.
-
-
-    Examples
-    --------
-    .. code-block:: python
-
-        # Mixture of 2 Poisson variables
-        with pm.Model() as model:
-            w = pm.Dirichlet('w', a=np.array([1, 1]))  # 2 mixture weights
-
-            lam1 = pm.Exponential('lam1', lam=1)
-            lam2 = pm.Exponential('lam2', lam=1)
-
-            # As we just need the logp, rather than add a RV to the model, we need to call `.dist()`
-            # These two forms are equivalent, but the second benefits from vectorization
-            components = [
-                pm.Poisson.dist(mu=lam1),
-                pm.Poisson.dist(mu=lam2),
-            ]
-            # `shape=(2,)` indicates 2 mixture components
-            components = pm.Poisson.dist(mu=pm.math.stack([lam1, lam2]), shape=(2,))
-
-            like = pm.Mixture('like', w=w, comp_dists=components, observed=data)
-
-
-    .. code-block:: python
-
-        # Mixture of Normal and StudentT variables
-        with pm.Model() as model:
-            w = pm.Dirichlet('w', a=np.array([1, 1]))  # 2 mixture weights
-
-            mu = pm.Normal("mu", 0, 1)
-
-            components = [
-                pm.Normal.dist(mu=mu, sigma=1),
-                pm.StudentT.dist(nu=4, mu=mu, sigma=1),
-            ]
-
-            like = pm.Mixture('like', w=w, comp_dists=components, observed=data)
-
-
-    .. code-block:: python
-
-        # Mixture of (5 x 3) Normal variables
-        with pm.Model() as model:
-            # w is a stack of 5 independent size 3 weight vectors
-            # If shape was `(3,)`, the weights would be shared across the 5 replication dimensions
-            w = pm.Dirichlet('w', a=np.ones(3), shape=(5, 3))
-
-            # Each of the 3 mixture components has an independent mean
-            mu = pm.Normal('mu', mu=np.arange(3), sigma=1, shape=3)
-
-            # These two forms are equivalent, but the second benefits from vectorization
-            components = [
-                pm.Normal.dist(mu=mu[0], sigma=1, shape=(5,)),
-                pm.Normal.dist(mu=mu[1], sigma=1, shape=(5,)),
-                pm.Normal.dist(mu=mu[2], sigma=1, shape=(5,)),
-            ]
-            components = pm.Normal.dist(mu=mu, sigma=1, shape=(5, 3))
-
-            # The mixture is an array of 5 elements
-            # Each element can be thought of as an independent scalar mixture of 3
-            # components with different means
-            like = pm.Mixture('like', w=w, comp_dists=components, observed=data)
-
-
-    .. code-block:: python
-
-        # Mixture of 2 Dirichlet variables
-        with pm.Model() as model:
-            w = pm.Dirichlet('w', a=np.ones(2))  # 2 mixture weights
-
-            # These two forms are equivalent, but the second benefits from vectorization
-            components = [
-                pm.Dirichlet.dist(a=[1, 10, 100], shape=(3,)),
-                pm.Dirichlet.dist(a=[100, 10, 1], shape=(3,)),
-            ]
-            components = pm.Dirichlet.dist(a=[[1, 10, 100], [100, 10, 1]], shape=(2, 3))
-
-            # The mixture is an array of 3 elements
-            # Each element comes from only one of the two core Dirichlet components
-            like = pm.Mixture('like', w=w, comp_dists=components, observed=data)
-    """
-
-    rv_type = MarginalMixtureRV
-    rv_op = MarginalMixtureRV.rv_op
+class _BaseMixtureDistribution(Distribution):
+    """Base class distribution for Mixture and Hurdle distributions."""
 
     @classmethod
     def dist(cls, w, comp_dists, **kwargs):
@@ -298,8 +186,6 @@ class Mixture(Distribution):
         # Check that components are not associated with a registered variable in the model
         components_ndim_supp = set()
         for dist in comp_dists:
-            # TODO: Allow these to not be a RandomVariable as long as we can call `ndim_supp` on them
-            #  and resize them
             if not isinstance(dist, TensorVariable) or not isinstance(
                 dist.owner.op, RandomVariable | SymbolicRandomVariable
             ):
@@ -318,8 +204,8 @@ class Mixture(Distribution):
         return super().dist([w, *comp_dists], **kwargs)
 
 
-@_change_dist_size.register(MarginalMixtureRV)
-def change_marginal_mixture_size(op, dist, new_size, expand=False):
+@_change_dist_size.register(_BaseMixtureRV)
+def change_mixture_size(op, dist, new_size, expand=False):
     rng, weights, *components = dist.owner.inputs
 
     if expand:
@@ -333,39 +219,32 @@ def change_marginal_mixture_size(op, dist, new_size, expand=False):
         old_size = components[0].shape[:size_dims]
         new_size = tuple(new_size) + tuple(old_size)
 
-    return Mixture.rv_op(weights, *components, size=new_size)
+    return op.rv_op(weights, *components, size=new_size)
 
 
-@_logprob.register(MarginalMixtureRV)
-def marginal_mixture_logprob(op, values, rng, weights, *components, **kwargs):
-    (value,) = values
+@_support_point.register(_BaseMixtureRV)
+def mixture_support_point(op, rv, rng, weights, *components):
+    ndim_supp = components[0].owner.op.ndim_supp
+    weights = pt.shape_padright(weights, ndim_supp)
+    mix_axis = -ndim_supp - 1
 
-    # single component
     if len(components) == 1:
-        # Need to broadcast value across mixture axis
-        mix_axis = -components[0].owner.op.ndim_supp - 1
-        components_logp = logp(components[0], pt.expand_dims(value, mix_axis))
+        support_point_components = support_point(components[0])
+
     else:
-        components_logp = pt.stack(
-            [logp(component, value) for component in components],
-            axis=-1,
+        support_point_components = pt.stack(
+            [support_point(component) for component in components],
+            axis=mix_axis,
         )
 
-    mix_logp = pt.logsumexp(pt.log(weights) + components_logp, axis=-1)
-
-    mix_logp = check_parameters(
-        mix_logp,
-        0 <= weights,
-        weights <= 1,
-        pt.isclose(pt.sum(weights, axis=-1), 1),
-        msg="0 <= weights <= 1, sum(weights) == 1",
-    )
-
-    return mix_logp
+    mix_support_point = pt.sum(weights * support_point_components, axis=mix_axis)
+    if components[0].dtype in discrete_types:
+        mix_support_point = pt.round(mix_support_point)
+    return mix_support_point
 
 
-@_logcdf.register(MarginalMixtureRV)
-def marginal_mixture_logcdf(op, value, rng, weights, *components, **kwargs):
+@_logcdf.register(_BaseMixtureRV)
+def mixture_logcdf(op, value, rng, weights, *components):
     # single component
     if len(components) == 1:
         # Need to broadcast value across mixture axis
@@ -390,27 +269,6 @@ def marginal_mixture_logcdf(op, value, rng, weights, *components, **kwargs):
     return mix_logcdf
 
 
-@_support_point.register(MarginalMixtureRV)
-def marginal_mixture_support_point(op, rv, rng, weights, *components):
-    ndim_supp = components[0].owner.op.ndim_supp
-    weights = pt.shape_padright(weights, ndim_supp)
-    mix_axis = -ndim_supp - 1
-
-    if len(components) == 1:
-        support_point_components = support_point(components[0])
-
-    else:
-        support_point_components = pt.stack(
-            [support_point(component) for component in components],
-            axis=mix_axis,
-        )
-
-    mix_support_point = pt.sum(weights * support_point_components, axis=mix_axis)
-    if components[0].dtype in discrete_types:
-        mix_support_point = pt.round(mix_support_point)
-    return mix_support_point
-
-
 # List of transforms that can be used by Mixture, either because they do not require
 # special handling or because we have custom logic to enable them. If new default
 # transforms are implemented, this list and function should be updated
@@ -431,8 +289,8 @@ class MixtureTransformWarning(UserWarning):
     pass
 
 
-@_default_transform.register(MarginalMixtureRV)
-def marginal_mixture_default_transform(op, rv):
+@_default_transform.register(_BaseMixtureRV)
+def mixture_default_transform(op, rv):
     def transform_warning():
         warnings.warn(
             f"No safe default transform found for Mixture distribution {rv}. This can "
@@ -491,9 +349,154 @@ def marginal_mixture_default_transform(op, rv):
         return default_transform
 
 
+class MixtureRV(_BaseMixtureRV):
+    _print_name = ("Mixture", "\\operatorname{Mixture}")
+
+
+class Mixture(_BaseMixtureDistribution):
+    R"""
+    Mixture distribution.
+
+    Often used to model subpopulation heterogeneity
+
+    .. math:: f(x \mid w, \theta) = \sum_{i = 1}^n w_i f_i(x \mid \theta_i)
+
+    ========  ============================================
+    Support   :math:`\cup_{i = 1}^n \textrm{support}(f_i)`
+    Mean      :math:`\sum_{i = 1}^n w_i \mu_i`
+    ========  ============================================
+
+    Parameters
+    ----------
+    w : tensor_like of float
+        w >= 0 and w <= 1
+        the mixture weights
+    comp_dists : iterable of unnamed distributions or single batched distribution
+        Distributions should be created via the `.dist()` API. If a single distribution
+        is passed, the last size dimension (not shape) determines the number of mixture
+        components (e.g. `pm.Poisson.dist(..., size=components)`)
+        :math:`f_1, \ldots, f_n`
+
+        .. warning:: comp_dists will be cloned, rendering them independent of the ones passed as input.
+
+
+    Examples
+    --------
+    .. code-block:: python
+
+        # Mixture of 2 Poisson variables
+        with pm.Model() as model:
+            w = pm.Dirichlet("w", a=np.array([1, 1]))  # 2 mixture weights
+
+            lam1 = pm.Exponential("lam1", lam=1)
+            lam2 = pm.Exponential("lam2", lam=1)
+
+            # As we just need the logp, rather than add a RV to the model, we need to call `.dist()`
+            # These two forms are equivalent, but the second benefits from vectorization
+            components = [
+                pm.Poisson.dist(mu=lam1),
+                pm.Poisson.dist(mu=lam2),
+            ]
+            # `shape=(2,)` indicates 2 mixture components
+            components = pm.Poisson.dist(mu=pm.math.stack([lam1, lam2]), shape=(2,))
+
+            like = pm.Mixture("like", w=w, comp_dists=components, observed=data)
+
+
+    .. code-block:: python
+
+        # Mixture of Normal and StudentT variables
+        with pm.Model() as model:
+            w = pm.Dirichlet("w", a=np.array([1, 1]))  # 2 mixture weights
+
+            mu = pm.Normal("mu", 0, 1)
+
+            components = [
+                pm.Normal.dist(mu=mu, sigma=1),
+                pm.StudentT.dist(nu=4, mu=mu, sigma=1),
+            ]
+
+            like = pm.Mixture("like", w=w, comp_dists=components, observed=data)
+
+
+    .. code-block:: python
+
+        # Mixture of (5 x 3) Normal variables
+        with pm.Model() as model:
+            # w is a stack of 5 independent size 3 weight vectors
+            # If shape was `(3,)`, the weights would be shared across the 5 replication dimensions
+            w = pm.Dirichlet("w", a=np.ones(3), shape=(5, 3))
+
+            # Each of the 3 mixture components has an independent mean
+            mu = pm.Normal("mu", mu=np.arange(3), sigma=1, shape=3)
+
+            # These two forms are equivalent, but the second benefits from vectorization
+            components = [
+                pm.Normal.dist(mu=mu[0], sigma=1, shape=(5,)),
+                pm.Normal.dist(mu=mu[1], sigma=1, shape=(5,)),
+                pm.Normal.dist(mu=mu[2], sigma=1, shape=(5,)),
+            ]
+            components = pm.Normal.dist(mu=mu, sigma=1, shape=(5, 3))
+
+            # The mixture is an array of 5 elements
+            # Each element can be thought of as an independent scalar mixture of 3
+            # components with different means
+            like = pm.Mixture("like", w=w, comp_dists=components, observed=data)
+
+
+    .. code-block:: python
+
+        # Mixture of 2 Dirichlet variables
+        with pm.Model() as model:
+            w = pm.Dirichlet("w", a=np.ones(2))  # 2 mixture weights
+
+            # These two forms are equivalent, but the second benefits from vectorization
+            components = [
+                pm.Dirichlet.dist(a=[1, 10, 100], shape=(3,)),
+                pm.Dirichlet.dist(a=[100, 10, 1], shape=(3,)),
+            ]
+            components = pm.Dirichlet.dist(a=[[1, 10, 100], [100, 10, 1]], shape=(2, 3))
+
+            # The mixture is an array of 3 elements
+            # Each element comes from only one of the two core Dirichlet components
+            like = pm.Mixture("like", w=w, comp_dists=components, observed=data)
+    """
+
+    rv_type = MixtureRV
+    rv_op = MixtureRV.rv_op
+
+
+@_logprob.register(MixtureRV)
+def mixture_logprob(op, values, rng, weights, *components, **kwargs):
+    (value,) = values
+
+    # single component
+    if len(components) == 1:
+        # Need to broadcast value across mixture axis
+        mix_axis = -components[0].owner.op.ndim_supp - 1
+        components_logp = logp(components[0], pt.expand_dims(value, mix_axis))
+    else:
+        components_logp = pt.stack(
+            [logp(component, value) for component in components],
+            axis=-1,
+        )
+
+    mix_logp = pt.logsumexp(pt.log(weights) + components_logp, axis=-1)
+
+    mix_logp = check_parameters(
+        mix_logp,
+        0 <= weights,
+        weights <= 1,
+        pt.isclose(pt.sum(weights, axis=-1), 1),
+        msg="0 <= weights <= 1, sum(weights) == 1",
+    )
+
+    return mix_logp
+
+
 class NormalMixture:
     R"""
-    Normal mixture log-likelihood
+    Normal mixture distribution.
 
     .. math::
 
@@ -555,9 +558,9 @@ class NormalMixture:
 
 
 def _zero_inflated_mixture(*, name, nonzero_p, nonzero_dist, **kwargs):
-    """Helper function to create a zero-inflated mixture
+    """Create a zero-inflated mixture (helper function).
 
-    If name is `None`, this function returns an unregistered variable
+    If name is `None`, this function returns an unregistered variable.
     """
     nonzero_p = pt.as_tensor_variable(nonzero_p)
     weights = pt.stack([1 - nonzero_p, nonzero_p], axis=-1)
@@ -573,7 +576,7 @@ def _zero_inflated_mixture(*, name, nonzero_p, nonzero_dist, **kwargs):
 
 class ZeroInflatedPoisson:
     R"""
-    Zero-inflated Poisson log-likelihood.
+    Zero-inflated Poisson distribution.
 
     Often used to model the number of events occurring in a fixed period
     of time when the times at which events occur are independent.
@@ -637,7 +640,7 @@ class ZeroInflatedPoisson:
 
 class ZeroInflatedBinomial:
     R"""
-    Zero-inflated Binomial log-likelihood.
+    Zero-inflated Binomial distribution.
 
     The pmf of this distribution is
 
@@ -701,11 +704,12 @@ class ZeroInflatedBinomial:
 
 class ZeroInflatedNegativeBinomial:
     R"""
-    Zero-Inflated Negative binomial log-likelihood.
+    Zero-Inflated Negative binomial distribution.
+
     The Zero-inflated version of the Negative Binomial (NB).
     The NB distribution describes a Poisson random variable
     whose rate parameter is gamma distributed.
-    The pmf of this distribution is
+    The pmf of this distribution is.
 
     .. math::
 
@@ -798,39 +802,77 @@ class ZeroInflatedNegativeBinomial:
         )
 
 
-def _hurdle_mixture(*, name, nonzero_p, nonzero_dist, dtype, **kwargs):
-    """Helper function to create a hurdle mixtures
+class _HurdleRV(_BaseMixtureRV):
+    _print_name = ("Hurdle", "\\operatorname{Hurdle}")
 
-    If name is `None`, this function returns an unregistered variable
 
-    In hurdle models, the zeros come from a completely different process than the rest of the data.
-    In other words, the zeros are not inflated, they come from a different process.
-    """
-    if dtype == "float":
-        zero = 0.0
-        lower = np.finfo(pytensor.config.floatX).eps
-    elif dtype == "int":
-        zero = 0
-        lower = 1
-    else:
-        raise ValueError("dtype must be 'float' or 'int'")
+class _Hurdle(_BaseMixtureDistribution):
+    rv_type = _HurdleRV
+    rv_op = _HurdleRV.rv_op
 
-    nonzero_p = pt.as_tensor_variable(nonzero_p)
-    weights = pt.stack([1 - nonzero_p, nonzero_p], axis=-1)
-    comp_dists = [
-        DiracDelta.dist(zero),
-        Truncated.dist(nonzero_dist, lower=lower),
-    ]
+    @classmethod
+    def _create(cls, *, name, nonzero_p, nonzero_dist, max_n_steps=10_000, **kwargs):
+        """Create a hurdle mixture (helper function).
 
-    if name is not None:
-        return Mixture(name, weights, comp_dists, **kwargs)
-    else:
-        return Mixture.dist(weights, comp_dists, **kwargs)
+        If name is `None`, this function returns an unregistered variable
+
+        In hurdle models, the zeros come from a completely different process than the rest of the data.
+        In other words, the zeros are not inflated, they come from a different process.
+
+        Note: this is invalid for discrete nonzero distributions with mass below 0, as we simply truncate[lower=1].
+        """
+        dtype = nonzero_dist.dtype
+
+        if dtype.startswith("int"):
+            # Need to truncate the distribution to exclude zero.
+            # Continuous distributions have "zero" mass at zero (and anywhere else), so can be used as is.
+            nonzero_dist = Truncated.dist(nonzero_dist, lower=1, max_n_steps=max_n_steps)
+        elif not dtype.startswith("float"):
+            raise ValueError(f"nonzero_dist dtype must be 'float' or 'int', got {dtype}")
+
+        nonzero_p = pt.as_tensor_variable(nonzero_p)
+        weights = pt.stack([1 - nonzero_p, nonzero_p], axis=-1)
+        comp_dists = [
+            DiracDelta.dist(np.asarray(0, dtype=dtype)),
+            nonzero_dist,
+        ]
+
+        if name is not None:
+            return cls(name, weights, comp_dists, **kwargs)
+        else:
+            return cls.dist(weights, comp_dists, **kwargs)
+
+
+@_logprob.register(_HurdleRV)
+def marginal_hurdle_logprob(op, values, rng, weights, zero_dist, dist, **kwargs):
+    (value,) = values
+
+    psi = weights[..., 1]
+
+    # Use a safe value for computing logp to avoid NaN gradients.
+    # pt.where evaluates both branches, so logp(dist, 0) would produce
+    # -inf for continuous distributions like Gamma, causing NaN gradients.
+    # By replacing zeros with a valid value (1.0), we ensure the gradient
+    # computation is well-defined even though the result is not selected.
+    safe_value = pt.switch(pt.eq(value, 0), 1.0, value)
+
+    hurdle_logp = pt.where(
+        pt.eq(value, 0),
+        pt.log(1 - psi),
+        pt.log(psi) + logp(dist, safe_value),
+    )
+
+    return check_parameters(
+        hurdle_logp,
+        0 <= psi,
+        psi <= 1,
+        msg="0 <= psi <= 1",
+    )
 
 
 class HurdlePoisson:
     R"""
-    Hurdle Poisson log-likelihood.
+    Hurdle Poisson distribution.
 
     The Poisson distribution is often used to model the number of events occurring
     in a fixed period of time or space when the times or locations
@@ -863,20 +905,26 @@ class HurdlePoisson:
     """
 
     def __new__(cls, name, psi, mu, **kwargs):
-        return _hurdle_mixture(
-            name=name, nonzero_p=psi, nonzero_dist=Poisson.dist(mu=mu), dtype="int", **kwargs
+        return _Hurdle._create(
+            name=name,
+            nonzero_p=psi,
+            nonzero_dist=Poisson.dist(mu=mu),
+            **kwargs,
         )
 
     @classmethod
     def dist(cls, psi, mu, **kwargs):
-        return _hurdle_mixture(
-            name=None, nonzero_p=psi, nonzero_dist=Poisson.dist(mu=mu), dtype="int", **kwargs
+        return _Hurdle._create(
+            name=None,
+            nonzero_p=psi,
+            nonzero_dist=Poisson.dist(mu=mu),
+            **kwargs,
         )
 
 
 class HurdleNegativeBinomial:
     R"""
-    Hurdle Negative Binomial log-likelihood.
+    Hurdle Negative Binomial distribution.
 
     The negative binomial distribution describes a Poisson random variable
     whose rate parameter is gamma distributed.
@@ -913,28 +961,26 @@ class HurdleNegativeBinomial:
     """
 
     def __new__(cls, name, psi, mu=None, alpha=None, p=None, n=None, **kwargs):
-        return _hurdle_mixture(
+        return _Hurdle._create(
             name=name,
             nonzero_p=psi,
             nonzero_dist=NegativeBinomial.dist(mu=mu, alpha=alpha, p=p, n=n),
-            dtype="int",
             **kwargs,
         )
 
     @classmethod
     def dist(cls, psi, mu=None, alpha=None, p=None, n=None, **kwargs):
-        return _hurdle_mixture(
+        return _Hurdle._create(
             name=None,
             nonzero_p=psi,
             nonzero_dist=NegativeBinomial.dist(mu=mu, alpha=alpha, p=p, n=n),
-            dtype="int",
             **kwargs,
         )
 
 
 class HurdleGamma:
     R"""
-    Hurdle Gamma log-likelihood.
+    Hurdle Gamma distribution.
 
     .. math::
 
@@ -962,31 +1008,35 @@ class HurdleGamma:
         Alternative shape parameter (mu > 0).
     sigma : tensor_like of float, optional
         Alternative scale parameter (sigma > 0).
+
+    .. warning::
+        HurdleGamma distributions cannot be sampled correctly with MCMC methods,
+        as this would require a specialized step sampler. They are intended to be used as
+        observed variables, and/or sampled exclusively with forward methods like
+        `sample_prior_predictive` and `sample_posterior_predictive`.
     """
 
     def __new__(cls, name, psi, alpha=None, beta=None, mu=None, sigma=None, **kwargs):
-        return _hurdle_mixture(
+        return _Hurdle._create(
             name=name,
             nonzero_p=psi,
             nonzero_dist=Gamma.dist(alpha=alpha, beta=beta, mu=mu, sigma=sigma),
-            dtype="float",
             **kwargs,
         )
 
     @classmethod
     def dist(cls, psi, alpha=None, beta=None, mu=None, sigma=None, **kwargs):
-        return _hurdle_mixture(
+        return _Hurdle._create(
             name=None,
             nonzero_p=psi,
             nonzero_dist=Gamma.dist(alpha=alpha, beta=beta, mu=mu, sigma=sigma),
-            dtype="float",
             **kwargs,
         )
 
 
 class HurdleLogNormal:
     R"""
-    Hurdle LogNormal log-likelihood.
+    Hurdle LogNormal distribution.
 
     .. math::
 
@@ -1014,23 +1064,27 @@ class HurdleLogNormal:
     tau : tensor_like of float, optional
         Scale parameter (tau > 0). (only required if sigma is not specified).
         Defaults to 1.
+
+    .. warning::
+        HurdleLogNormal distributions cannot be sampled correctly with MCMC methods,
+        as this would require a specialized step sampler. They are intended to be used as
+        observed variables, and/or sampled exclusively with forward methods like
+        `sample_prior_predictive` and `sample_posterior_predictive`.
     """
 
     def __new__(cls, name, psi, mu=0, sigma=None, tau=None, **kwargs):
-        return _hurdle_mixture(
+        return _Hurdle._create(
             name=name,
             nonzero_p=psi,
             nonzero_dist=LogNormal.dist(mu=mu, sigma=sigma, tau=tau),
-            dtype="float",
             **kwargs,
         )
 
     @classmethod
     def dist(cls, psi, mu=0, sigma=None, tau=None, **kwargs):
-        return _hurdle_mixture(
+        return _Hurdle._create(
             name=None,
             nonzero_p=psi,
             nonzero_dist=LogNormal.dist(mu=mu, sigma=sigma, tau=tau),
-            dtype="float",
             **kwargs,
         )

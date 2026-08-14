@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from pytensor.tensor.random.op import RandomVariable
 from scipy.special import logsumexp
 
 from pymc.distributions import (
+    Beta,
     Categorical,
     DiracDelta,
     Dirichlet,
@@ -49,13 +50,12 @@ from pymc.distributions import (
     Poisson,
     StickBreakingWeights,
     Triangular,
-    Truncated,
     Uniform,
     ZeroInflatedBinomial,
     ZeroInflatedNegativeBinomial,
     ZeroInflatedPoisson,
 )
-from pymc.distributions.mixture import MixtureTransformWarning
+from pymc.distributions.mixture import MixtureTransformWarning, _Hurdle
 from pymc.distributions.shape_utils import change_dist_size, to_tuple
 from pymc.distributions.transforms import _default_transform
 from pymc.logprob.basic import logp
@@ -433,7 +433,7 @@ class TestMixture:
         cov2 = np.diag([2.5, 3.5])
         obs = np.asarray([[0.5, 0.5], mu1, mu2])
         with Model() as model:
-            w = Dirichlet("w", floatX(np.ones(2)), transform=None, shape=(2,))
+            w = Dirichlet("w", floatX(np.ones(2)), default_transform=None, shape=(2,))
             mvncomp1 = MvNormal.dist(mu=mu1, cov=cov1)
             mvncomp2 = MvNormal.dist(mu=mu2, cov=cov2)
             y = Mixture("x_obs", w, [mvncomp1, mvncomp2], observed=obs)
@@ -561,7 +561,7 @@ class TestMixture:
 
         n_samples = 30
         with model:
-            prior = sample_prior_predictive(samples=n_samples, return_inferencedata=False)
+            prior = sample_prior_predictive(draws=n_samples, return_inferencedata=False)
             ppc = sample_posterior_predictive(
                 n_samples * [self.get_initial_point(model)], return_inferencedata=False
             )
@@ -607,7 +607,7 @@ class TestMixture:
 
         n_samples = 20
         with model:
-            prior = sample_prior_predictive(samples=n_samples, return_inferencedata=False)
+            prior = sample_prior_predictive(draws=n_samples, return_inferencedata=False)
             ppc = sample_posterior_predictive(
                 n_samples * [self.get_initial_point(model)], return_inferencedata=False
             )
@@ -630,19 +630,27 @@ class TestMixture:
         with Model() as model:
             # mixtures components
             g_comp = Normal.dist(
-                mu=Exponential("mu_g", lam=1.0, shape=nbr, transform=None), sigma=1, shape=nbr
+                mu=Exponential("mu_g", lam=1.0, shape=nbr, default_transform=None),
+                sigma=1,
+                shape=nbr,
             )
             l_comp = LogNormal.dist(
-                mu=Exponential("mu_l", lam=1.0, shape=nbr, transform=None), sigma=1, shape=nbr
+                mu=Exponential("mu_l", lam=1.0, shape=nbr, default_transform=None),
+                sigma=1,
+                shape=nbr,
             )
             # weight vector for the mixtures
-            g_w = Dirichlet("g_w", a=floatX(np.ones(nbr) * 0.0000001), transform=None, shape=(nbr,))
-            l_w = Dirichlet("l_w", a=floatX(np.ones(nbr) * 0.0000001), transform=None, shape=(nbr,))
+            g_w = Dirichlet(
+                "g_w", a=floatX(np.ones(nbr) * 0.0000001), default_transform=None, shape=(nbr,)
+            )
+            l_w = Dirichlet(
+                "l_w", a=floatX(np.ones(nbr) * 0.0000001), default_transform=None, shape=(nbr,)
+            )
             # mixture components
             g_mix = Mixture.dist(w=g_w, comp_dists=g_comp)
             l_mix = Mixture.dist(w=l_w, comp_dists=l_comp)
             # mixture of mixtures
-            mix_w = Dirichlet("mix_w", a=floatX(np.ones(2)), transform=None, shape=(2,))
+            mix_w = Dirichlet("mix_w", a=floatX(np.ones(2)), default_transform=None, shape=(2,))
             mix = Mixture("mix", w=mix_w, comp_dists=[g_mix, l_mix], observed=np.exp(norm_x))
 
         test_point = model.initial_point()
@@ -804,7 +812,7 @@ class TestNormalMixture:
         assert_allclose(np.sort(trace["mu"].mean(axis=0)), np.sort(norm_mu), rtol=0.1, atol=0.1)
 
     @pytest.mark.parametrize(
-        "nd, ncomp", [(tuple(), 5), (1, 5), (3, 5), ((3, 3), 5), (3, 3), ((3, 3), 3)], ids=str
+        "nd, ncomp", [((), 5), (1, 5), (3, 5), ((3, 3), 5), (3, 3), ((3, 3), 3)], ids=str
     )
     def test_normal_mixture_nd(self, seeded_test, nd, ncomp):
         nd = to_tuple(nd)
@@ -917,7 +925,9 @@ class TestMixtureVsLatent:
 
         # Check that logp is the same whether elements of the last axis are mixed or not
         logp_fn = model.compile_logp(vars=[m])
-        assert np.isclose(logp_fn({"m": [0, 0, 0]}), logp_fn({"m": [0, 1, 2]}))
+        ip = model.initial_point()
+
+        assert np.isclose(logp_fn(ip | {"m": [0, 0, 0]}), logp_fn(ip | {"m": [0, 1, 2]}))
         self.logp_matches(m, latent_m, z, npop, model=model)
 
     def test_vector_components(self):
@@ -938,8 +948,8 @@ class TestMixtureVsLatent:
             latent_m = Normal("latent_m", mu=mus[..., z], sigma=1e-5, shape=nd)
 
         size = 100
-        m_val = draw(m, draws=size, random_seed=998)
-        latent_m_val = draw(latent_m, draws=size, random_seed=998 * 2)
+        m_val = draw(m, draws=size, random_seed=997)
+        latent_m_val = draw(latent_m, draws=size, random_seed=997 * 2)
         assert m_val.shape == latent_m_val.shape
         # Test that each element in axis = -1 comes from the same mixture
         # component
@@ -952,7 +962,12 @@ class TestMixtureVsLatent:
 
         # Check that mixing of values in the last axis leads to smaller logp
         logp_fn = model.compile_logp(vars=[m])
-        assert logp_fn({"m": [0, 0, 0]}) > logp_fn({"m": [0, 1, 0]}) > logp_fn({"m": [0, 1, 2]})
+        ip = model.initial_point()
+        assert (
+            logp_fn(ip | {"m": [0, 0, 0]})
+            > logp_fn(ip | {"m": [0, 1, 0]})
+            > logp_fn(ip | {"m": [0, 1, 2]})
+        )
         self.logp_matches(m, latent_m, z, npop, model=model)
 
     def samples_from_same_distribution(self, *args):
@@ -1028,7 +1043,7 @@ class TestMixtureSameFamily:
                 comp_dists=comp_dists,
                 shape=(*batch_shape, 3),
             )
-            prior = sample_prior_predictive(samples=self.n_samples, return_inferencedata=False)
+            prior = sample_prior_predictive(draws=self.n_samples, return_inferencedata=False)
 
         assert prior["mixture"].shape == (self.n_samples, *batch_shape, 3)
         assert draw(mixture, draws=self.size).shape == (self.size, *batch_shape, 3)
@@ -1060,7 +1075,7 @@ class TestMixtureSameFamily:
         with Model() as model:
             comp_dists = MvNormal.dist(mu=mu, chol=chol, shape=(self.mixture_comps, 3))
             mixture = Mixture("mixture", w=w, comp_dists=comp_dists, shape=(3,))
-            prior = sample_prior_predictive(samples=self.n_samples, return_inferencedata=False)
+            prior = sample_prior_predictive(draws=self.n_samples, return_inferencedata=False)
 
         assert prior["mixture"].shape == (self.n_samples, 3)
         assert draw(mixture, draws=self.size).shape == (self.size, 3)
@@ -1084,7 +1099,7 @@ class TestMixtureSameFamily:
             mu = Gamma("mu", 1.0, 1.0, shape=2)
             comp_dists = Poisson.dist(mu, shape=2)
             mix = Mixture("mix", w=np.ones(2) / 2, comp_dists=comp_dists, shape=(1000,))
-            prior = sample_prior_predictive(samples=self.n_samples, return_inferencedata=False)
+            prior = sample_prior_predictive(draws=self.n_samples, return_inferencedata=False)
 
         assert prior["mix"].shape == (self.n_samples, 1000)
 
@@ -1306,9 +1321,9 @@ class TestMixtureDefaultTransforms:
         with Model() as model:
             lower = Normal("lower", 0.5)
             upper = Uniform("upper", 0, 1)
-            uniform = Uniform("uniform", -pt.abs(lower), pt.abs(upper), transform=None)
+            uniform = Uniform("uniform", -pt.abs(lower), pt.abs(upper), default_transform=None)
             triangular = Triangular(
-                "triangular", -pt.abs(lower), pt.abs(upper), c=0.25, transform=None
+                "triangular", -pt.abs(lower), pt.abs(upper), c=0.25, default_transform=None
             )
             comp_dists = [
                 Uniform.dist(-pt.abs(lower), pt.abs(upper)),
@@ -1334,7 +1349,7 @@ class TestMixtureDefaultTransforms:
             halfnorm = HalfNormal("halfnorm")
             comp_dists = [HalfNormal.dist(), HalfNormal.dist()]
             mix_transf = Mixture("mix_transf", w=[0.5, 0.5], comp_dists=comp_dists)
-            mix = Mixture("mix", w=[0.5, 0.5], comp_dists=comp_dists, transform=None)
+            mix = Mixture("mix", w=[0.5, 0.5], comp_dists=comp_dists, default_transform=None)
 
         logp_fn = m.compile_logp(vars=[halfnorm, mix_transf, mix], sum=False)
         test_point = {"halfnorm_log__": 1, "mix_transf_log__": 1, "mix": np.exp(1)}
@@ -1405,14 +1420,14 @@ class TestZeroInflatedMixture:
 
     def test_zeroinflatednegativebinomial_logp(self):
         def logp_fn(value, psi, mu, alpha):
-            n, p = NegativeBinomial.get_n_p(mu=mu, alpha=alpha)
+            n, p = alpha, alpha / (mu + alpha)
             if value == 0:
                 return np.log((1 - psi) * st.nbinom.pmf(0, n, p))
             else:
                 return np.log(psi * st.nbinom.pmf(value, n, p))
 
         def logcdf_fn(value, psi, mu, alpha):
-            n, p = NegativeBinomial.get_n_p(mu=mu, alpha=alpha)
+            n, p = alpha, alpha / (mu + alpha)
             return np.log((1 - psi) + psi * st.nbinom.cdf(value, n, p))
 
         check_logp(
@@ -1522,10 +1537,12 @@ class TestZeroInflatedMixture:
             (0.2, 10, 4, 5, np.full(5, 2)),
             (
                 0.4,
-                np.arange(1, 5),
+                # keep the means off whole numbers, where the floor in the support
+                # point is sensitive to how p was built
+                np.arange(1, 5) + 0.5,
                 np.arange(2, 6),
                 None,
-                np.array([0, 1, 1, 2] if pytensor.config.floatX == "float64" else [0, 0, 1, 1]),
+                np.array([0, 1, 1, 2]),
             ),
             (
                 np.linspace(0.2, 0.6, 3),
@@ -1555,26 +1572,24 @@ class TestZeroInflatedMixture:
         assert x.eval().shape == (3,)
 
 
-class TestHurdleMixtures:
+class TestHurdleDistributions:
     @staticmethod
-    def check_hurdle_mixture_graph(dist):
+    def check_hurdle_graph(dist):
         # Assert it's a mixture
-        assert isinstance(dist.owner.op, Mixture)
+        assert isinstance(dist.owner.op, _Hurdle)
 
         # Extract the distribution for zeroes and nonzeroes
         zero_dist, nonzero_dist = dist.owner.inputs[-2:]
 
         # Assert ops are of the right type
         assert isinstance(zero_dist.owner.op, DiracDelta)
-        assert isinstance(nonzero_dist.owner.op, Truncated)
-
         return zero_dist, nonzero_dist
 
     def test_hurdle_poisson_graph(self):
         # There's nothing special in these values
         psi, mu = 0.3, 4
         dist = HurdlePoisson.dist(psi=psi, mu=mu)
-        _, nonzero_dist = self.check_hurdle_mixture_graph(dist)
+        _, nonzero_dist = self.check_hurdle_graph(dist)
 
         # Assert the truncated distribution is of the right type
         assert isinstance(nonzero_dist.owner.op.base_rv_op, Poisson)
@@ -1585,7 +1600,7 @@ class TestHurdleMixtures:
     def test_hurdle_negativebinomial_graph(self):
         psi, p, n = 0.2, 0.6, 10
         dist = HurdleNegativeBinomial.dist(psi=psi, p=p, n=n)
-        _, nonzero_dist = self.check_hurdle_mixture_graph(dist)
+        _, nonzero_dist = self.check_hurdle_graph(dist)
 
         assert isinstance(nonzero_dist.owner.op.base_rv_op, NegativeBinomial)
         assert nonzero_dist.owner.inputs[-4].data == n
@@ -1594,22 +1609,24 @@ class TestHurdleMixtures:
     def test_hurdle_gamma_graph(self):
         psi, alpha, beta = 0.25, 3, 4
         dist = HurdleGamma.dist(psi=psi, alpha=alpha, beta=beta)
-        _, nonzero_dist = self.check_hurdle_mixture_graph(dist)
+        _, nonzero_dist = self.check_hurdle_graph(dist)
 
         # Under the hood it uses the shape-scale parametrization of the Gamma distribution.
         # So the second value is the reciprocal of the rate (i.e. 1 / beta)
-        assert isinstance(nonzero_dist.owner.op.base_rv_op, Gamma)
-        assert nonzero_dist.owner.inputs[-4].data == alpha
-        assert nonzero_dist.owner.inputs[-3].eval() == 1 / beta
+        assert isinstance(nonzero_dist.owner.op, Gamma)
+        alpha_param, reciprocal_beta_param = nonzero_dist.owner.op.dist_params(nonzero_dist.owner)
+        assert alpha_param.data == alpha
+        assert reciprocal_beta_param.eval() == 1 / beta
 
     def test_hurdle_lognormal_graph(self):
         psi, mu, sigma = 0.1, 2, 2.5
         dist = HurdleLogNormal.dist(psi=psi, mu=mu, sigma=sigma)
-        _, nonzero_dist = self.check_hurdle_mixture_graph(dist)
+        _, nonzero_dist = self.check_hurdle_graph(dist)
 
-        assert isinstance(nonzero_dist.owner.op.base_rv_op, LogNormal)
-        assert nonzero_dist.owner.inputs[-4].data == mu
-        assert nonzero_dist.owner.inputs[-3].data == sigma
+        assert isinstance(nonzero_dist.owner.op, LogNormal)
+        mu_param, sigma_param = nonzero_dist.owner.op.dist_params(nonzero_dist.owner)
+        assert mu_param.data == mu
+        assert sigma_param.data == sigma
 
     @pytest.mark.parametrize(
         "dist, psi, non_psi_args",
@@ -1676,7 +1693,7 @@ class TestHurdleMixtures:
 
     def test_hurdle_negativebinomial_logp(self):
         def logp_fn(value, psi, mu, alpha):
-            n, p = NegativeBinomial.get_n_p(mu=mu, alpha=alpha)
+            n, p = alpha, alpha / (mu + alpha)
             if value == 0:
                 return np.log(1 - psi)
             else:
@@ -1691,11 +1708,7 @@ class TestHurdleMixtures:
             if value == 0:
                 return np.log(1 - psi)
             else:
-                return (
-                    np.log(psi)
-                    + st.gamma.logpdf(value, alpha, scale=1.0 / beta)
-                    - np.log(1 - st.gamma.cdf(np.finfo(float).eps, alpha, scale=1.0 / beta))
-                )
+                return np.log(psi) + st.gamma.logpdf(value, alpha, scale=1.0 / beta)
 
         check_logp(HurdleGamma, Rplus, {"psi": Unit, "alpha": Rplusbig, "beta": Rplusbig}, logp_fn)
 
@@ -1704,10 +1717,40 @@ class TestHurdleMixtures:
             if value == 0:
                 return np.log(1 - psi)
             else:
-                return (
-                    np.log(psi)
-                    + st.lognorm.logpdf(value, sigma, 0, np.exp(mu))
-                    - np.log(1 - st.lognorm.cdf(np.finfo(float).eps, sigma, 0, np.exp(mu)))
-                )
+                return np.log(psi) + st.lognorm.logpdf(value, sigma, 0, np.exp(mu))
 
         check_logp(HurdleLogNormal, Rplus, {"psi": Unit, "mu": R, "sigma": Rplusbig}, logp_fn)
+
+    @pytest.mark.parametrize(
+        "hurdle_cls,dist_params",
+        [
+            (HurdleGamma, {"psi": 0.3, "alpha": 2.0, "beta": 1.5}),
+            (HurdleLogNormal, {"psi": 0.3, "mu": 0.0, "sigma": 1.0}),
+        ],
+    )
+    def test_hurdle_dlogp_no_nan(self, hurdle_cls, dist_params):
+        """Test that dlogp does not return NaN for Hurdle distributions.
+
+        Regression test for issue #8053. The gradient of pt.where evaluates both
+        branches, so logp(dist, 0) would produce invalid gradients for continuous
+        distributions like Gamma. The fix uses a safe value for the logp computation.
+        """
+        dist = hurdle_cls.dist(**dist_params)
+        y = draw(dist, draws=50, random_seed=1)
+
+        with Model() as model:
+            psi = Beta("psi", alpha=2.0, beta=2.0)
+            if hurdle_cls == HurdleGamma:
+                alpha = HalfNormal("alpha", sigma=2.0)
+                beta = HalfNormal("beta", sigma=2.0)
+                hurdle_cls("y_obs", psi=psi, alpha=alpha, beta=beta, observed=y)
+            else:  # HurdleLogNormal
+                mu = Normal("mu", mu=0.0, sigma=1.0)
+                sigma = HalfNormal("sigma", sigma=1.0)
+                hurdle_cls("y_obs", psi=psi, mu=mu, sigma=sigma, observed=y)
+
+        dlogp_fn = model.compile_dlogp()
+        ip = model.initial_point()
+        dlogp_val = dlogp_fn(ip)
+
+        assert not np.any(np.isnan(dlogp_val)), f"dlogp contains NaN: {dlogp_val}"

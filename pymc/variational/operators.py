@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ import pytensor
 
 from pytensor.graph.basic import Variable
 
-import pymc as pm
-
+from pymc.pytensorf import floatX
 from pymc.variational import opvi
 from pymc.variational.opvi import (
     NotImplementedInference,
@@ -32,7 +31,7 @@ __all__ = ["KL", "KSD"]
 
 
 class KL(Operator):
-    R"""**Operator based on Kullback Leibler Divergence**
+    R"""**Operator based on Kullback Leibler Divergence**.
 
     This operator constructs Evidence Lower Bound (ELBO) objective
 
@@ -57,7 +56,7 @@ class KL(Operator):
 
     def __init__(self, approx, beta=1.0):
         super().__init__(approx)
-        self.beta = pm.floatX(beta)
+        self.beta = floatX(beta)
 
     def apply(self, f):
         return -self.datalogp_norm + self.beta * (self.logq_norm - self.varlogp_norm)
@@ -67,7 +66,7 @@ class KL(Operator):
 
 
 class KSDObjective(ObjectiveFunction):
-    R"""Helper class for construction loss and updates for variational inference
+    R"""Helper class for construction loss and updates for variational inference.
 
     Parameters
     ----------
@@ -84,7 +83,6 @@ class KSDObjective(ObjectiveFunction):
             raise opvi.ParametrizationError("Op should be KSD")
         super().__init__(op, tf)
 
-    @pytensor.config.change_flags(compute_test_value="off")
     def __call__(self, nmc, **kwargs) -> list[Variable]:
         op: KSD = self.op
         grad = op.apply(self.tf)
@@ -96,7 +94,7 @@ class KSDObjective(ObjectiveFunction):
             params = self.obj_params + kwargs["more_obj_params"]
         else:
             params = self.test_params + kwargs["more_tf_params"]
-            grad *= pm.floatX(-1)
+            grad *= floatX(-1)
         grads = pytensor.grad(None, params, known_grads={z: grad})
         return self.approx.set_size_and_deterministic(
             grads, nmc, 0, kwargs.get("more_replacements")
@@ -104,7 +102,7 @@ class KSDObjective(ObjectiveFunction):
 
 
 class KSD(Operator):
-    R"""**Operator based on Kernelized Stein Discrepancy**
+    R"""**Operator based on Kernelized Stein Discrepancy**.
 
     Input: A target distribution with density function :math:`p(x)`
         and a set of initial particles :math:`\{x^0_i\}^n_{i=1}`
@@ -134,7 +132,7 @@ class KSD(Operator):
     has_test_function = True
     returns_loss = False
     require_logq = False
-    objective_class = KSDObjective
+    objective_class = KSDObjective  # type: ignore[assignment]
 
     def __init__(self, approx, temperature=1):
         super().__init__(approx)
@@ -152,4 +150,4 @@ class KSD(Operator):
             use_histogram=self.approx.all_histograms,
             temperature=self.temperature,
         )
-        return pm.floatX(-1) * stein.grad
+        return floatX(-1) * stein.grad

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -36,11 +36,11 @@ from tests.helpers import StepMethodTester
 from tests.models import simple_2model_continuous
 
 
-def test_all_stepmethods_emit_tune_stat():
+def test_stepmethods_do_not_require_tune_stat():
     step_types = pm.step_methods.STEP_METHODS
     assert len(step_types) > 5
     for cls in step_types:
-        assert "tune" in cls.stats_dtypes_shapes
+        assert "tune" not in cls.stats_dtypes_shapes
 
 
 class TestCompoundStep:
@@ -140,7 +140,7 @@ class TestStatsMetadata:
         with pm.Model():
             s1 = pm.NUTS(pm.Normal("n"))
             s2 = pm.Metropolis(pm.Bernoulli("b", 0.5))
-            cs = pm.CompoundStep([s1, s2])
+            cs = CompoundStep([s1, s2])
         # Make sure that sampler initialization does not modify the
         # class-level default values of the attributes.
         assert pm.NUTS.stats_dtypes == []
@@ -179,8 +179,8 @@ class TestStatsBijection:
         assert bij.n_samplers == 2
         w = Warning("hmm")
         stats_l = [
-            dict(a=1.5, b=3),
-            dict(a=2.5, c=w),
+            {"a": 1.5, "b": 3},
+            {"a": 2.5, "c": w},
         ]
         stats_d = bij.map(stats_l)
         assert isinstance(stats_d, dict)

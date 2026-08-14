@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -41,18 +41,19 @@ import pytest
 import scipy.stats.distributions as sp
 
 from pytensor import function
+from pytensor.compile import get_default_mode
 from pytensor.graph.basic import Variable
 from pytensor.ifelse import ifelse
+from pytensor.link.numba import NumbaLinker
 from pytensor.tensor.random.basic import CategoricalRV
 from pytensor.tensor.shape import shape_tuple
 from pytensor.tensor.subtensor import (
     AdvancedSubtensor,
-    AdvancedSubtensor1,
     Subtensor,
     as_index_constant,
 )
 
-from pymc.logprob.abstract import MeasurableVariable
+from pymc.logprob.abstract import MeasurableOp
 from pymc.logprob.basic import conditional_logp, logp
 from pymc.logprob.mixture import MeasurableSwitchMixture, expand_indices
 from pymc.logprob.rewriting import construct_ir_fgraph
@@ -67,7 +68,6 @@ def test_mixture_basics():
         Y_rv = pt.random.gamma(0.5, scale=2.0, size=size, name="Y")
 
         p_at = pt.scalar("p")
-        p_at.tag.test_value = 0.5
 
         I_rv = pt.random.bernoulli(p_at, size=size, name="I")
         i_vv = I_rv.clone()
@@ -90,56 +90,54 @@ def test_mixture_basics():
     i_vv = env["i_vv"]
     M_rv = env["M_rv"]
     m_vv = env["m_vv"]
+    p_at = env["p_at"]
 
     x_vv = X_rv.clone()
     x_vv.name = "x"
 
-    with pytest.raises(RuntimeError, match="could not be derived: {m}"):
-        conditional_logp({M_rv: m_vv, I_rv: i_vv, X_rv: x_vv})
+    mix_logp = conditional_logp({M_rv: m_vv, I_rv: i_vv, X_rv: x_vv})
+    mix_logp_combined = pt.add(*mix_logp.values())
+    assert_no_rvs(mix_logp_combined)
 
-    with pytest.raises(RuntimeError, match="could not be derived: {m}"):
+    p_val = np.array(0.5, dtype=pytensor.config.floatX)
+    x_val = np.array(1.0, dtype=pytensor.config.floatX)
+
+    # if I == 0, then M == X; any mismatch should yield -inf
+    bad_logp = mix_logp_combined.eval(
+        {
+            p_at: p_val,
+            i_vv: np.array(0, dtype=i_vv.dtype),
+            x_vv: x_val,
+            m_vv: np.array(0.0, dtype=pytensor.config.floatX),
+        }
+    )
+    assert np.isneginf(bad_logp)
+
+    good_logp = mix_logp_combined.eval(
+        {
+            p_at: p_val,
+            i_vv: np.array(0, dtype=i_vv.dtype),
+            x_vv: x_val,
+            m_vv: x_val,
+        }
+    )
+    assert np.isfinite(good_logp)
+
+    # if I == 1, M comes from Y and is independent of X
+    y_logp = mix_logp_combined.eval(
+        {
+            p_at: p_val,
+            i_vv: np.array(1, dtype=i_vv.dtype),
+            x_vv: x_val,
+            m_vv: np.array(1.0, dtype=pytensor.config.floatX),
+        }
+    )
+    assert np.isfinite(y_logp)
+
+    # Symbolic join axes are rejected by PyTensor at graph construction
+    with pytest.raises(TypeError, match="axis of join must be a constant"):
         axis_at = pt.lscalar("axis")
-        axis_at.tag.test_value = 0
-        env = create_mix_model((2,), axis_at)
-        I_rv = env["I_rv"]
-        i_vv = env["i_vv"]
-        M_rv = env["M_rv"]
-        m_vv = env["m_vv"]
-        conditional_logp({M_rv: m_vv, I_rv: i_vv})
-
-
-@pytensor.config.change_flags(compute_test_value="warn")
-@pytest.mark.parametrize(
-    "op_constructor",
-    [
-        lambda _I, _X, _Y: pt.stack([_X, _Y])[_I],
-        lambda _I, _X, _Y: pt.switch(_I, _X, _Y),
-    ],
-)
-def test_compute_test_value(op_constructor):
-    X_rv = pt.random.normal(0, 1, name="X")
-    Y_rv = pt.random.gamma(0.5, scale=2.0, name="Y")
-
-    p_at = pt.scalar("p")
-    p_at.tag.test_value = 0.3
-
-    I_rv = pt.random.bernoulli(p_at, name="I")
-
-    i_vv = I_rv.clone()
-    i_vv.name = "i"
-
-    M_rv = op_constructor(I_rv, X_rv, Y_rv)
-    M_rv.name = "M"
-
-    m_vv = M_rv.clone()
-    m_vv.name = "m"
-
-    del M_rv.tag.test_value
-
-    M_logp = conditional_logp({M_rv: m_vv, I_rv: i_vv})
-    M_logp_combined = pt.add(*M_logp.values())
-
-    assert isinstance(M_logp_combined.tag.test_value, np.ndarray)
+        create_mix_model((2,), axis_at)
 
 
 @pytest.mark.parametrize(
@@ -161,12 +159,10 @@ def test_hetero_mixture_binomial(p_val, size, supported):
 
     if np.ndim(p_val) == 0:
         p_at = pt.scalar("p")
-        p_at.tag.test_value = p_val
         I_rv = pt.random.bernoulli(p_at, size=size, name="I")
         p_val_1 = p_val
     else:
         p_at = pt.vector("p")
-        p_at.tag.test_value = np.array(p_val, dtype=pytensor.config.floatX)
         I_rv = pt.random.categorical(p_at, size=size, name="I")
         p_val_1 = p_val[1]
 
@@ -570,7 +566,6 @@ def test_hetero_mixture_categorical(
 
     p_at = pt.as_tensor(p_val).type()
     p_at.name = "p"
-    p_at.tag.test_value = np.array(p_val, dtype=pytensor.config.floatX)
     I_rv = pt.random.categorical(p_at, size=idx_size, name="I")
 
     i_vv = I_rv.clone()
@@ -822,61 +817,6 @@ def test_expand_indices_single_indices(A_parts, indices):
     assert np.array_equal(res, exp_res)
 
 
-@pytest.mark.parametrize(
-    "A_parts, indices",
-    [
-        (
-            (
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-            ),
-            (None,),
-        ),
-        (
-            (
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-            ),
-            (None, None, None),
-        ),
-        (
-            (
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-            ),
-            (None, 1, None, 0, None),
-        ),
-        (
-            (
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-            ),
-            (slice(2, 3), None, 1, None, 0, None),
-        ),
-        (
-            (
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-                np.random.normal(size=(4, 3)),
-            ),
-            (slice(2, 3), None, 1, 0, None),
-        ),
-    ],
-)
-def test_expand_indices_newaxis(A_parts, indices):
-    A = pt.stack(A_parts)
-    at_indices = [as_index_constant(idx) for idx in indices]
-    full_indices = expand_indices(at_indices, shape_tuple(A))
-    assert len(full_indices) == A.ndim
-    exp_res = A[indices].eval()
-    res = A[full_indices].eval()
-    assert np.array_equal(res, exp_res)
-
-
 def test_mixture_with_DiracDelta():
     srng = pt.random.RandomStream(29833)
 
@@ -920,8 +860,8 @@ def test_scalar_switch_mixture():
     z_vv = Z1_rv.clone()
     z_vv.name = "z1"
 
-    fgraph, _, _ = construct_ir_fgraph({Z1_rv: z_vv, I_rv: i_vv})
-    assert isinstance(fgraph.outputs[0].owner.op, MeasurableSwitchMixture)
+    fgraph = construct_ir_fgraph({Z1_rv: z_vv, I_rv: i_vv})
+    assert isinstance(fgraph.outputs[0].owner.inputs[0].owner.op, MeasurableSwitchMixture)
 
     # building the identical graph but with a stack to check that mixture logps are identical
     Z2_rv = pt.stack((Y_rv, X_rv))[I_rv]
@@ -992,19 +932,53 @@ def test_switch_mixture_invalid_bcast():
     invalid_false_branch = pt.abs(pt.random.normal(size=()))
 
     valid_mix = pt.switch(valid_switch_cond, valid_true_branch, valid_false_branch)
-    fgraph, _, _ = construct_ir_fgraph({valid_mix: valid_mix.type()})
-    assert isinstance(fgraph.outputs[0].owner.op, MeasurableVariable)
-    assert isinstance(fgraph.outputs[0].owner.op, MeasurableSwitchMixture)
+    fgraph = construct_ir_fgraph({valid_mix: valid_mix.type()})
+    assert isinstance(fgraph.outputs[0].owner.inputs[0].owner.op, MeasurableOp)
+    assert isinstance(fgraph.outputs[0].owner.inputs[0].owner.op, MeasurableSwitchMixture)
 
     invalid_mix = pt.switch(invalid_switch_cond, valid_true_branch, valid_false_branch)
-    fgraph, _, _ = construct_ir_fgraph({invalid_mix: invalid_mix.type()})
-    assert not isinstance(fgraph.outputs[0].owner.op, MeasurableVariable)
+    fgraph = construct_ir_fgraph({invalid_mix: invalid_mix.type()})
+    assert not isinstance(fgraph.outputs[0].owner.inputs[0].owner.op, MeasurableOp)
 
     invalid_mix = pt.switch(valid_switch_cond, valid_true_branch, invalid_false_branch)
-    fgraph, _, _ = construct_ir_fgraph({invalid_mix: invalid_mix.type()})
-    assert not isinstance(fgraph.outputs[0].owner.op, MeasurableVariable)
+    fgraph = construct_ir_fgraph({invalid_mix: invalid_mix.type()})
+    assert not isinstance(fgraph.outputs[0].owner.inputs[0].owner.op, MeasurableOp)
 
 
+def test_switch_mixture_constant_branch_broadcast_ok():
+    t = pt.arange(10)
+
+    p = pt.as_tensor(np.array([0.5, 0.5], dtype=pytensor.config.floatX))
+    cat = pt.random.categorical(p=p, size=(10,))
+
+    cat_fixed_const = pt.where(t > 5, cat, -1)
+
+    dirac_branch = dirac_delta(pt.full_like(t, -1, dtype=cat.dtype))
+    cat_fixed_dirac = pt.where(t > 5, cat, dirac_branch)
+
+    vv_const = cat_fixed_const.clone()
+    vv_dirac = cat_fixed_dirac.clone()
+    logp_const = logp(cat_fixed_const, vv_const)
+    logp_dirac = logp(cat_fixed_dirac, vv_dirac)
+    test_value = np.where(np.arange(10) > 5, 0, -1).astype(vv_const.dtype)
+    np.testing.assert_allclose(
+        logp_const.eval({vv_const: test_value}),
+        logp_dirac.eval({vv_dirac: test_value.astype(vv_dirac.dtype)}),
+    )
+
+    bad_value = test_value.copy()
+    bad_value[0] = 0  # violates the deterministic branch requirement (-1)
+    bad_const = logp_const.eval({vv_const: bad_value})
+    bad_dirac = logp_dirac.eval({vv_dirac: bad_value.astype(vv_dirac.dtype)})
+    assert np.isneginf(bad_const[0])
+    assert np.isneginf(bad_dirac[0])
+
+
+@pytest.mark.xfail(
+    condition=isinstance(get_default_mode().linker, NumbaLinker),
+    raises=AssertionError,
+    reason="Logp graph fails when evaluated with a non-lazy approach. https://github.com/pymc-devs/pymc/issues/8036",
+)
 def test_ifelse_mixture_one_component():
     if_rv = pt.random.bernoulli(0.5, name="if")
     scale_rv = pt.random.halfnormal(name="scale")
@@ -1031,18 +1005,26 @@ def test_ifelse_mixture_one_component():
     )
 
 
+@pytest.mark.xfail(
+    condition=isinstance(get_default_mode().linker, NumbaLinker),
+    raises=AssertionError,
+    reason="Logp graph fails when evaluated with a non-lazy approach. https://github.com/pymc-devs/pymc/issues/8036",
+)
 def test_ifelse_mixture_multiple_components():
     rng = np.random.default_rng(968)
 
     if_var = pt.scalar("if_var", dtype="bool")
     comp_then1 = pt.random.normal(size=(2,), name="comp_true1")
-    comp_then2 = comp_then1 + pt.random.normal(size=(2, 2), name="comp_then2")
+    comp_then2 = comp_then1 + pt.random.normal(size=(2, 2))
+    comp_then2.name = "comp_then2"
     comp_else1 = pt.random.halfnormal(size=(4,), name="comp_else1")
     comp_else2 = pt.random.halfnormal(size=(4, 4), name="comp_else2")
 
     mix_rv1, mix_rv2 = ifelse(
         if_var, [comp_then1, comp_then2], [comp_else1, comp_else2], name="mix"
     )
+    mix_rv1.name = "mix1"
+    mix_rv2.name = "mix2"
     mix_vv1 = mix_rv1.clone()
     mix_vv2 = mix_rv2.clone()
     mix_logp1, mix_logp2 = conditional_logp({mix_rv1: mix_vv1, mix_rv2: mix_vv2}).values()
@@ -1065,6 +1047,11 @@ def test_ifelse_mixture_multiple_components():
     )
 
 
+@pytest.mark.xfail(
+    condition=isinstance(get_default_mode().linker, NumbaLinker),
+    raises=AssertionError,
+    reason="Logp graph fails when evaluated with a non-lazy approach. https://github.com/pymc-devs/pymc/issues/8036",
+)
 def test_ifelse_mixture_shared_component():
     rng = np.random.default_rng(1009)
 
@@ -1136,7 +1123,7 @@ def test_joint_logprob_subtensor():
     #  (e.g., at least one of the advanced indexes has non-repeating values)
     A_idx = A_rv[I_rv, pt.ogrid[A_rv.shape[-1] :]]
 
-    assert isinstance(A_idx.owner.op, Subtensor | AdvancedSubtensor | AdvancedSubtensor1)
+    assert isinstance(A_idx.owner.op, Subtensor | AdvancedSubtensor)
 
     A_idx_value_var = A_idx.type()
     A_idx_value_var.name = "A_idx_value"
@@ -1189,3 +1176,30 @@ def test_nested_ifelse():
     np.testing.assert_almost_equal(mix_logp_fn(0, test_value), sp.norm.logpdf(test_value, -5, 1))
     np.testing.assert_almost_equal(mix_logp_fn(1, test_value), sp.norm.logpdf(test_value, 0, 1))
     np.testing.assert_almost_equal(mix_logp_fn(2, test_value), sp.norm.logpdf(test_value, 5, 1))
+
+
+def test_advanced_subtensor_none_and_integer():
+    """
+    Test for correct error handling when the logp graph is over-specified.
+
+    Providing values for both a random variable ('a') and its deterministic
+    child ('b') creates a logical conflict. The system should detect this
+    and raise a controlled RuntimeError.
+
+    This test fails if the rewriter instead crashes with the old internal
+    AttributeError bug, which would indicate a regression. Please see: #7762
+    """
+    a = pt.random.normal(0, 1, size=(10,), name="a")
+    inds = np.array([0, 1, 2, 3], dtype="int32")
+    b = a[None, inds]
+
+    b_val = b.type()
+    b_val.name = "b_val"
+    a_val = a.type()
+    a_val.name = "a_val"
+
+    with pytest.raises(
+        RuntimeError,
+        match="logprob terms of the following value variables could not be derived: {b_val}",
+    ):
+        conditional_logp({b: b_val, a: a_val})

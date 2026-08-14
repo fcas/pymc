@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -19,22 +19,19 @@ from collections.abc import Callable
 from typing import Any
 from unittest import mock
 
-import arviz as az
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
 import pytest
+import xarray as xr
 
-from numpyro.infer import MCMC
 from pytensor.compile import SharedVariable
 from pytensor.graph import graph_inputs
 
 import pymc as pm
 
-from pymc import ImputationWarning
-from pymc.distributions.multivariate import DirichletMultinomial, PosDefMatrix
+from pymc.exceptions import ImputationWarning
 from pymc.sampling.jax import (
     _get_batched_jittered_initial_points,
     _get_log_likelihood,
@@ -45,31 +42,8 @@ from pymc.sampling.jax import (
     sample_numpyro_nuts,
 )
 
-
-def test_old_import_route():
-    import pymc.sampling.jax as new_sj
-    import pymc.sampling_jax as old_sj
-
-    assert set(new_sj.__all__) <= set(dir(old_sj))
-
-
-def test_jax_PosDefMatrix():
-    x = pt.tensor(name="x", shape=(2, 2), dtype="float32")
-    matrix_pos_def = PosDefMatrix()
-    x_is_pos_def = matrix_pos_def(x)
-    f = pytensor.function(inputs=[x], outputs=[x_is_pos_def], mode="JAX")
-
-    test_cases = [
-        (jnp.eye(2), True),
-        (jnp.zeros(shape=(2, 2)), False),
-        (jnp.array([[1, -1.5], [0, 1.2]], dtype="float32"), True),
-        (-1 * jnp.array([[1, -1.5], [0, 1.2]], dtype="float32"), False),
-        (jnp.array([[1, -1.5], [0, -1.2]], dtype="float32"), False),
-    ]
-
-    for input, expected in test_cases:
-        actual = f(input)[0]
-        assert jnp.array_equal(a1=actual, a2=expected)
+MCMC = pytest.importorskip("numpyro.infer").MCMC
+pytest.importorskip("blackjax")
 
 
 @pytest.mark.parametrize(
@@ -222,7 +196,7 @@ def test_get_log_likelihood():
                 draws=10,
                 chains=2,
                 random_seed=1322,
-                idata_kwargs=dict(log_likelihood=True),
+                idata_kwargs={"log_likelihood": True},
             )
 
     b_true = trace.log_likelihood.b.values
@@ -239,10 +213,6 @@ def test_replace_shared_variables():
     new_x = _replace_shared_variables([x])
     shared_variables = [var for var in graph_inputs(new_x) if isinstance(var, SharedVariable)]
     assert not shared_variables
-
-    x.default_update = x + 1
-    with pytest.raises(ValueError, match="shared variables with default_update"):
-        _replace_shared_variables([x])
 
     shared_rng = pytensor.shared(np.random.default_rng(), name="shared_rng")
     x = pytensor.tensor.random.normal(rng=shared_rng)
@@ -283,24 +253,24 @@ def model_test_idata_kwargs() -> pm.Model:
 @pytest.mark.parametrize(
     "idata_kwargs",
     [
-        dict(),
-        dict(log_likelihood=True),
+        {},
+        {"log_likelihood": True},
         # Overwrite models coords
-        dict(coords={"x_coord": ["x1", "x2"]}),
+        {"coords": {"x_coord": ["x1", "x2"]}},
         # Overwrite dims from dist specification in model
-        dict(dims={"x": ["x_coord2"]}),
+        {"dims": {"x": ["x_coord2"]}},
         # Overwrite both coords and dims
-        dict(coords={"x_coord3": ["A", "B"]}, dims={"x": ["x_coord3"]}),
+        {"coords": {"x_coord3": ["A", "B"]}, "dims": {"x": ["x_coord3"]}},
     ],
 )
 @pytest.mark.parametrize("postprocessing_backend", [None, "cpu"])
 def test_idata_kwargs(
     model_test_idata_kwargs: pm.Model,
-    sampler: Callable[..., az.InferenceData],
+    sampler: Callable[..., xr.DataTree],
     idata_kwargs: dict[str, Any],
     postprocessing_backend: str | None,
 ):
-    idata: az.InferenceData | None = None
+    idata: xr.DataTree | None = None
     with model_test_idata_kwargs:
         idata = sampler(
             tune=50,
@@ -358,6 +328,27 @@ def test_get_batched_jittered_initial_points():
     assert np.all(ips[0][0] != ips[0][1])
 
 
+def test_get_batched_jittered_initial_points_set_subtensor():
+    """Regression bug for issue described in
+    https://discourse.pymc.io/t/attributeerror-numpy-ndarray-object-has-no-attribute-at-when-sampling-lkj-cholesky-covariance-priors-for-multivariate-normal-models-example-with-numpyro-or-blackjax/16598/3
+
+    Which was caused by passing numpy arrays to a non-jitted logp function
+    """
+    with pm.Model() as model:
+        # Set operation will use `x.at[1].set(100)` which is only available in JAX
+        x = pm.Normal("x", mu=[-100, -100])
+        mu_y = x[1].set(100)
+        y = pm.Normal("y", mu=mu_y)
+
+    logp_fn = get_jaxified_logp(model)
+    [x_ips, y_ips] = _get_batched_jittered_initial_points(
+        model, chains=3, initvals=None, logp_fn=logp_fn, jitter=True, random_seed=0
+    )
+    assert np.all(x_ips < -10)
+    assert np.all(y_ips[..., 0] < -10)
+    assert np.all(y_ips[..., 1] > 10)
+
+
 @pytest.mark.parametrize(
     "sampler",
     [
@@ -376,12 +367,12 @@ def test_get_batched_jittered_initial_points():
     ],
 )
 def test_seeding(chains, random_seed, sampler):
-    sample_kwargs = dict(
-        tune=100,
-        draws=5,
-        chains=chains,
-        random_seed=random_seed,
-    )
+    sample_kwargs = {
+        "tune": 100,
+        "draws": 5,
+        "chains": chains,
+        "random_seed": random_seed,
+    }
 
     with pm.Model() as m:
         pm.Normal("x", mu=0, sigma=1)
@@ -439,7 +430,7 @@ def test_numpyro_nuts_kwargs_are_used(mocked: mock.MagicMock):
 )
 def test_idata_contains_stats(sampler_name: str):
     """Tests whether sampler statistics were written to sample_stats
-    group of InferenceData"""
+    group of idata"""
     if sampler_name == "sample_blackjax_nuts":
         sampler = sample_blackjax_nuts
     elif sampler_name == "sample_numpyro_nuts":
@@ -503,7 +494,7 @@ def test_sample_var_names():
 def test_convergence_warnings(caplog, nuts_sampler):
     with pm.Model() as m:
         # Model that should diverge
-        sigma = pm.Normal("sigma", initval=3, transform=None)
+        sigma = pm.Normal("sigma", initval=3, default_transform=None)
         pm.Normal("obs", mu=0, sigma=sigma, observed=[0.99, 1.0, 1.01])
 
         with caplog.at_level(logging.WARNING, logger="pymc"):
@@ -511,9 +502,3 @@ def test_convergence_warnings(caplog, nuts_sampler):
 
     [record] = caplog.records
     assert re.match(r"There were \d+ divergences after tuning", record.message)
-
-
-def test_dirichlet_multinomial():
-    dm = DirichletMultinomial.dist(n=5, a=np.eye(3) * 1e6 + 0.01)
-    dm_draws = pm.draw(dm, mode="JAX")
-    np.testing.assert_equal(dm_draws, np.eye(3) * 5)

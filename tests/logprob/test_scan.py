@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@
 #   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
+import itertools
 
 import numpy as np
 import pytensor
@@ -76,10 +77,9 @@ def test_convert_outer_out_to_in_sit_sot():
     This should be a single SIT-SOT replacement.
     """
 
-    rng_state = np.random.RandomState(np.random.MT19937(np.random.SeedSequence(1234)))
+    rng_state = np.random.default_rng(123)
     rng_tt = pytensor.shared(rng_state, name="rng", borrow=True)
     rng_tt.tag.is_rng = True
-    rng_tt.default_update = rng_tt
 
     #
     # We create a `Scan` representing a time-series model with normally
@@ -94,7 +94,7 @@ def test_convert_outer_out_to_in_sit_sot():
         mu.name = "mu_t"
         return mu, pt.random.normal(mu, 1.0, rng=rng, name="Y_t")
 
-    (mu_tt, Y_rv), _ = pytensor.scan(
+    mu_tt, Y_rv = pytensor.scan(
         fn=input_step_fn,
         outputs_info=[
             {
@@ -108,6 +108,7 @@ def test_convert_outer_out_to_in_sit_sot():
         ],
         non_sequences=[rng_tt],
         n_steps=10,
+        return_updates=False,
     )
 
     mu_tt.name = "mu_tt"
@@ -116,7 +117,7 @@ def test_convert_outer_out_to_in_sit_sot():
     Y_all = Y_rv.owner.inputs[0]
     Y_all.name = "Y_all"
 
-    input_scan_args = ScanArgs.from_node(Y_rv.owner.inputs[0].owner)
+    input_scan_args = ScanArgs.from_node(Y_rv.owner.inputs[0].owner, clone=True)
 
     # TODO FIXME: Everything below needs to be replaced with explicit asserts
     # on the values in `input_scan_args`
@@ -137,7 +138,7 @@ def test_convert_outer_out_to_in_sit_sot():
         logp.name = "logp"
         return mu, logp
 
-    (mu_tt, Y_logp), _ = pytensor.scan(
+    mu_tt, Y_logp = pytensor.scan(
         fn=output_step_fn,
         sequences=[{"input": Y_obs, "taps": [0, -1]}],
         outputs_info=[
@@ -147,6 +148,7 @@ def test_convert_outer_out_to_in_sit_sot():
             },
             {},
         ],
+        return_updates=False,
     )
 
     Y_logp.name = "Y_logp"
@@ -193,7 +195,6 @@ def test_convert_outer_out_to_in_mit_sot():
     rng_state = np.random.default_rng(1234)
     rng_tt = pytensor.shared(rng_state, name="rng", borrow=True)
     rng_tt.tag.is_rng = True
-    rng_tt.default_update = rng_tt
 
     #
     # This is a very simple model with only one output, but multiple
@@ -204,13 +205,14 @@ def test_convert_outer_out_to_in_mit_sot():
         y_tm2.name = "y_tm2"
         return pt.random.normal(y_tm1 + y_tm2, 1.0, rng=rng, name="Y_t")
 
-    Y_rv, _ = pytensor.scan(
+    Y_rv = pytensor.scan(
         fn=input_step_fn,
         outputs_info=[
             {"initial": pt.as_tensor_variable(np.r_[-1.0, 0.0]), "taps": [-1, -2]},
         ],
         non_sequences=[rng_tt],
         n_steps=10,
+        return_updates=False,
     )
 
     Y_rv.name = "Y_rv"
@@ -220,7 +222,7 @@ def test_convert_outer_out_to_in_mit_sot():
     Y_obs = pt.as_tensor_variable(Y_rv.eval())
     Y_obs.name = "Y_obs"
 
-    input_scan_args = ScanArgs.from_node(Y_rv.owner.inputs[0].owner)
+    input_scan_args = ScanArgs.from_node(Y_rv.owner.inputs[0].owner, clone=True)
 
     # TODO FIXME: Everything below needs to be replaced with explicit asserts
     # on the values in `input_scan_args`
@@ -236,10 +238,11 @@ def test_convert_outer_out_to_in_mit_sot():
         logp.name = "logp(y_t)"
         return logp
 
-    Y_logp, _ = pytensor.scan(
+    Y_logp = pytensor.scan(
         fn=output_step_fn,
         sequences=[{"input": Y_obs, "taps": [0, -1, -2]}],
         outputs_info=[{}],
+        return_updates=False,
     )
 
     #
@@ -282,58 +285,54 @@ def test_convert_outer_out_to_in_mit_sot():
     ],
 )
 def test_scan_joint_logprob(require_inner_rewrites):
-    srng = pt.random.RandomStream()
+    rng = pytensor.shared(np.random.default_rng())
 
     N_tt = pt.iscalar("N")
     N_val = 10
-    N_tt.tag.test_value = N_val
 
     M_tt = pt.iscalar("M")
     M_val = 2
-    M_tt.tag.test_value = M_val
 
     mus_tt = pt.matrix("mus_t")
 
     mus_val = np.stack([np.arange(0.0, 10), np.arange(0.0, -10, -1)], axis=-1).astype(
         pytensor.config.floatX
     )
-    mus_tt.tag.test_value = mus_val
 
     sigmas_tt = pt.ones((N_tt,))
-    Gamma_rv = srng.dirichlet(pt.ones((M_tt, M_tt)), name="Gamma")
+    next_rng, Gamma_rv = pt.random.dirichlet(
+        pt.ones((M_tt, M_tt)), name="Gamma", rng=rng
+    ).owner.outputs
 
-    Gamma_vv = Gamma_rv.clone()
-    Gamma_vv.name = "Gamma_vv"
-
+    Gamma_vv = Gamma_rv.clone(name="Gamma_vv")
     Gamma_val = np.array([[0.5, 0.5], [0.5, 0.5]])
-    Gamma_rv.tag.test_value = Gamma_val
 
-    def scan_fn(mus_t, sigma_t, Gamma_t):
-        S_t = srng.categorical(Gamma_t[0], name="S_t")
+    def scan_fn(mus_t, sigma_t, rng, Gamma_t):
+        next_rng, S_t = pt.random.categorical(Gamma_t[0], name="S_t", rng=rng).owner.outputs
 
         if require_inner_rewrites:
-            Y_t = srng.normal(mus_t, sigma_t, name="Y_t")[S_t]
+            next_rng, Y_t = pt.random.normal(mus_t, sigma_t, name="Y_t", rng=next_rng).owner.outputs
+            Y_t = Y_t[S_t]
         else:
-            Y_t = srng.normal(mus_t[S_t], sigma_t, name="Y_t")
+            next_rng, Y_t = pt.random.normal(
+                mus_t[S_t], sigma_t, name="Y_t", rng=next_rng
+            ).owner.outputs
 
-        return Y_t, S_t
+        return Y_t, S_t, next_rng
 
-    (Y_rv, S_rv), _ = pytensor.scan(
+    Y_rv, S_rv, _next_rng = pytensor.scan(
         fn=scan_fn,
         sequences=[mus_tt, sigmas_tt],
+        outputs_info=[{}, {}, next_rng],
         non_sequences=[Gamma_rv],
-        outputs_info=[{}, {}],
         strict=True,
         name="scan_rv",
+        return_updates=False,
     )
     Y_rv.name = "Y"
     S_rv.name = "S"
-
-    y_vv = Y_rv.clone()
-    y_vv.name = "y"
-
-    s_vv = S_rv.clone()
-    s_vv.name = "s"
+    y_vv = Y_rv.clone(name="y")
+    s_vv = S_rv.clone(name="s")
 
     y_logp = conditional_logp({Y_rv: y_vv, S_rv: s_vv, Gamma_rv: Gamma_vv})
     y_logp_combined = pt.sum([pt.sum(factor) for factor in y_logp.values()])
@@ -364,13 +363,14 @@ def test_scan_joint_logprob(require_inner_rewrites):
         S_t_logp.name = "log(S_t=s_t)"
         return Y_t_logp, S_t_logp
 
-    (Y_rv_logp, S_rv_logp), _ = pytensor.scan(
+    Y_rv_logp, S_rv_logp = pytensor.scan(
         fn=scan_fn,
         sequences=[mus_tt, sigmas_tt, y_vv, s_vv],
         non_sequences=[Gamma_vv],
         outputs_info=[{}, {}],
         strict=True,
         name="scan_rv",
+        return_updates=False,
     )
     Y_rv_logp.name = "logp(Y=y)"
     S_rv_logp.name = "logp(S=s)"
@@ -388,66 +388,15 @@ def test_scan_joint_logprob(require_inner_rewrites):
     assert np.allclose(y_logp_val, y_logp_ref_val)
 
 
-@pytest.mark.xfail(reason="see #148")
-@pytensor.config.change_flags(compute_test_value="raise")
-@pytest.mark.xfail(reason="see #148")
-def test_initial_values():
-    srng = pt.random.RandomStream(seed=2320)
-
-    p_S_0 = np.array([0.9, 0.1])
-    S_0_rv = srng.categorical(p_S_0, name="S_0")
-    S_0_rv.tag.test_value = 0
-
-    Gamma_at = pt.matrix("Gamma")
-    Gamma_at.tag.test_value = np.array([[0, 1], [1, 0]])
-
-    s_0_vv = S_0_rv.clone()
-    s_0_vv.name = "s_0"
-
-    def step_fn(S_tm1, Gamma):
-        S_t = srng.categorical(Gamma[S_tm1], name="S_t")
-        return S_t
-
-    S_1T_rv, _ = pytensor.scan(
-        fn=step_fn,
-        outputs_info=[{"initial": S_0_rv, "taps": [-1]}],
-        non_sequences=[Gamma_at],
-        strict=True,
-        n_steps=10,
-        name="S_0T",
-    )
-
-    S_1T_rv.name = "S_1T"
-    s_1T_vv = S_1T_rv.clone()
-    s_1T_vv.name = "s_1T"
-
-    logp_parts = conditional_logp({S_1T_rv: s_1T_vv, S_0_rv: s_0_vv})
-
-    s_0_val = 0
-    s_1T_val = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1])
-    Gamma_val = np.array([[0.1, 0.9], [0.9, 0.1]])
-
-    exp_res = np.log(p_S_0[s_0_val])
-    s_prev = s_0_val
-    for s in s_1T_val:
-        exp_res += np.log(Gamma_val[s_prev, s])
-        s_prev = s
-
-    S_0T_logp = sum(v.sum() for v in logp_parts.values())
-    S_0T_logp_fn = pytensor.function([s_0_vv, s_1T_vv, Gamma_at], S_0T_logp)
-    res = S_0T_logp_fn(s_0_val, s_1T_val, Gamma_val)
-
-    assert res == pytest.approx(exp_res)
-
-
 @pytest.mark.parametrize("remove_asserts", (True, False))
 def test_mode_is_kept(remove_asserts):
     mode = Mode().including("local_remove_all_assert") if remove_asserts else None
-    x, _ = pytensor.scan(
+    x = pytensor.scan(
         fn=lambda x: pt.random.normal(assert_op(x, x > 0)),
         outputs_info=[pt.ones(())],
         n_steps=10,
         mode=mode,
+        return_updates=False,
     )
     x.name = "x"
     x_vv = x.clone()
@@ -462,11 +411,12 @@ def test_mode_is_kept(remove_asserts):
 
 
 def test_scan_non_pure_rv_output():
-    grw, _ = pytensor.scan(
+    grw = pytensor.scan(
         fn=lambda xtm1: pt.random.normal() + xtm1,
         outputs_info=[pt.zeros(())],
         n_steps=10,
         name="grw",
+        return_updates=False,
     )
 
     grw_vv = grw.clone()
@@ -486,8 +436,12 @@ def test_scan_over_seqs():
     n_steps = 10
 
     xs = pt.random.normal(size=(n_steps,), name="xs")
-    ys, _ = pytensor.scan(
-        fn=lambda x: pt.random.normal(x), sequences=[xs], outputs_info=[None], name="ys"
+    ys = pytensor.scan(
+        fn=lambda x: pt.random.normal(x),
+        sequences=[xs],
+        outputs_info=[None],
+        name="ys",
+        return_updates=False,
     )
 
     xs_vv = ys.clone()
@@ -512,23 +466,28 @@ def test_scan_carried_deterministic_state():
     rng = np.random.default_rng(490)
     steps = 99
 
+    rng_pt = pytensor.shared(np.random.default_rng())
     rho = pt.vector("rho", shape=(2,))
     sigma = pt.scalar("sigma")
 
-    def ma2_step(eps_tm2, eps_tm1, rho, sigma):
+    def ma2_step(eps_tm2, eps_tm1, rng, rho, sigma):
         mu = eps_tm1 * rho[0] + eps_tm2 * rho[1]
-        y = pt.random.normal(mu, sigma)
+        next_rng, y = pt.random.normal(mu, sigma, rng=rng).owner.outputs
         eps = y - mu
-        update = {y.owner.inputs[0]: y.owner.outputs[0]}
-        return (eps, y), update
+        return eps, y, next_rng
 
-    [_, ma2], ma2_updates = pytensor.scan(
+    _eps, ma2, _next_rng = pytensor.scan(
         fn=ma2_step,
-        outputs_info=[{"initial": pt.arange(2, dtype="float64"), "taps": range(-2, 0)}, None],
+        outputs_info=[
+            {"initial": pt.arange(2, dtype="float64"), "taps": range(-2, 0)},
+            None,
+            rng_pt,
+        ],
         non_sequences=[rho, sigma],
         n_steps=steps,
         strict=True,
         name="ma2",
+        return_updates=False,
     )
 
     def ref_logp(values, rho, sigma):
@@ -554,3 +513,80 @@ def test_scan_carried_deterministic_state():
         logp_expr.eval({ma2_vv: ma2_test, rho: rho_test, sigma: sigma_test}),
         ref_logp(ma2_test, rho_test, sigma_test),
     )
+
+
+def test_scan_multiple_output_types():
+    """Test we can derive the logp for a scan that contains recurring and non-recurring measurable outputs."""
+    xs, ys, zs = pytensor.scan(
+        fn=lambda x_mu, y_tm1, z_tm2, z_tm1: (
+            pt.random.normal(x_mu),
+            pt.random.normal(y_tm1),
+            pt.random.normal(z_tm1) + z_tm2,
+        ),
+        sequences=[pt.arange(10)],
+        outputs_info=[
+            None,
+            pt.zeros(()),
+            {"initial": pt.ones(2), "taps": [-2, -1]},
+        ],
+        return_updates=False,
+    )
+
+    xs.name = "xs"
+    xs_value = xs.clone()
+    ys.name = "ys"
+    ys_value = ys.clone()
+    zs.name = "zs"
+    zs_value = zs.clone()
+
+    logp_dict = conditional_logp({xs: xs_value, ys: ys_value, zs: zs_value})
+    xs_logp = logp_dict[xs_value]
+    ys_logp = logp_dict[ys_value]
+    zs_logp = logp_dict[zs_value]
+
+    assert_no_rvs([xs_logp, ys_logp, zs_logp])
+    fn = pytensor.function(
+        [xs_value, ys_value, zs_value],
+        [xs_logp, ys_logp, zs_logp],
+    )
+
+    rng = np.random.default_rng(577)
+    test_value = rng.uniform(size=(10,))
+    (xs_logp_eval, ys_logp_eval, zs_logp_eval) = fn(test_value, test_value, test_value)
+    np.testing.assert_allclose(xs_logp_eval, stats.norm.logpdf(test_value, np.arange(10)))
+    np.testing.assert_allclose(ys_logp_eval, stats.norm.logpdf(test_value, [0, *test_value[:-1]]))
+    np.testing.assert_allclose(
+        zs_logp_eval,
+        stats.norm.logpdf(
+            test_value, [a + b for a, b in itertools.pairwise([1, 1, *test_value[:-1]])]
+        ),
+    )
+
+
+def test_generative_graph_unchanged():
+    # Regression test where creating the IR would overwrite the original Scan inner fgraph
+
+    rng = pytensor.shared(np.random.default_rng())
+
+    def step(eps_tm1, rng):
+        next_rng, x = pt.random.normal(0, eps_tm1, rng=rng).owner.outputs
+        eps_t = x - 0
+        return x, eps_t, next_rng
+
+    xs, _eps, _rng = pytensor.scan(
+        step,
+        outputs_info=[None, pt.ones(()), rng],
+        n_steps=5,
+        return_updates=False,
+    )
+
+    before = xs.dprint(file="str")
+
+    xs_value = np.ones(5)
+    expected_logp = stats.norm.logpdf(xs_value, 0, 1)
+    for i in range(2):
+        xs_logp = logp(xs, xs_value)
+        np.testing.assert_allclose(xs_logp.eval(), expected_logp)
+
+    after = xs.dprint(file="str")
+    assert before == after

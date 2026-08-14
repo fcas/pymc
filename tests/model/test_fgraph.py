@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ from pytensor.tensor.exceptions import NotScalarConstantError
 
 import pymc as pm
 
+from pymc.distributions.shape_utils import rv_size_is_none
 from pymc.model.fgraph import (
     ModelDeterministic,
     ModelFreeRV,
@@ -107,9 +108,9 @@ def test_data(inline_views):
     with pm.Model(coords={"test_dim": range(3)}) as m_old:
         x = pm.Data("x", [0.0, 1.0, 2.0], dims=("test_dim",))
         y = pm.Data("y", [10.0, 11.0, 12.0], dims=("test_dim",))
-        sigma = pm.MutableData("sigma", [1.0], shape=(1,))
+        sigma = pm.Data("sigma", [1.0], shape=(1,))
         b0 = pm.Data("b0", np.zeros((1,)), shape=((1,)))
-        b1 = pm.DiracDelta("b1", 1.0)
+        b1 = pm.Normal("b1", 1.0, sigma=1e-8)
         mu = pm.Deterministic("mu", b0 + b1 * x, dims=("test_dim",))
         obs = pm.Normal("obs", mu=mu, sigma=sigma, observed=y, dims=("test_dim",))
 
@@ -127,12 +128,12 @@ def test_data(inline_views):
         # ObservedRV(obs, y, *dims) not ObservedRV(obs, Named(y), *dims)
         assert obs.owner.inputs[1] is memo[y].owner.inputs[0]
         # ObservedRV(Normal(..., sigma), ...) not ObservedRV(Normal(..., Named(sigma)), ...)
-        assert obs.owner.inputs[0].owner.inputs[4] is memo[sigma].owner.inputs[0]
+        assert obs.owner.inputs[0].owner.inputs[-1] is memo[sigma].owner.inputs[0]
     else:
         assert mu_inp.owner.inputs[0] is memo[b0]
         assert mu_inp.owner.inputs[1].owner.inputs[1] is memo[x]
         assert obs.owner.inputs[1] is memo[y]
-        assert obs.owner.inputs[0].owner.inputs[4] is memo[sigma]
+        assert obs.owner.inputs[0].owner.inputs[-1] is memo[sigma]
 
     m_new = model_from_fgraph(m_fgraph)
 
@@ -180,14 +181,14 @@ def test_shared_variable():
     with pm.Model() as m_old:
         test = pm.Normal("test", mu=mu, sigma=sigma, observed=obs)
 
-    assert test.owner.inputs[3] is mu
-    assert test.owner.inputs[4] is sigma
+    assert test.owner.inputs[2] is mu
+    assert test.owner.inputs[3] is sigma
     assert m_old.rvs_to_values[test] is obs
 
     m_new = clone_model(m_old)
     test_new = m_new["test"]
     # Shared Variables are cloned but still point to the same memory
-    mu_new, sigma_new = test_new.owner.inputs[3:5]
+    mu_new, sigma_new = test_new.owner.op.dist_params(test_new.owner)
     obs_new = m_new.rvs_to_values[test_new]
     assert mu_new is not mu
     assert sigma_new is not sigma
@@ -224,8 +225,8 @@ def test_deterministics(inline_views):
         z = pm.Normal("z", y__)
 
     # Deterministic mu is in the graph of x to y but not sigma
-    assert m["y"].owner.inputs[3] is m["mu"]
-    assert m["y"].owner.inputs[4] is not m["sigma"]
+    assert m["y"].owner.inputs[2] is m["mu"]
+    assert m["y"].owner.inputs[3] is not m["sigma"]
 
     fg, _ = fgraph_from_model(m, inlined_views=inline_views)
 
@@ -234,27 +235,27 @@ def test_deterministics(inline_views):
     # [Det(mu), Det(sigma)]
     mu = det_mu.owner.inputs[0]
     sigma = det_sigma.owner.inputs[0]
-    assert y.owner.inputs[0].owner.inputs[4] is sigma
+    assert y.owner.inputs[0].owner.inputs[3] is sigma
     assert det_y_ is not det_y__
     assert det_y_.owner.inputs[0] is y
     if not inline_views:
         # FreeRV(y(mu, sigma)) not FreeRV(y(Det(mu), Det(sigma)))
-        assert y.owner.inputs[0].owner.inputs[3] is mu
+        assert y.owner.inputs[0].owner.inputs[2] is mu
         # FreeRV(z(y)) not FreeRV(z(Det(Det(y))))
-        assert z.owner.inputs[0].owner.inputs[3] is y
+        assert z.owner.inputs[0].owner.inputs[2] is y
         # Det(y), not Det(Det(y))
         assert det_y__.owner.inputs[0] is y
     else:
-        assert y.owner.inputs[0].owner.inputs[3] is det_mu
-        assert z.owner.inputs[0].owner.inputs[3] is det_y__
+        assert y.owner.inputs[0].owner.inputs[2] is det_mu
+        assert z.owner.inputs[0].owner.inputs[2] is det_y__
         assert det_y__.owner.inputs[0] is det_y_
 
     # Both mu and sigma deterministics are now in the graph of x to y
     m = model_from_fgraph(fg)
-    assert m["y"].owner.inputs[3] is m["mu"]
-    assert m["y"].owner.inputs[4] is m["sigma"]
+    assert m["y"].owner.inputs[2] is m["mu"]
+    assert m["y"].owner.inputs[3] is m["sigma"]
     # But not y_* in y to z, since there was no real Op in between
-    assert m["z"].owner.inputs[3] is m["y"]
+    assert m["z"].owner.inputs[2] is m["y"]
     assert m["y_"].owner.inputs[0] is m["y"]
     assert m["y__"].owner.inputs[0] is m["y"]
 
@@ -267,10 +268,15 @@ def test_context_error():
     with pm.Model() as m:
         x = pm.Normal("x")
 
-        fg = fgraph_from_model(m)
+        fg, _ = fgraph_from_model(m)
 
-        with pytest.raises(RuntimeError, match="cannot be called inside a PyMC model context"):
-            model_from_fgraph(fg)
+        new_m = model_from_fgraph(fg)
+        new_x = new_m["x"]
+
+    assert new_m.parent is None
+    assert x != new_x
+    assert m.named_vars == {"x": x}
+    assert new_m.named_vars == {"x": new_x}
 
 
 def test_sub_model_error():
@@ -295,13 +301,14 @@ def non_centered_rewrite():
     def non_centered_param(fgraph: FunctionGraph, node):
         """Rewrite that replaces centered normal by non-centered parametrization."""
 
-        rv, value, *dims = node.inputs
+        rv, value = node.inputs
+        name, dims = node.op.name, node.op.dims
         if not isinstance(rv.owner.op, pm.Normal):
             return
-        rng, size, dtype, loc, scale = rv.owner.inputs
+        rng, size, loc, scale = rv.owner.inputs
 
         # Only apply rewrite if size information is explicit
-        if size.ndim == 0:
+        if rv_size_is_none(size):
             return None
 
         try:
@@ -316,15 +323,15 @@ def non_centered_rewrite():
         if is_unit:
             return
 
+        raw_name = f"{name}_raw_"
         raw_norm = pm.Normal.dist(0, 1, size=size, rng=rng)
-        raw_norm.name = f"{rv.name}_raw_"
         raw_norm_value = raw_norm.clone()
+        raw_norm_value.name = raw_name
         fgraph.add_input(raw_norm_value)
-        raw_norm = model_free_rv(raw_norm, raw_norm_value, node.op.transform, *dims)
+        raw_norm = model_free_rv(raw_norm, raw_norm_value, node.op.transform, raw_name, *dims)
 
         new_norm = loc + raw_norm * scale
-        new_norm.name = rv.name
-        new_norm_det = model_deterministic(new_norm, *dims)
+        new_norm_det = model_deterministic(new_norm, name, *dims)
         fgraph.add_output(new_norm_det)
 
         return [new_norm]

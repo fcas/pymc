@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ from pytensor.tensor.random.basic import (
     uniform,
 )
 from pytensor.tensor.random.utils import normalize_size_param
-from scipy import stats
+from pytensor.utils import lazy_scipy_module
 
 import pymc as pm
 
@@ -50,28 +50,29 @@ from pymc.distributions.distribution import Discrete, SymbolicRandomVariable
 from pymc.distributions.shape_utils import implicit_size_from_params, rv_size_is_none
 from pymc.logprob.basic import logcdf, logp
 from pymc.math import sigmoid
+from pymc.pytensorf import normalize_rng_param
+
+stats = lazy_scipy_module("stats")
 
 __all__ = [
-    "Binomial",
-    "BetaBinomial",
     "Bernoulli",
-    "DiscreteWeibull",
-    "Poisson",
-    "NegativeBinomial",
+    "BetaBinomial",
+    "Binomial",
+    "Categorical",
     "DiscreteUniform",
+    "DiscreteWeibull",
     "Geometric",
     "HyperGeometric",
-    "Categorical",
+    "NegativeBinomial",
     "OrderedLogistic",
     "OrderedProbit",
+    "Poisson",
 ]
-
-from pymc.pytensorf import normalize_rng_param
 
 
 class Binomial(Discrete):
     R"""
-    Binomial log-likelihood.
+    Binomial distribution.
 
     The discrete probability distribution of the number of successes
     in a sequence of n independent yes/no experiments, each of which
@@ -176,7 +177,7 @@ class Binomial(Discrete):
 
 class BetaBinomial(Discrete):
     R"""
-    Beta-binomial log-likelihood.
+    Beta-binomial distribution.
 
     Equivalent to binomial random variable with success probability
     drawn from a beta distribution.
@@ -293,7 +294,7 @@ class BetaBinomial(Discrete):
 
 
 class Bernoulli(Discrete):
-    R"""Bernoulli log-likelihood
+    R"""Bernoulli distribution.
 
     The Bernoulli distribution describes the probability of successes
     (x=1) and failures (x=0).
@@ -389,11 +390,25 @@ class Bernoulli(Discrete):
             msg="0 <= p <= 1",
         )
 
+    def icdf(value, p):
+        res = pt.switch(
+            pt.le(value, 1 - p),
+            0,
+            1,
+        ).astype("int64")
+        res = check_icdf_value(res, value)
+        return check_icdf_parameters(
+            res,
+            0 <= p,
+            p <= 1,
+            msg="0 <= p <= 1",
+        )
+
 
 class DiscreteWeibullRV(SymbolicRandomVariable):
     name = "discrete_weibull"
-    signature = "[rng],[size],(),()->[rng],()"
-    _print_name = ("dWeibull", "\\operatorname{dWeibull}")
+    extended_signature = "[rng],[size],(),()->[rng],()"
+    _print_name = ("DiscreteWeibull", "\\operatorname{DiscreteWeibull}")
 
     @classmethod
     def rv_op(cls, q, beta, *, size=None, rng=None):
@@ -405,7 +420,7 @@ class DiscreteWeibullRV(SymbolicRandomVariable):
         if rv_size_is_none(size):
             size = implicit_size_from_params(q, beta, ndims_params=cls.ndims_params)
 
-        next_rng, p = uniform(size=size, rng=rng).owner.outputs
+        next_rng, p = uniform(size=size, rng=rng, return_next_rng=True)
         draws = pt.ceil(pt.power(pt.log(1 - p) / pt.log(q), 1.0 / beta)) - 1
         draws = draws.astype("int64")
 
@@ -413,7 +428,7 @@ class DiscreteWeibullRV(SymbolicRandomVariable):
 
 
 class DiscreteWeibull(Discrete):
-    R"""Discrete Weibull log-likelihood.
+    R"""Discrete Weibull distribution.
 
     The discrete Weibull distribution is a flexible model of count data that
     can handle both over- and under-dispersion.
@@ -506,7 +521,7 @@ class DiscreteWeibull(Discrete):
 
 class Poisson(Discrete):
     R"""
-    Poisson log-likelihood.
+    Poisson distribution.
 
     Often used to model the number of events occurring in a fixed period
     of time when the times at which events occur are independent.
@@ -602,7 +617,7 @@ class Poisson(Discrete):
 
 class NegativeBinomial(Discrete):
     R"""
-    Negative binomial log-likelihood.
+    Negative binomial distribution.
 
     The negative binomial distribution describes a Poisson random variable
     whose rate parameter is gamma distributed.
@@ -684,7 +699,7 @@ class NegativeBinomial(Discrete):
         return super().dist([n, p], *args, **kwargs)
 
     @classmethod
-    def get_n_p(cls, mu=None, alpha=None, p=None, n=None):
+    def get_n_p(cls, mu=None, alpha=None, p=None, n=None, math=pt):
         if n is None:
             if alpha is not None:
                 n = alpha
@@ -695,7 +710,9 @@ class NegativeBinomial(Discrete):
 
         if p is None:
             if mu is not None:
-                p = n / (mu + n)
+                # n / (mu + n) in logit space, so a mu = exp(x) that overflows still
+                # yields finite logp and dlogp: log(mu) cancels back to x
+                p = math.sigmoid(math.log(n) - math.log(mu))
             else:
                 raise ValueError("Incompatible parametrization. Must specify either mu or p.")
         elif mu is not None:
@@ -710,28 +727,30 @@ class NegativeBinomial(Discrete):
         return mu
 
     def logp(value, n, p):
-        alpha = n
-        mu = alpha * (1 - p) / p
+        # (1 - p) / p in log space: a p = sigmoid(w) that saturates at 1.0 carries no
+        # information, while the rewritten log terms still see w. Spelled log(1 - p)
+        # because the sigmoid stabilization rewrites do not recognize log1p(-p)
+        mu = n * pt.exp(pt.log(1 - p) - pt.log(p))
 
+        # binomln subtracts gammaln(value + n) - gammaln(n), whose difference falls below
+        # their shared ulp once n is large, so fall back on the Poisson(mu) limit there.
         res = pt.switch(
-            pt.lt(value, 0),
-            -np.inf,
-            (
-                binomln(value + alpha - 1, value)
-                + logpow(mu / (mu + alpha), value)
-                + logpow(alpha / (mu + alpha), alpha)
-            ),
+            pt.gt(n, 1e10),
+            logpow(mu, value) - mu - factln(value),
+            binomln(value + n - 1, value) + logpow(1 - p, value) + logpow(p, n),
         )
+        res = pt.switch(pt.lt(value, 0), -np.inf, res)
 
-        negbinom = check_parameters(
+        # p == 0 is outside the support, but a valid tiny p can round to it: sigmoid(-800)
+        # is exactly 0.0 while log(p) is still -800. Checking 0 <= p instead of 0 < p keeps
+        # those usable, at the cost of returning the limiting -inf for a degenerate p == 0.
+        return check_parameters(
             res,
-            mu > 0,
-            alpha > 0,
-            msg="mu > 0, alpha > 0",
+            0 <= p,
+            p <= 1,
+            n > 0,
+            msg="0 <= p <= 1, n > 0",
         )
-
-        # Return Poisson when alpha gets very large.
-        return pt.switch(pt.gt(alpha, 1e10), logp(Poisson.dist(mu=mu), value), negbinom)
 
     def logcdf(value, n, p):
         res = pt.switch(
@@ -750,7 +769,7 @@ class NegativeBinomial(Discrete):
 
 class Geometric(Discrete):
     R"""
-    Geometric log-likelihood.
+    Geometric distribution.
 
     The probability that the first success in a sequence of Bernoulli
     trials occurs on the x'th trial.
@@ -971,8 +990,7 @@ class HyperGeometric(Discrete):
 
 class DiscreteUniformRV(ScipyRandomVariable):
     name = "discrete_uniform"
-    ndim_supp = 0
-    ndims_params = [0, 0]
+    signature = "(),()->()"
     dtype = "int64"
     _print_name = ("DiscreteUniform", "\\operatorname{DiscreteUniform}")
 
@@ -1085,7 +1103,7 @@ class DiscreteUniform(Discrete):
 
 class Categorical(Discrete):
     R"""
-    Categorical log-likelihood.
+    Categorical distribution.
 
     The most general discrete distribution. The pmf of this distribution is
 
@@ -1156,71 +1174,67 @@ class Categorical(Discrete):
             mode = pt.full(size, mode)
         return mode
 
+    @staticmethod
+    def _safe_index_value_p(value, p):
+        # Find the probabily of the given value by indexing in p,
+        # after handling broadcasting and invalid values.
+
+        # In the standard case p has one more dimension than value
+        dim_diff = p.type.ndim - value.type.ndim
+        if dim_diff > 1:
+            # p brodacasts implicitly beyond value
+            value = pt.shape_padleft(value, dim_diff - 1)
+        elif dim_diff < 1:
+            # value broadcasts implicitly beyond p
+            p = pt.shape_padleft(p, 1 - dim_diff)
+
+        k = pt.shape(p)[-1]
+        value_clip = pt.clip(value, 0, k - 1).astype(int)
+        return value, pt.log(pt.take_along_axis(p, value_clip[..., None], axis=-1).squeeze(-1))
+
     def logp(value, p):
         k = pt.shape(p)[-1]
-        p_ = p
-        value_clip = pt.clip(value, 0, k - 1)
+        value, safe_value_p = Categorical._safe_index_value_p(value, p)
 
-        if p.ndim > 1:
-            if p.ndim > value_clip.ndim:
-                value_clip = pt.shape_padleft(value_clip, p_.ndim - value_clip.ndim)
-            elif p.ndim < value_clip.ndim:
-                p = pt.shape_padleft(p, value_clip.ndim - p_.ndim)
-            pattern = (p.ndim - 1, *range(p.ndim - 1))
-            a = pt.log(
-                pt.take_along_axis(
-                    p.dimshuffle(pattern),
-                    value_clip,
-                )
-            )
-        else:
-            a = pt.log(p[value_clip])
-
-        res = pt.switch(
+        value_p = pt.switch(
             pt.or_(pt.lt(value, 0), pt.gt(value, k - 1)),
             -np.inf,
-            a,
+            safe_value_p,
         )
 
         return check_parameters(
-            res,
-            0 <= p_,
-            p_ <= 1,
+            value_p,
+            0 <= p,
+            p <= 1,
+            pt.isclose(pt.sum(p, axis=-1), 1),
+            msg="0 <= p <=1, sum(p) = 1",
+        )
+
+    def logcdf(value, p):
+        k = pt.shape(p)[-1]
+        value, safe_value_p = Categorical._safe_index_value_p(value, p.cumsum(-1))
+
+        value_p = pt.switch(
+            pt.lt(value, 0),
+            -np.inf,
+            pt.switch(
+                pt.gt(value, k - 1),
+                0,
+                safe_value_p,
+            ),
+        )
+
+        return check_parameters(
+            value_p,
+            0 <= p,
+            p <= 1,
             pt.isclose(pt.sum(p, axis=-1), 1),
             msg="0 <= p <=1, sum(p) = 1",
         )
 
 
-class _OrderedLogistic(Categorical):
-    r"""
-    Underlying class for ordered logistic distributions.
-    See docs for the OrderedLogistic wrapper class for more details on how to use it in models.
-    """
-
-    rv_op = categorical
-
-    @classmethod
-    def dist(cls, eta, cutpoints, *args, **kwargs):
-        eta = pt.as_tensor_variable(eta)
-        cutpoints = pt.as_tensor_variable(cutpoints)
-
-        pa = sigmoid(cutpoints - pt.shape_padright(eta))
-        p_cum = pt.concatenate(
-            [
-                pt.zeros_like(pt.shape_padright(pa[..., 0])),
-                pa,
-                pt.ones_like(pt.shape_padright(pa[..., 0])),
-            ],
-            axis=-1,
-        )
-        p = p_cum[..., 1:] - p_cum[..., :-1]
-
-        return super().dist(p, *args, **kwargs)
-
-
 class OrderedLogistic:
-    R"""
-    Wrapper class for Ordered Logistic distributions.
+    R"""Ordered Logistic distribution.
 
     Useful for regression on ordinal data values whose values range
     from 1 to K as a function of some predictor, :math:`\eta`. The
@@ -1287,50 +1301,39 @@ class OrderedLogistic:
         plt.hist(posterior["cutpoints"][1], 80, alpha=0.2, color='k');
     """
 
-    def __new__(cls, name, *args, compute_p=True, **kwargs):
-        out_rv = _OrderedLogistic(name, *args, **kwargs)
+    def __new__(cls, name, eta, cutpoints, compute_p=True, **kwargs):
+        p = cls.compute_p(eta, cutpoints)
         if compute_p:
-            pm.Deterministic(f"{name}_probs", out_rv.owner.inputs[3], dims=kwargs.get("dims"))
+            p = pm.Deterministic(f"{name}_probs", p)
+        out_rv = Categorical(name, p=p, **kwargs)
         return out_rv
 
     @classmethod
-    def dist(cls, *args, **kwargs):
-        return _OrderedLogistic.dist(*args, **kwargs)
-
-
-class _OrderedProbit(Categorical):
-    r"""
-    Underlying class for ordered probit distributions.
-    See docs for the OrderedProbit wrapper class for more details on how to use it in models.
-    """
-
-    rv_op = categorical
+    def dist(cls, eta, cutpoints, **kwargs):
+        p = cls.compute_p(eta, cutpoints)
+        return Categorical.dist(p=p, **kwargs)
 
     @classmethod
-    def dist(cls, eta, cutpoints, sigma=1, *args, **kwargs):
+    def compute_p(cls, eta, cutpoints):
         eta = pt.as_tensor_variable(eta)
         cutpoints = pt.as_tensor_variable(cutpoints)
 
-        probits = pt.shape_padright(eta) - cutpoints
-        _log_p = pt.concatenate(
+        pa = sigmoid(cutpoints - pt.shape_padright(eta))
+        p_cum = pt.concatenate(
             [
-                pt.shape_padright(normal_lccdf(0, sigma, probits[..., 0])),
-                log_diff_normal_cdf(
-                    0, pt.shape_padright(sigma), probits[..., :-1], probits[..., 1:]
-                ),
-                pt.shape_padright(normal_lcdf(0, sigma, probits[..., -1])),
+                pt.zeros_like(pt.shape_padright(pa[..., 0])),
+                pa,
+                pt.ones_like(pt.shape_padright(pa[..., 0])),
             ],
             axis=-1,
         )
-        _log_p = pt.as_tensor_variable(_log_p)
-        p = pt.exp(_log_p)
-
-        return super().dist(p, *args, **kwargs)
+        p = p_cum[..., 1:] - p_cum[..., :-1]
+        return p
 
 
 class OrderedProbit:
     R"""
-    Wrapper class for Ordered Probit distributions.
+    Ordered Probit distributions.
 
     Useful for regression on ordinal data values whose values range
     from 1 to K as a function of some predictor, :math:`\eta`. The
@@ -1373,7 +1376,7 @@ class OrderedProbit:
 
     Examples
     --------
-    .. code:: python
+    .. code-block:: python
 
         # Generate data for a simple 1 dimensional example problem
         n1_c = 300; n2_c = 300; n3_c = 300
@@ -1402,12 +1405,33 @@ class OrderedProbit:
         plt.hist(posterior["cutpoints"][1], 80, alpha=0.2, color='k');
     """
 
-    def __new__(cls, name, *args, compute_p=True, **kwargs):
-        out_rv = _OrderedProbit(name, *args, **kwargs)
+    def __new__(cls, name, eta, cutpoints, sigma=1, compute_p=True, **kwargs):
+        p = cls.compute_p(eta, cutpoints, sigma)
         if compute_p:
-            pm.Deterministic(f"{name}_probs", out_rv.owner.inputs[3], dims=kwargs.get("dims"))
+            p = pm.Deterministic(f"{name}_probs", p)
+        out_rv = Categorical(name, p=p, **kwargs)
         return out_rv
 
     @classmethod
-    def dist(cls, *args, **kwargs):
-        return _OrderedProbit.dist(*args, **kwargs)
+    def dist(cls, eta, cutpoints, sigma=1, **kwargs):
+        p = cls.compute_p(eta, cutpoints, sigma)
+        return Categorical.dist(p=p, **kwargs)
+
+    @classmethod
+    def compute_p(cls, eta, cutpoints, sigma):
+        eta = pt.as_tensor_variable(eta)
+        cutpoints = pt.as_tensor_variable(cutpoints)
+
+        probits = pt.shape_padright(eta) - cutpoints
+        log_p = pt.concatenate(
+            [
+                pt.shape_padright(normal_lccdf(0, sigma, probits[..., 0])),
+                log_diff_normal_cdf(
+                    0, pt.shape_padright(sigma), probits[..., :-1], probits[..., 1:]
+                ),
+                pt.shape_padright(normal_lcdf(0, sigma, probits[..., -1])),
+            ],
+            axis=-1,
+        )
+        p = pt.exp(log_p)
+        return p

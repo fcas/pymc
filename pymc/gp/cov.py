@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -30,23 +30,23 @@ from pytensor.tensor.variable import TensorConstant, TensorVariable
 
 __all__ = [
     "Constant",
-    "WhiteNoise",
-    "ExpQuad",
-    "RatQuad",
-    "Exponential",
-    "Matern52",
-    "Matern32",
-    "Matern12",
-    "Linear",
-    "Polynomial",
-    "Cosine",
-    "Periodic",
-    "WarpedInput",
-    "WrappedPeriodic",
-    "Gibbs",
     "Coregion",
-    "ScaledCov",
+    "Cosine",
+    "ExpQuad",
+    "Exponential",
+    "Gibbs",
     "Kron",
+    "Linear",
+    "Matern12",
+    "Matern32",
+    "Matern52",
+    "Periodic",
+    "Polynomial",
+    "RatQuad",
+    "ScaledCov",
+    "WarpedInput",
+    "WhiteNoise",
+    "WrappedPeriodic",
 ]
 
 from pymc.pytensorf import constant_fold
@@ -56,9 +56,7 @@ IntSequence = np.ndarray | Sequence[int]
 
 
 class BaseCovariance:
-    """
-    Base class for kernels/covariance functions.
-    """
+    """Base class for kernels/covariance functions."""
 
     def __call__(
         self,
@@ -116,9 +114,7 @@ class BaseCovariance:
         return Exponentiated(self, other)
 
     def __array_wrap__(self, result):
-        """
-        Required to allow radd/rmul by numpy arrays.
-        """
+        """Allow radd/rmul by numpy arrays."""
         result = np.squeeze(result)
         if len(result.shape) <= 1:
             result = result.reshape(1, 1)
@@ -147,13 +143,14 @@ class BaseCovariance:
 
     @staticmethod
     def _alloc(X, *shape: int) -> TensorVariable:
-        return pt.alloc(X, *shape)  # type: ignore
+        return pt.alloc(X, *shape)  # type: ignore[return-value]
 
 
 class Covariance(BaseCovariance):
     """
-    Base class for kernels/covariance functions with input_dim and active_dims, which excludes
-    kernels like `Constant` and `WhiteNoise`.
+    Base class for kernels/covariance functions with input_dim and active_dims.
+
+    This excludes kernels like `Constant` and `WhiteNoise`.
 
     Parameters
     ----------
@@ -167,19 +164,18 @@ class Covariance(BaseCovariance):
 
     def __init__(self, input_dim: int, active_dims: IntSequence | None = None):
         self.input_dim = input_dim
+        self.active_dims: np.ndarray[Any, np.dtype[np.int_]]
         if active_dims is None:
             self.active_dims = np.arange(input_dim)
         else:
             self.active_dims = np.asarray(active_dims, int)
 
-        if max(self.active_dims) > self.input_dim:
+        if self.active_dims.max() > self.input_dim:
             raise ValueError("Values in `active_dims` can't be larger than `input_dim`.")
 
     @property
     def n_dims(self) -> int:
-        """The dimensionality of the input, as taken from the
-        `active_dims`.
-        """
+        """The dimensionality of the input, as taken from the `active_dims`."""
         # Evaluate lazily in case this changes.
         return len(self.active_dims)
 
@@ -205,7 +201,6 @@ class Covariance(BaseCovariance):
 class Combination(Covariance):
     def __init__(self, factor_list: Sequence):
         """Use constituent factors to get input_dim and active_dims for the Combination covariance."""
-
         # Check if all input_dim are the same in factor_list
         input_dims = {factor.input_dim for factor in factor_list if isinstance(factor, Covariance)}
 
@@ -239,9 +234,7 @@ class Combination(Covariance):
                 self._factor_list.append(factor)
 
     def _merge_factors_cov(self, X, Xs=None, diag=False):
-        """Called to evaluate either all the sums or all the
-        products of kernels that are possible to evaluate.
-        """
+        """Evaluate either all the sums or all the products of kernels that are possible to evaluate."""
         factor_list = []
         for factor in self._factor_list:
             # make sure diag=True is handled properly
@@ -269,12 +262,12 @@ class Combination(Covariance):
         return factor_list
 
     def _merge_factors_psd(self, omega):
-        """Called to evaluatate spectral densities of combination kernels when possible.
+        """Evaluate spectral densities of combination kernels when possible.
 
-        Implements
-        a more restricted set of rules than `_merge_factors_cov` -- just additivity of stationary
-        covariances with defined power spectral densities and multiplication by scalars.  Also, the
-        active_dims for all covariances in the sum must be the same.
+        Implements a more restricted set of rules than `_merge_factors_cov` --
+        just additivity of stationary covariances with defined power spectral
+        densities and multiplication by scalars.  Also, the active_dims for all
+        covariances in the sum must be the same.
         """
         factor_list = []
         for factor in self._factor_list:
@@ -336,8 +329,7 @@ class Prod(Combination):
         check = Counter([isinstance(factor, Covariance) for factor in self._factor_list])
         if check.get(True, 0) >= 2:
             raise NotImplementedError(
-                "The power spectral density of products of covariance "
-                "functions is not implemented."
+                "The power spectral density of products of covariance functions is not implemented."
             )
         return reduce(mul, self._merge_factors_psd(omega))
 
@@ -565,8 +557,9 @@ class Stationary(Covariance):
 
 class ExpQuad(Stationary):
     r"""
-    The Exponentiated Quadratic kernel.  Also referred to as the Squared
-    Exponential, or Radial Basis Function kernel.
+    The Exponentiated Quadratic kernel.
+
+    Also referred to as the Squared Exponential, or Radial Basis Function kernel.
 
     .. math::
 
@@ -580,7 +573,7 @@ class ExpQuad(Stationary):
 
     def power_spectral_density(self, omega: TensorLike) -> TensorVariable:
         r"""
-        The power spectral density for the ExpQuad kernel is:
+        Power spectral density for the ExpQuad kernel.
 
         .. math::
 
@@ -621,16 +614,73 @@ class RatQuad(Stationary):
             -1.0 * self.alpha,
         )
 
+    def power_spectral_density(self, omega: TensorLike) -> TensorVariable:
+        r"""
+        Power spectral density for the Rational Quadratic kernel.
+
+        .. math::
+           S(\boldsymbol\omega) = \frac{2 (2\pi\alpha)^{D/2} \prod_{i=1}^D \ell_i}{\Gamma(\alpha)}
+                                  \left(\frac{z}{2}\right)^{\nu}
+                                  K_{\nu}(z)
+        where :math:`z = \sqrt{2\alpha} \sqrt{\sum \ell_i^2 \omega_i^2}` and :math:`\nu = \alpha - D/2`.
+
+        Derivation
+        ----------
+        The Rational Quadratic kernel can be expressed as a scale mixture of Squared Exponential kernels:
+
+        .. math::
+            k_{RQ}(r) = \int_0^\infty k_{SE}(r; \lambda) p(\lambda) d\lambda
+
+        where :math:`k_{SE}(r; \lambda) = \exp\left(-\frac{\lambda r^2}{2}\right)` and the mixing distribution
+        on the precision parameter :math:`\lambda` is :math:`\lambda \sim \text{Gamma}(\alpha, \beta)`
+        with rate parameter :math:`\beta = \alpha \ell^2`.
+
+        By the linearity of the Fourier transform, the PSD of the Rational Quadratic kernel is the expectation
+        of the PSD of the Squared Exponential kernel with respect to the mixing distribution:
+
+        .. math::
+            S_{RQ}(\omega) = \int_0^\infty S_{SE}(\omega; \lambda) p(\lambda) d\lambda
+
+        Substituting the known PSD of the Squared Exponential kernel and evaluating the integral yields
+        the expression involving the modified Bessel function of the second kind, :math:`K_{\nu}(z)`.
+        """
+        ls = pt.ones(self.n_dims) * self.ls
+        alpha = self.alpha
+        D = self.n_dims
+        nu = alpha - D / 2.0
+
+        z = pt.sqrt(2 * alpha) * pt.sqrt(pt.dot(pt.square(omega), pt.square(ls)))
+        coeff = 2.0 * pt.power(2.0 * np.pi * alpha, D / 2.0) * pt.prod(ls) / pt.gamma(alpha)
+
+        # Handle singularity at z=0
+        term_z = pt.switch(pt.eq(z, 0), pt.gamma(nu) / 2.0, pt.power(z / 2.0, nu) * pt.kv(nu, z))
+
+        return coeff * term_z
+
 
 class Matern52(Stationary):
     r"""
-    The Matern kernel with nu = 5/2.
+    The Matérn kernel with :math:`\nu = \frac{5}{2}`.
 
     .. math::
 
        k(x, x') = \left(1 + \frac{\sqrt{5(x - x')^2}}{\ell} +
                    \frac{5(x-x')^2}{3\ell^2}\right)
                    \mathrm{exp}\left[ - \frac{\sqrt{5(x - x')^2}}{\ell} \right]
+
+    Read more `here <https://en.wikipedia.org/wiki/Mat%C3%A9rn_covariance_function>`_.
+
+    Parameters
+    ----------
+    input_dim : int
+        The number of input dimensions
+    ls : scalar or array, optional
+        Lengthscale parameter :math:`\ell`; if `input_dim` > 1, a list or array of scalars.
+        If `input_dim` == 1, a scalar.
+    ls_inv : scalar or array, optional
+        Inverse lengthscale :math:`1 / \ell`. One of `ls` or `ls_inv` must be provided.
+    active_dims : list of int, optional
+        The dimension(s) the covariance function operates on.
     """
 
     def full_from_distance(self, dist: TensorLike, squared: bool = False) -> TensorVariable:
@@ -639,7 +689,7 @@ class Matern52(Stationary):
 
     def power_spectral_density(self, omega: TensorLike) -> TensorVariable:
         r"""
-        The power spectral density for the Matern52 kernel is:
+        Power spectral density for the Matern52 kernel.
 
         .. math::
 
@@ -664,12 +714,26 @@ class Matern52(Stationary):
 
 class Matern32(Stationary):
     r"""
-    The Matern kernel with nu = 3/2.
+    The Matérn kernel with :math:`\nu = \frac{3}{2}`.
 
     .. math::
 
        k(x, x') = \left(1 + \frac{\sqrt{3(x - x')^2}}{\ell}\right)
                   \mathrm{exp}\left[ - \frac{\sqrt{3(x - x')^2}}{\ell} \right]
+
+    Read more `here <https://en.wikipedia.org/wiki/Mat%C3%A9rn_covariance_function>`_.
+
+    Parameters
+    ----------
+    input_dim : int
+        The number of input dimensions
+    ls : scalar or array, optional
+        Lengthscale parameter :math:`\ell`; if `input_dim` > 1, a list or array of scalars.
+        If `input_dim` == 1, a scalar.
+    ls_inv : scalar or array, optional
+        Inverse lengthscale :math:`1 / \ell`. One of `ls` or `ls_inv` must be provided.
+    active_dims : list of int, optional
+        The dimension(s) the covariance function operates on.
     """
 
     def full_from_distance(self, dist: TensorLike, squared: bool = False) -> TensorVariable:
@@ -678,7 +742,7 @@ class Matern32(Stationary):
 
     def power_spectral_density(self, omega: TensorLike) -> TensorVariable:
         r"""
-        The power spectral density for the Matern32 kernel is:
+        Power spectral density for the Matern32 kernel.
 
         .. math::
 
@@ -703,7 +767,7 @@ class Matern32(Stationary):
 
 class Matern12(Stationary):
     r"""
-    The Matern kernel with nu = 1/2
+    The Matern kernel with nu = 1/2.
 
     .. math::
 
@@ -789,7 +853,8 @@ class Periodic(Stationary):
         return pt.exp(-0.5 * r2)
 
     def power_spectral_density_approx(self, J: TensorLike) -> TensorVariable:
-        """
+        r"""Power spectral density approximation.
+
         Technically, this is not a spectral density but these are the first `m` coefficients of
         the low rank approximation for the periodic kernel, which are used in the same way.
         `J` is a vector of `np.arange(m)`.
@@ -865,8 +930,7 @@ class Polynomial(Linear):
 
 class WarpedInput(Covariance):
     r"""
-    Warp the inputs of any kernel using an arbitrary function
-    defined using PyTensor.
+    Warp the inputs of any kernel using an arbitrary function defined using PyTensor.
 
     .. math::
        k(x, x') = k(w(x), w(x'))
@@ -935,7 +999,7 @@ class WrappedPeriodic(Covariance):
     In order to construct a kernel equivalent to the `Periodic` kernel you
     can do the following (though using `Periodic` will likely be a bit faster):
 
-    .. code:: python
+    .. code-block:: python
 
         exp_quad = pm.gp.cov.ExpQuad(1, ls=0.5)
         cov = pm.gp.cov.WrappedPeriodic(exp_quad, period=5)
@@ -977,8 +1041,10 @@ class WrappedPeriodic(Covariance):
 
 class Gibbs(Covariance):
     r"""
-    The Gibbs kernel.  Use an arbitrary lengthscale function defined
-    using PyTensor.  Only tested in one dimension.
+    The Gibbs kernel.
+
+    Use an arbitrary lengthscale function defined using PyTensor.
+    Only tested in one dimension.
 
     .. math::
        k(x, x') = \sqrt{\frac{2\ell(x)\ell(x')}{\ell^2(x) + \ell^2(x')}}
@@ -1044,9 +1110,9 @@ class Gibbs(Covariance):
 
 class ScaledCov(Covariance):
     r"""
-    Construct a kernel by multiplying a base kernel with a scaling
-    function defined using PyTensor.  The scaling function is
-    non-negative, and can be parameterized.
+    Construct a kernel by multiplying a base kernel with a scaling function defined using PyTensor.
+
+    The scaling function is non-negative, and can be parameterized.
 
     .. math::
        k(x, x') = \phi(x) k_{\text{base}}(x, x') \phi(x')
@@ -1096,6 +1162,7 @@ class ScaledCov(Covariance):
 
 class Coregion(Covariance):
     r"""Covariance function for intrinsic/linear coregionalization models.
+
     Adapted from GPy http://gpy.readthedocs.io/en/deploy/GPy.kern.src.html#GPy.kern.src.coregionalize.Coregionalize.
 
     This covariance has the form:

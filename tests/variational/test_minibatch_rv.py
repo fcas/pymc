@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 #   limitations under the License.
 import numpy as np
 import pytensor
+import pytensor.tensor as pt
 import pytest
 
 from scipy import stats as st
@@ -20,10 +21,8 @@ from scipy import stats as st
 import pymc as pm
 
 from pymc import Normal, draw
-from pymc.data import minibatch_index
-from pymc.testing import select_by_precision
+from pymc.data import Minibatch
 from pymc.variational.minibatch_rv import create_minibatch_rv
-from tests.test_data import gen1, gen2
 
 
 class TestMinibatchRandomVariable:
@@ -40,50 +39,6 @@ class TestMinibatchRandomVariable:
             pm.Normal("n", observed=[[1]], total_size=2)
             p2 = pytensor.function([], model2.logp())
         assert p1() * 2 == p2()
-
-    def test_density_scaling_with_generator(self):
-        # We have different size generators
-
-        def true_dens():
-            g = gen1()
-            for i, point in enumerate(g):
-                yield st.norm.logpdf(point).sum() * 10
-
-        t = true_dens()
-        # We have same size models
-        with pm.Model() as model1:
-            pm.Normal("n", observed=gen1(), total_size=100)
-            p1 = pytensor.function([], model1.logp())
-
-        with pm.Model() as model2:
-            gen_var = pm.generator(gen2())
-            pm.Normal("n", observed=gen_var, total_size=100)
-            p2 = pytensor.function([], model2.logp())
-
-        for i in range(10):
-            _1, _2, _t = p1(), p2(), next(t)
-            decimals = select_by_precision(float64=7, float32=1)
-            np.testing.assert_almost_equal(_1, _t, decimal=decimals)  # Value O(-50,000)
-            np.testing.assert_almost_equal(_1, _2)
-        # Done
-
-    def test_gradient_with_scaling(self):
-        with pm.Model() as model1:
-            genvar = pm.generator(gen1())
-            m = pm.Normal("m")
-            pm.Normal("n", observed=genvar, total_size=1000)
-            grad1 = model1.compile_fn(model1.dlogp(vars=m), point_fn=False)
-        with pm.Model() as model2:
-            m = pm.Normal("m")
-            shavar = pytensor.shared(np.ones((1000, 100)))
-            pm.Normal("n", observed=shavar)
-            grad2 = model2.compile_fn(model2.dlogp(vars=m), point_fn=False)
-
-        for i in range(10):
-            shavar.set_value(np.ones((100, 100)) * i)
-            g1 = grad1(1)
-            g2 = grad2(1)
-            np.testing.assert_almost_equal(g1, g2)
 
     def test_multidim_scaling(self):
         with pm.Model() as model0:
@@ -157,6 +112,13 @@ class TestMinibatchRandomVariable:
         assert mx is not x
         np.testing.assert_array_equal(draw(mx, random_seed=1), draw(x, random_seed=1))
 
+    def test_warning_on_missing_total_size(self):
+        total_size = 1000
+        with pytest.warns(match="total_size not provided"):
+            with pm.Model() as m:
+                MB = pm.Minibatch(np.arange(total_size, dtype="float64"), batch_size=100)
+                pm.Normal("n", observed=MB)
+
     @pytest.mark.filterwarnings("error")
     def test_minibatch_parameter_and_value(self):
         rng = np.random.default_rng(161)
@@ -165,10 +127,7 @@ class TestMinibatchRandomVariable:
         with pm.Model(check_bounds=False) as m:
             AD = pm.Data("AD", np.arange(total_size, dtype="float64"))
             TD = pm.Data("TD", np.arange(total_size, dtype="float64"))
-
-            minibatch_idx = minibatch_index(0, 10, size=(9,))
-            AD_mt = AD[minibatch_idx]
-            TD_mt = TD[minibatch_idx]
+            AD_mt, TD_mt = Minibatch(AD, TD, batch_size=9)
 
             pm.Normal(
                 "AD_predicted",
@@ -189,3 +148,12 @@ class TestMinibatchRandomVariable:
         with m:
             pm.set_data({"AD": rng.normal(size=1000)})
         assert logp_fn(ip) != logp_fn(ip)
+
+    def test_derived_rv(self):
+        """Test we can obtain a minibatch logp out of a derived RV."""
+        dist = pt.clip(pm.Normal.dist(0, 1, size=(1,)), -1, 1)
+        mb_dist = create_minibatch_rv(dist, total_size=(2,))
+        np.testing.assert_allclose(
+            pm.logp(mb_dist, -1).eval(),
+            pm.logp(dist, -1).eval() * 2,
+        )

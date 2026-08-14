@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -124,7 +124,7 @@ class LKJCholeskyCovFixture(KnownCDF):
             chol_packed = pm.LKJCholeskyCov(
                 "chol_packed", eta=3, n=5, sd_dist=sd_dist, compute_corr=False
             )
-            chol = pm.expand_packed_triangular(5, chol_packed, lower=True)
+            chol = pm.math.expand_packed_triangular(5, chol_packed, lower=True)
             cov = pt.dot(chol, chol.T)
             stds = pt.sqrt(pt.diag(cov))
             pm.Deterministic("log_stds", pt.log(stds))

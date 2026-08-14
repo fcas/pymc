@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -36,28 +36,26 @@
 import typing
 import warnings
 
-from collections.abc import Container, Sequence
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import pytensor
 
-from pytensor import Variable
 from pytensor import tensor as pt
 from pytensor.graph import Apply, Op, node_rewriter
-from pytensor.graph.basic import Constant, clone_get_equiv, graph_inputs, walk
-from pytensor.graph.op import HasInnerGraph
+from pytensor.graph.basic import Constant, clone_get_equiv
+from pytensor.graph.fg import FunctionGraph
+from pytensor.graph.traversal import graph_inputs, walk
 from pytensor.link.c.type import CType
 from pytensor.raise_op import CheckAndRaise
 from pytensor.scalar.basic import Mul
 from pytensor.tensor.basic import get_underlying_scalar_constant_value
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.exceptions import NotScalarConstantError
-from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.variable import TensorVariable
 
-from pymc.logprob.abstract import MeasurableVariable, _logprob
+from pymc.logprob.abstract import MeasurableOp, ValuedRV, _logprob
 from pymc.pytensorf import replace_vars_in_graphs
-from pymc.util import makeiter
 
 if typing.TYPE_CHECKING:
     from pymc.logprob.transforms import Transform
@@ -80,7 +78,6 @@ def replace_rvs_by_values(
     rvs_to_transforms, optional
         Mapping between the original graph RVs and respective value transforms
     """
-
     if rvs_to_transforms:
         # Conditional transforms like Interval can reference variables in the original RV graph
         # To avoid mutating the original graphs in place, we have to clone them
@@ -131,26 +128,6 @@ def replace_rvs_by_values(
     return replace_vars_in_graphs(graphs, replacements)
 
 
-def rvs_in_graph(vars: Variable | Sequence[Variable]) -> set[Variable]:
-    """Assert that there are no `MeasurableVariable` nodes in a graph."""
-
-    def expand(r):
-        owner = r.owner
-        if owner:
-            inputs = list(reversed(owner.inputs))
-
-            if isinstance(owner.op, HasInnerGraph):
-                inputs += owner.op.inner_outputs
-
-            return inputs
-
-    return {
-        node
-        for node in walk(makeiter(vars), expand, False)
-        if node.owner and isinstance(node.owner.op, RandomVariable | MeasurableVariable)
-    }
-
-
 def convert_indices(indices, entry):
     if indices and isinstance(entry, CType):
         rval = indices.pop(0)
@@ -172,33 +149,34 @@ def indices_from_subtensor(idx_list, indices):
     )
 
 
-def check_potential_measurability(
-    inputs: tuple[TensorVariable], valued_rvs: Container[TensorVariable]
-) -> bool:
-    valued_rvs = set(valued_rvs)
+def filter_measurable_variables(inputs):
+    return [
+        inp for inp in inputs if (inp.owner is not None and isinstance(inp.owner.op, MeasurableOp))
+    ]
 
+
+def check_potential_measurability(inputs: Iterable[TensorVariable]) -> bool:
     def expand_fn(var):
-        # expand_fn does not go beyond valued_rvs or any MeasurableVariable
-        if var.owner and not isinstance(var.owner.op, MeasurableVariable) and var not in valued_rvs:
-            return reversed(var.owner.inputs)
+        # expand_fn does not go beyond valued_rvs or any MeasurableOp variables
+        if var.owner and not isinstance(var.owner.op, MeasurableOp | ValuedRV):
+            return var.owner.inputs
         else:
             return []
 
     if any(
-        ancestor_var
-        for ancestor_var in walk(inputs, expand=expand_fn, bfs=False)
-        if (
+        (
             ancestor_var.owner
-            and isinstance(ancestor_var.owner.op, MeasurableVariable)
-            and ancestor_var not in valued_rvs
+            and isinstance(ancestor_var.owner.op, MeasurableOp)
+            and not isinstance(ancestor_var.owner.op, ValuedRV)
         )
+        for ancestor_var in walk(inputs, expand=expand_fn, bfs=False)
     ):
         return True
     return False
 
 
 class ParameterValueError(ValueError):
-    """Exception for invalid parameters values in logprob graphs"""
+    """Exception for invalid parameters values in logprob graphs."""
 
 
 class CheckParameterValue(CheckAndRaise):
@@ -214,12 +192,13 @@ class CheckParameterValue(CheckAndRaise):
         self.can_be_replaced_by_ninf = can_be_replaced_by_ninf
 
     def __str__(self):
+        """Return a string representation of the object."""
         return f"Check{{{self.msg}}}"
 
 
 @node_rewriter(tracks=[CheckParameterValue])
 def local_remove_check_parameter(fgraph, node):
-    """Rewrite that removes CheckParameterValue
+    """Rewrite that removes CheckParameterValue.
 
     This is used when compile_rv_inplace
     """
@@ -259,7 +238,7 @@ pytensor.compile.optdb["canonicalize"].register(
 )
 
 
-class DiracDelta(Op):
+class DiracDelta(MeasurableOp, Op):
     """An `Op` that represents a Dirac-delta distribution."""
 
     __props__ = ("rtol", "atol")
@@ -283,11 +262,8 @@ class DiracDelta(Op):
         warnings.warn("DiracDelta is a dummy Op that shouldn't be used in a compiled graph")
         z[0] = x
 
-    def infer_shape(self, fgraph, node, input_shapes):
+    def infer_shape(self, node, input_shapes):
         return input_shapes
-
-
-MeasurableVariable.register(DiracDelta)
 
 
 dirac_delta = DiracDelta()
@@ -303,11 +279,8 @@ def diracdelta_logprob(op, values, *inputs, **kwargs):
 
 def find_negated_var(var):
     """Return a variable that is being multiplied by -1 or None otherwise."""
-
-    if (
-        not (var.owner)
-        and isinstance(var.owner.op, Elemwise)
-        and isinstance(var.owner.op.scalar_op, Mul)
+    if not (
+        var.owner and isinstance(var.owner.op, Elemwise) and isinstance(var.owner.op.scalar_op, Mul)
     ):
         return None
     if len(var.owner.inputs) != 2:
@@ -322,3 +295,33 @@ def find_negated_var(var):
             continue
 
     return None
+
+
+def get_related_valued_nodes(fgraph: FunctionGraph, node: Apply) -> list[Apply]:
+    """Get all ValuedVars related to the same RV node.
+
+    Returns
+    -------
+        rv_node
+        valued_nodes
+    """
+    clients = fgraph.clients
+    return [
+        client
+        for out in node.outputs
+        for client, _ in clients[out]
+        if isinstance(client.op, ValuedRV)
+    ]
+
+
+def __getattr__(name):
+    if name == "rvs_in_graphs":
+        warnings.warn(
+            f"{name} has been moved to `pymc.pytensorf`. Importing from `pymc.logprob.utils` will fail in a future release.",
+            FutureWarning,
+        )
+        from pymc.pytensorf import rvs_in_graph
+
+        return rvs_in_graph()
+
+    raise AttributeError(f"module {__name__} has no attribute {name}")

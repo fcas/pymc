@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 #   limitations under the License.
 
 import logging
-import sys
 import warnings
 
 import numpy as np
@@ -37,14 +36,15 @@ class TestNUTSUniform(sf.NutsFixture, sf.UniformFixture):
     min_n_eff = 9000
     rtol = 0.1
     atol = 0.05
+    step_args = {"random_seed": 202010}
 
 
 class TestNUTSUniform2(TestNUTSUniform):
-    step_args = {"target_accept": 0.95}
+    step_args = {"target_accept": 0.95, "random_seed": 202010}
 
 
 class TestNUTSUniform3(TestNUTSUniform):
-    step_args = {"target_accept": 0.80}
+    step_args = {"target_accept": 0.80, "random_seed": 202010}
 
 
 class TestNUTSNormal(sf.NutsFixture, sf.NormalFixture):
@@ -55,6 +55,7 @@ class TestNUTSNormal(sf.NutsFixture, sf.NormalFixture):
     min_n_eff = 10000
     rtol = 0.1
     atol = 0.05
+    step_args = {"random_seed": 123456}
 
 
 class TestNUTSBetaBinomial(sf.NutsFixture, sf.BetaBinomialFixture):
@@ -64,6 +65,7 @@ class TestNUTSBetaBinomial(sf.NutsFixture, sf.BetaBinomialFixture):
     burn = 0
     chains = 2
     min_n_eff = 400
+    step_args = {"random_seed": 202010}
 
 
 class TestNUTSStudentT(sf.NutsFixture, sf.StudentTFixture):
@@ -74,6 +76,7 @@ class TestNUTSStudentT(sf.NutsFixture, sf.StudentTFixture):
     min_n_eff = 1000
     rtol = 0.1
     atol = 0.05
+    step_args = {"random_seed": 202010}
 
 
 @pytest.mark.skip("Takes too long to run")
@@ -93,6 +96,7 @@ class TestNUTSLKJCholeskyCov(sf.NutsFixture, sf.LKJCholeskyCovFixture):
     burn = 0
     chains = 2
     min_n_eff = 200
+    step_args = {"random_seed": 202010}
 
 
 class TestNutsCheckTrace:
@@ -109,29 +113,31 @@ class TestNutsCheckTrace:
 
     def test_bad_init_nonparallel(self):
         with pm.Model():
-            pm.HalfNormal("a", sigma=1, initval=-1, transform=None)
+            pm.HalfNormal("a", sigma=1, initval=-1, default_transform=None)
             with pytest.raises(SamplingError) as error:
-                pm.sample(chains=1, random_seed=1)
+                # Testing PyMC NUTS pipeline
+                pm.sample(chains=1, random_seed=1, nuts_sampler="pymc")
             error.match("Initial evaluation")
 
-    @pytest.mark.skipif(sys.version_info < (3, 6), reason="requires python3.6 or higher")
     def test_bad_init_parallel(self):
         with pm.Model():
-            pm.HalfNormal("a", sigma=1, initval=-1, transform=None)
+            pm.HalfNormal("a", sigma=1, initval=-1, default_transform=None)
             with pytest.raises(SamplingError) as error:
-                pm.sample(cores=2, random_seed=1)
+                # Testing PyMC NUTS pipeline
+                pm.sample(cores=2, random_seed=1, nuts_sampler="pymc")
             error.match("Initial evaluation")
 
     def test_emits_energy_warnings(self, caplog):
         with pm.Model():
             a = pm.Normal("a", size=2, initval=floatX(np.zeros(2)))
             a = pt.switch(a > 0, np.inf, a)
-            b = pt.slinalg.solve(floatX(np.eye(2)), a, check_finite=False)
+            b = pt.linalg.solve(floatX(np.eye(2)), a, check_finite=False)
             pm.Normal("c", mu=b, size=2, initval=floatX(np.r_[0.0, 0.0]))
             caplog.clear()
             # The logger name must be specified for DEBUG level capturing to work
             with caplog.at_level(logging.DEBUG, logger="pymc"):
-                idata = pm.sample(20, tune=5, chains=2, random_seed=526)
+                # Testing PyMC NUTS behavior
+                idata = pm.sample(20, tune=5, chains=2, random_seed=526, nuts_sampler="pymc")
             assert any("Energy change" in w.msg for w in caplog.records)
 
     def test_sampler_stats(self):
@@ -145,6 +151,7 @@ class TestNutsCheckTrace:
         expected_stat_names = {
             "depth",
             "diverging",
+            "divergences",
             "energy",
             "energy_error",
             "model_logp",
@@ -153,7 +160,6 @@ class TestNutsCheckTrace:
             "step_size",
             "step_size_bar",
             "tree_size",
-            "tune",
             "perf_counter_diff",
             "perf_counter_start",
             "process_time_diff",
@@ -201,3 +207,24 @@ class TestRVsAssignmentNUTS(RVsAssignmentStepsTester):
     @pytest.mark.parametrize("step, step_kwargs", [(NUTS, {})])
     def test_continuous_steps(self, step, step_kwargs):
         self.continuous_steps(step, step_kwargs)
+
+
+def test_nuts_step_legacy_value_grad_function():
+    # This test can be removed once ravel_inputs=False is deprecated
+    with pm.Model() as m:
+        x = pm.Normal("x", shape=(2,))
+        y = pm.Normal("y", x, shape=(3, 2))
+
+    legacy_value_grad_fn = m.logp_dlogp_function(ravel_inputs=False, mode="FAST_COMPILE")
+    legacy_value_grad_fn.set_extra_values({})
+    nuts = NUTS(model=m, logp_dlogp_func=legacy_value_grad_fn)
+
+    # Confirm it is a function of multiple variables
+    logp, dlogp = nuts._logp_dlogp_func([np.zeros((2,)), np.zeros((3, 2))])
+    np.testing.assert_allclose(dlogp, np.zeros(8))
+
+    # Confirm we can perform a NUTS step
+    ip = m.initial_point()
+    new_ip, _ = nuts.step(ip)
+    assert np.all(new_ip["x"] != ip["x"])
+    assert np.all(new_ip["y"] != ip["y"])

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,25 +16,37 @@ import logging
 
 import arviz
 import numpy as np
+import pytest
 
 from pymc.stats import convergence
 
 
-def test_warn_divergences():
+@pytest.mark.parametrize(
+    "diverging, expected_phrase",
+    [
+        pytest.param([1, 0, 1, 0], "were 2 divergences after tuning", id="plural"),
+        pytest.param([1, 0, 0, 0], "was 1 divergence after tuning", id="singular"),
+    ],
+)
+def test_warn_divergences(diverging, expected_phrase):
     idata = arviz.from_dict(
-        sample_stats={
-            "diverging": np.array([[1, 0, 1, 0], [0, 0, 0, 0]]).astype(bool),
+        {
+            "sample_stats": {
+                "diverging": np.array([diverging, [0, 0, 0, 0]]).astype(bool),
+            }
         }
     )
     warns = convergence.warn_divergences(idata)
     assert len(warns) == 1
-    assert "2 divergences after tuning" in warns[0].message
+    assert expected_phrase in warns[0].message
 
 
 def test_warn_treedepth():
     idata = arviz.from_dict(
-        sample_stats={
-            "reached_max_treedepth": np.array([[0, 0, 0], [0, 1, 0]]).astype(bool),
+        {
+            "sample_stats": {
+                "reached_max_treedepth": np.array([[0, 0, 0], [0, 1, 0]]).astype(bool),
+            }
         }
     )
     warns = convergence.warn_treedepth(idata)
@@ -48,8 +60,10 @@ def test_warn_treedepth_multiple_samplers():
     max_treedepth[0, 0, 0] = True
     max_treedepth[2, 1, 1] = True
     idata = arviz.from_dict(
-        sample_stats={
-            "reached_max_treedepth": max_treedepth,
+        {
+            "sample_stats": {
+                "reached_max_treedepth": max_treedepth,
+            }
         }
     )
     warns = convergence.warn_treedepth(idata)
@@ -59,8 +73,8 @@ def test_warn_treedepth_multiple_samplers():
 
 
 def test_log_warning_stats(caplog):
-    s1 = dict(warning="Temperature too low!")
-    s2 = dict(warning="Temperature too high!")
+    s1 = {"warning": "Temperature too low!"}
+    s2 = {"warning": "Temperature too high!"}
     stats = [s1, s2]
 
     with caplog.at_level(logging.WARNING):
@@ -78,7 +92,7 @@ def test_log_warning_stats_knows_SamplerWarning(caplog):
         "Not that interesting",
         "debug",
     )
-    stats = [dict(warning=warn)]
+    stats = [{"warning": warn}]
 
     with caplog.at_level(logging.DEBUG, logger="pymc"):
         convergence.log_warning_stats(stats)

@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -36,28 +36,23 @@
 
 import warnings
 
-from collections import deque
 from collections.abc import Sequence
 from typing import TypeAlias
 
 import numpy as np
 import pytensor.tensor as pt
 
-from pytensor import config
 from pytensor.graph.basic import (
     Constant,
     Variable,
-    ancestors,
-    graph_inputs,
-    io_toposort,
 )
-from pytensor.graph.op import compute_test_value
 from pytensor.graph.rewriting.basic import GraphRewriter, NodeRewriter
-from pytensor.tensor.variable import TensorVariable
+from pytensor.graph.traversal import ancestors, walk
 
 from pymc.logprob.abstract import (
-    MeasurableVariable,
+    MeasurableOp,
     _icdf_helper,
+    _logccdf_helper,
     _logcdf_helper,
     _logprob,
     _logprob_helper,
@@ -65,8 +60,8 @@ from pymc.logprob.abstract import (
 from pymc.logprob.rewriting import cleanup_ir, construct_ir_fgraph
 from pymc.logprob.transform_value import TransformValuesRewrite
 from pymc.logprob.transforms import Transform
-from pymc.logprob.utils import rvs_in_graph
-from pymc.pytensorf import replace_vars_in_graphs
+from pymc.logprob.utils import get_related_valued_nodes
+from pymc.pytensorf import expand_inner_graph, replace_vars_in_graphs
 
 TensorLike: TypeAlias = Variable | float | np.ndarray
 
@@ -76,13 +71,17 @@ def _find_unallowed_rvs_in_graph(graph):
     from pymc.distributions.simulator import SimulatorRV
 
     return {
-        rv
-        for rv in rvs_in_graph(graph)
-        if not isinstance(rv.owner.op, SimulatorRV | MinibatchIndexRV)
+        var
+        for var in walk(graph, expand_inner_graph, False)
+        if (
+            var.owner
+            and isinstance(var.owner.op, MeasurableOp)
+            and not isinstance(var.owner.op, SimulatorRV | MinibatchIndexRV)
+        )
     }
 
 
-def _warn_rvs_in_inferred_graph(graph: TensorVariable | Sequence[TensorVariable]):
+def _warn_rvs_in_inferred_graph(graph: Variable | Sequence[Variable]):
     """Issue warning if any RVs are found in graph.
 
     RVs are usually an (implicit) conditional input of the derived probability expression,
@@ -92,7 +91,6 @@ def _warn_rvs_in_inferred_graph(graph: TensorVariable | Sequence[TensorVariable]
     This makes it impossible (or difficult) to replace it by the respective values afterward,
     so we instruct users to do it beforehand.
     """
-
     rvs_in_graph = _find_unallowed_rvs_in_graph(graph)
     if rvs_in_graph:
         warnings.warn(
@@ -104,30 +102,14 @@ def _warn_rvs_in_inferred_graph(graph: TensorVariable | Sequence[TensorVariable]
         )
 
 
-def _deprecate_warn_missing_rvs(warn_rvs, kwargs):
-    if "warn_missing_rvs" in kwargs:
-        warnings.warn(
-            "Argument `warn_missing_rvs` was renamed to `warn_rvs` and will be removed in a future release",
-            FutureWarning,
-        )
-        if warn_rvs is None:
-            warn_rvs = kwargs.pop("warn_missing_rvs")
-        else:
-            raise ValueError("Can't set both warn_rvs and warn_missing_rvs")
-    else:
-        if warn_rvs is None:
-            warn_rvs = True
-    return warn_rvs, kwargs
-
-
-def logp(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> TensorVariable:
+def logp(rv: Variable, value: Variable | TensorLike, warn_rvs=True, **kwargs) -> Variable:
     """Create a graph for the log-probability of a random variable.
 
     Parameters
     ----------
-    rv : TensorVariable
-    value : tensor_like
-        Should be the same type (shape and dtype) as the rv.
+    rv : Variable
+    value : Variable or tensor_like
+        Should be the same type as the rv.
     warn_rvs : bool, default True
         Warn if RVs were found in the logp graph.
         This can happen when a variable has other other random variables as inputs.
@@ -136,7 +118,7 @@ def logp(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
 
     Returns
     -------
-    logp : TensorVariable
+    logp : Variable
 
     Raises
     ------
@@ -162,7 +144,7 @@ def logp(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
         print(rv_logp.eval({value: 0.9, mu: 0.0}))  # -1.32393853
 
         # Compile a function for repeated evaluations
-        rv_logp_fn = pm.compile_pymc([value, mu], rv_logp)
+        rv_logp_fn = pm.compile([value, mu], rv_logp)
         print(rv_logp_fn(value=0.9, mu=0.0))  # -1.32393853
 
 
@@ -184,7 +166,7 @@ def logp(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
         print(exp_rv_logp.eval({value: 0.9, mu: 0.0}))  # -0.81912844
 
         # Compile a function for repeated evaluations
-        exp_rv_logp_fn = pm.compile_pymc([value, mu], exp_rv_logp)
+        exp_rv_logp_fn = pm.compile([value, mu], exp_rv_logp)
         print(exp_rv_logp_fn(value=0.9, mu=0.0))  # -0.81912844
 
 
@@ -195,8 +177,10 @@ def logp(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
         import pymc as pm
         import pytensor.tensor as pt
 
+
         def normal_logp(value, mu, sigma):
             return pm.logp(pm.Normal.dist(mu, sigma), value)
+
 
         with pm.Model() as model:
             mu = pm.Normal("mu")
@@ -204,29 +188,29 @@ def logp(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
             pm.CustomDist("x", mu, sigma, logp=normal_logp)
 
     """
-    warn_rvs, kwargs = _deprecate_warn_missing_rvs(warn_rvs, kwargs)
-
-    value = pt.as_tensor_variable(value, dtype=rv.dtype)
+    if not isinstance(value, Variable):
+        value = pt.as_tensor_variable(value, dtype=rv.dtype)
     try:
         return _logprob_helper(rv, value, **kwargs)
     except NotImplementedError:
-        fgraph, _, _ = construct_ir_fgraph({rv: value})
-        [(ir_rv, ir_value)] = fgraph.preserve_rv_mappings.rv_values.items()
+        fgraph = construct_ir_fgraph({rv: value})
+        [ir_valued_var] = fgraph.outputs
+        [ir_rv, ir_value] = ir_valued_var.owner.inputs
         expr = _logprob_helper(ir_rv, ir_value, **kwargs)
-        cleanup_ir([expr])
+        [expr] = cleanup_ir([expr])
         if warn_rvs:
-            _warn_rvs_in_inferred_graph(expr)
+            _warn_rvs_in_inferred_graph([expr])
         return expr
 
 
-def logcdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> TensorVariable:
+def logcdf(rv: Variable, value: Variable | TensorLike, warn_rvs=True) -> Variable:
     """Create a graph for the log-CDF of a random variable.
 
     Parameters
     ----------
-    rv : TensorVariable
+    rv : Variable
     value : tensor_like
-        Should be the same type (shape and dtype) as the rv.
+        Should be the same type as the rv.
     warn_rvs : bool, default True
         Warn if RVs were found in the logcdf graph.
         This can happen when a variable has other random variables as inputs.
@@ -234,7 +218,7 @@ def logcdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Te
 
     Returns
     -------
-    logp : TensorVariable
+    logp : Variable
 
     Raises
     ------
@@ -260,7 +244,7 @@ def logcdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Te
         print(rv_logcdf.eval({value: 0.9, mu: 0.0}))  # -0.2034146
 
         # Compile a function for repeated evaluations
-        rv_logcdf_fn = pm.compile_pymc([value, mu], rv_logcdf)
+        rv_logcdf_fn = pm.compile([value, mu], rv_logcdf)
         print(rv_logcdf_fn(value=0.9, mu=0.0))  # -0.2034146
 
 
@@ -282,7 +266,7 @@ def logcdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Te
         print(exp_rv_logcdf.eval({value: 0.9, mu: 0.0}))  # -0.78078813
 
         # Compile a function for repeated evaluations
-        exp_rv_logcdf_fn = pm.compile_pymc([value, mu], exp_rv_logcdf)
+        exp_rv_logcdf_fn = pm.compile([value, mu], exp_rv_logcdf)
         print(exp_rv_logcdf_fn(value=0.9, mu=0.0))  # -0.78078813
 
 
@@ -293,8 +277,10 @@ def logcdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Te
         import pymc as pm
         import pytensor.tensor as pt
 
+
         def normal_logcdf(value, mu, sigma):
-            return pm.logp(pm.Normal.dist(mu, sigma), value)
+            return pm.logcdf(pm.Normal.dist(mu, sigma), value)
+
 
         with pm.Model() as model:
             mu = pm.Normal("mu")
@@ -302,29 +288,95 @@ def logcdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Te
             pm.CustomDist("x", mu, sigma, logcdf=normal_logcdf)
 
     """
-    warn_rvs, kwargs = _deprecate_warn_missing_rvs(warn_rvs, kwargs)
-    value = pt.as_tensor_variable(value, dtype=rv.dtype)
+    if not isinstance(value, Variable):
+        value = pt.as_tensor_variable(value, dtype=rv.dtype)
     try:
-        return _logcdf_helper(rv, value, **kwargs)
+        return _logcdf_helper(rv, value)
     except NotImplementedError:
         # Try to rewrite rv
-        fgraph, rv_values, _ = construct_ir_fgraph({rv: value})
-        [ir_rv] = fgraph.outputs
-        expr = _logcdf_helper(ir_rv, value, **kwargs)
-        cleanup_ir([expr])
+        fgraph = construct_ir_fgraph({rv: value})
+        [ir_valued_rv] = fgraph.outputs
+        [ir_rv, ir_value] = ir_valued_rv.owner.inputs
+        expr = _logcdf_helper(ir_rv, ir_value)
+        [expr] = cleanup_ir([expr])
         if warn_rvs:
-            _warn_rvs_in_inferred_graph(expr)
+            _warn_rvs_in_inferred_graph([expr])
         return expr
 
 
-def icdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> TensorVariable:
+def logccdf(rv: Variable, value: Variable | TensorLike, warn_rvs=True) -> Variable:
+    """Create a graph for the log complementary CDF (log survival function) of a random variable.
+
+    The log complementary CDF is defined as log(1 - CDF(x)), also known as the
+    log survival function. For distributions with a numerically stable implementation,
+    this is more accurate than computing log(1 - exp(logcdf)).
+
+    Parameters
+    ----------
+    rv : Variable
+    value : tensor_like
+        Should be the same type (shape and dtype) as the rv.
+    warn_rvs : bool, default True
+        Warn if RVs were found in the logccdf graph.
+        This can happen when a variable has other random variables as inputs.
+        In that case, those random variables should be replaced by their respective values.
+
+    Returns
+    -------
+    logccdf : Variable
+
+    Raises
+    ------
+    RuntimeError
+        If the logccdf cannot be derived.
+
+    Examples
+    --------
+    Create a compiled function that evaluates the logccdf of a variable
+
+    .. code-block:: python
+
+        import pymc as pm
+        import pytensor.tensor as pt
+
+        mu = pt.scalar("mu")
+        rv = pm.Normal.dist(mu, 1.0)
+
+        value = pt.scalar("value")
+        rv_logccdf = pm.logccdf(rv, value)
+
+        # Use .eval() for debugging
+        print(rv_logccdf.eval({value: 0.9, mu: 0.0}))  # -1.5272506
+
+        # Compile a function for repeated evaluations
+        rv_logccdf_fn = pm.compile([value, mu], rv_logccdf)
+        print(rv_logccdf_fn(value=0.9, mu=0.0))  # -1.5272506
+
+    """
+    if not isinstance(value, Variable):
+        value = pt.as_tensor_variable(value, dtype=rv.dtype)
+    try:
+        return _logccdf_helper(rv, value)
+    except NotImplementedError:
+        # Try to rewrite rv
+        fgraph = construct_ir_fgraph({rv: value})
+        [ir_valued_rv] = fgraph.outputs
+        [ir_rv, ir_value] = ir_valued_rv.owner.inputs
+        expr = _logccdf_helper(ir_rv, ir_value)
+        [expr] = cleanup_ir([expr])
+        if warn_rvs:
+            _warn_rvs_in_inferred_graph([expr])
+        return expr
+
+
+def icdf(rv: Variable, value: Variable | TensorLike, warn_rvs=True) -> Variable:
     """Create a graph for the inverse CDF of a random variable.
 
     Parameters
     ----------
-    rv : TensorVariable
+    rv : Variable
     value : tensor_like
-        Should be the same type (shape and dtype) as the rv.
+        Should be the same type as the rv, except dtype can differ.
     warn_rvs : bool, default True
         Warn if RVs were found in the icdf graph.
         This can happen when a variable has other random variables as inputs.
@@ -332,7 +384,7 @@ def icdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
 
     Returns
     -------
-    icdf : TensorVariable
+    icdf : Variable
 
     Raises
     ------
@@ -358,7 +410,7 @@ def icdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
         print(rv_icdf.eval({value: 0.9, mu: 0.0}))  # 1.28155157
 
         # Compile a function for repeated evaluations
-        rv_icdf_fn = pm.compile_pymc([value, mu], rv_icdf)
+        rv_icdf_fn = pm.compile([value, mu], rv_icdf)
         print(rv_icdf_fn(value=0.9, mu=0.0))  # 1.28155157
 
 
@@ -380,41 +432,34 @@ def icdf(rv: TensorVariable, value: TensorLike, warn_rvs=None, **kwargs) -> Tens
         print(exp_rv_icdf.eval({value: 0.9, mu: 0.0}))  # 3.60222448
 
         # Compile a function for repeated evaluations
-        exp_rv_icdf_fn = pm.compile_pymc([value, mu], exp_rv_icdf)
+        exp_rv_icdf_fn = pm.compile([value, mu], exp_rv_icdf)
         print(exp_rv_icdf_fn(value=0.9, mu=0.0))  # 3.60222448
 
     """
-    warn_rvs, kwargs = _deprecate_warn_missing_rvs(warn_rvs, kwargs)
-    value = pt.as_tensor_variable(value, dtype="floatX")
+    if not isinstance(value, Variable):
+        value = pt.as_tensor_variable(value, dtype="floatX")
     try:
-        return _icdf_helper(rv, value, **kwargs)
+        return _icdf_helper(rv, value)
     except NotImplementedError:
         # Try to rewrite rv
-        fgraph, rv_values, _ = construct_ir_fgraph({rv: value})
-        [ir_rv] = fgraph.outputs
-        expr = _icdf_helper(ir_rv, value, **kwargs)
-        cleanup_ir([expr])
+        fgraph = construct_ir_fgraph({rv: value})
+        [ir_valued_rv] = fgraph.outputs
+        [ir_rv, ir_value] = ir_valued_rv.owner.inputs
+        expr = _icdf_helper(ir_rv, ir_value)
+        [expr] = cleanup_ir([expr])
         if warn_rvs:
-            _warn_rvs_in_inferred_graph(expr)
+            _warn_rvs_in_inferred_graph([expr])
         return expr
 
 
-RVS_IN_JOINT_LOGP_GRAPH_MSG = (
-    "Random variables detected in the logp graph: %s.\n"
-    "This can happen when DensityDist logp or Interval transform functions reference nonlocal variables,\n"
-    "or when not all rvs have a corresponding value variable."
-)
-
-
 def conditional_logp(
-    rv_values: dict[TensorVariable, TensorVariable],
-    warn_rvs=None,
+    rv_values: dict[Variable, Variable],
+    warn_rvs=True,
     ir_rewriter: GraphRewriter | None = None,
     extra_rewrites: GraphRewriter | NodeRewriter | None = None,
     **kwargs,
-) -> dict[TensorVariable, TensorVariable]:
-    r"""Create a map between variables and conditional log-probabilities
-    such that the sum is their joint log-probability.
+) -> dict[Variable, Variable]:
+    r"""Create a map between variables and conditional logps such that the sum is their joint logp.
 
     The `rv_values` dictionary specifies a joint probability graph defined by
     pairs of random variables and respective measure-space input parameters
@@ -474,129 +519,115 @@ def conditional_logp(
         from the respective `RandomVariable`.
 
     """
-    warn_rvs, kwargs = _deprecate_warn_missing_rvs(warn_rvs, kwargs)
-
-    fgraph, rv_values, _ = construct_ir_fgraph(rv_values, ir_rewriter=ir_rewriter)
+    fgraph = construct_ir_fgraph(rv_values, ir_rewriter=ir_rewriter)
 
     if extra_rewrites is not None:
         extra_rewrites.rewrite(fgraph)
 
-    rv_remapper = fgraph.preserve_rv_mappings
-
-    # This is the updated random-to-value-vars map with the lifted/rewritten
-    # variables.  The rewrites are supposed to produce new
-    # `MeasurableVariable`s that are amenable to `_logprob`.
-    updated_rv_values = rv_remapper.rv_values
-
-    # Some rewrites also transform the original value variables. This is the
-    # updated map from the new value variables to the original ones, which
-    # we want to use as the keys in the final dictionary output
-    original_values = rv_remapper.original_values
-
-    # When a `_logprob` has been produced for a `MeasurableVariable` node, all
-    # other references to it need to be replaced with its value-variable all
-    # throughout the `_logprob`-produced graphs.  The following `dict`
-    # cumulatively maintains remappings for all the variables/nodes that needed
-    # to be recreated after replacing `MeasurableVariable`s with their
-    # value-variables.  Since these replacements work in topological order, all
-    # the necessary value-variable replacements should be present for each
-    # node.
-    replacements = updated_rv_values.copy()
+    # Walk the graph from its inputs to its outputs and construct the
+    # log-probability
+    replacements = {}
 
     # To avoid cloning the value variables (or ancestors of value variables),
     # we map them to themselves in the `replacements` `dict`
     # (i.e. entries already existing in `replacements` aren't cloned)
     replacements.update(
-        {
-            v: v
-            for v in ancestors(rv_values.values())
-            if (not isinstance(v, Constant) and v not in replacements)
-        }
+        {v: v for v in ancestors(rv_values.values()) if not isinstance(v, Constant)}
     )
 
     # Walk the graph from its inputs to its outputs and construct the
     # log-probability
-    q = deque(fgraph.toposort())
-    logprob_vars = {}
+    values_to_logprobs = {}
+    original_values = tuple(rv_values.values())
 
-    while q:
-        node = q.popleft()
-
-        if not isinstance(node.op, MeasurableVariable):
+    # TODO: This seems too convoluted, can we just replace all RVs by their values,
+    #  except for the fgraph outputs (for which we want to call _logprob on)?
+    for node in fgraph.toposort():
+        if not isinstance(node.op, MeasurableOp):
             continue
 
-        q_values = [replacements[q_rv] for q_rv in node.outputs if q_rv in updated_rv_values]
+        valued_nodes = get_related_valued_nodes(fgraph, node)
 
-        if not q_values:
+        if not valued_nodes:
             continue
+
+        node_rvs = [valued_var.inputs[0] for valued_var in valued_nodes]
+        node_values = [valued_var.inputs[1] for valued_var in valued_nodes]
+        node_output_idxs = [
+            fgraph.outputs.index(valued_var.outputs[0]) for valued_var in valued_nodes
+        ]
 
         # Replace `RandomVariable`s in the inputs with value variables.
+        # Also, store the results in the `replacements` map for the nodes that follow.
+        for node_rv, node_value in zip(node_rvs, node_values):
+            replacements[node_rv] = node_value
+
         remapped_vars = replace_vars_in_graphs(
-            graphs=q_values + list(node.inputs),
+            graphs=node_values + list(node.inputs),
             replacements=replacements,
         )
-        q_values = remapped_vars[: len(q_values)]
-        q_rv_inputs = remapped_vars[len(q_values) :]
+        node_values = remapped_vars[: len(node_values)]
+        node_inputs = remapped_vars[len(node_values) :]
 
-        q_logprob_vars = _logprob(
+        node_logprobs = _logprob(
             node.op,
-            q_values,
-            *q_rv_inputs,
+            node_values,
+            *node_inputs,
             **kwargs,
         )
 
-        if not isinstance(q_logprob_vars, list | tuple):
-            q_logprob_vars = [q_logprob_vars]
+        if not isinstance(node_logprobs, list | tuple):
+            node_logprobs = [node_logprobs]
 
-        for q_value_var, q_logprob_var in zip(q_values, q_logprob_vars):
-            q_value_var = original_values[q_value_var]
+        for node_output_idx, node_value, node_logprob in zip(
+            node_output_idxs, node_values, node_logprobs
+        ):
+            original_value = original_values[node_output_idx]
 
-            if q_value_var.name:
-                q_logprob_var.name = f"{q_value_var.name}_logprob"
+            if original_value.name:
+                node_logprob.name = f"{original_value.name}_logprob"
 
-            if q_value_var in logprob_vars:
+            if original_value in values_to_logprobs:
                 raise ValueError(
-                    f"More than one logprob term was assigned to the value var {q_value_var}"
+                    f"More than one logprob term was assigned to the value var {original_value}"
                 )
 
-            logprob_vars[q_value_var] = q_logprob_var
+            values_to_logprobs[original_value] = node_logprob
 
-        # Recompute test values for the changes introduced by the replacements above.
-        if config.compute_test_value != "off":
-            for node in io_toposort(graph_inputs(q_logprob_vars), q_logprob_vars):
-                compute_test_value(node)
-
-    missing_value_terms = set(original_values.values()) - set(logprob_vars.keys())
+    missing_value_terms = set(original_values) - set(values_to_logprobs)
     if missing_value_terms:
         raise RuntimeError(
             f"The logprob terms of the following value variables could not be derived: {missing_value_terms}"
         )
 
-    logprob_expressions = list(logprob_vars.values())
-    cleanup_ir(logprob_expressions)
+    # Ensure same order as input
+    logprobs = cleanup_ir(tuple(values_to_logprobs[v] for v in original_values))
 
     if warn_rvs:
-        rvs_in_logp_expressions = _find_unallowed_rvs_in_graph(logprob_expressions)
+        rvs_in_logp_expressions = _find_unallowed_rvs_in_graph(logprobs)
         if rvs_in_logp_expressions:
-            warnings.warn(RVS_IN_JOINT_LOGP_GRAPH_MSG % rvs_in_logp_expressions, UserWarning)
+            warnings.warn(
+                f"Random variables detected in the logp graph: {rvs_in_logp_expressions}.\n"
+                "This can happen when not all random variables have a corresponding value variable.",
+                UserWarning,
+            )
 
-    return logprob_vars
+    return dict(zip(original_values, logprobs))
 
 
 def transformed_conditional_logp(
-    rvs: Sequence[TensorVariable],
+    rvs: Sequence[Variable],
     *,
-    rvs_to_values: dict[TensorVariable, TensorVariable],
-    rvs_to_transforms: dict[TensorVariable, Transform],
+    rvs_to_values: dict[Variable, Variable],
+    rvs_to_transforms: dict[Variable, Transform],
     jacobian: bool = True,
     **kwargs,
-) -> list[TensorVariable]:
+) -> list[Variable]:
     """Thin wrapper around conditional_logprob, which creates a value transform rewrite.
 
     This helper will only return the subset of logprob terms corresponding to `rvs`.
     All rvs_to_values and rvs_to_transforms mappings are required.
     """
-
     transform_rewrite = None
     values_to_transforms = {
         rvs_to_values[rv]: transform
@@ -605,7 +636,7 @@ def transformed_conditional_logp(
     }
     if values_to_transforms:
         # There seems to be an incorrect type hint in TransformValuesRewrite
-        transform_rewrite = TransformValuesRewrite(values_to_transforms)  # type: ignore
+        transform_rewrite = TransformValuesRewrite(values_to_transforms)  # type: ignore[arg-type]
 
     kwargs.setdefault("warn_rvs", False)
     temp_logp_terms = conditional_logp(
@@ -627,24 +658,10 @@ def transformed_conditional_logp(
 
     rvs_in_logp_expressions = _find_unallowed_rvs_in_graph(logp_terms_list)
     if rvs_in_logp_expressions:
-        raise ValueError(RVS_IN_JOINT_LOGP_GRAPH_MSG % rvs_in_logp_expressions)
+        raise ValueError(
+            f"Random variables detected in the logp graph: {rvs_in_logp_expressions}.\n"
+            "This can happen when mixing variables from different models, "
+            "or when CustomDist logp or Interval transform functions reference nonlocal variables."
+        )
 
     return logp_terms_list
-
-
-def factorized_joint_logprob(*args, **kwargs):
-    warnings.warn(
-        "`factorized_joint_logprob` was renamed to `conditional_logp`. "
-        "The function will be removed in a future release",
-        FutureWarning,
-    )
-    return conditional_logp(*args, **kwargs)
-
-
-def joint_logp(*args, **kwargs):
-    warnings.warn(
-        "`joint_logp` was renamed to `transformed_conditional_logp`. "
-        "The function will be removed in a future release",
-        FutureWarning,
-    )
-    return transformed_conditional_logp(*args, **kwargs)

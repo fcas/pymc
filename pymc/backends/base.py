@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-"""Base backend for traces
+"""Base backend for traces.
 
 See the docstring for pymc.backends for more information
 """
@@ -30,6 +30,7 @@ from typing import (
 )
 
 import numpy as np
+import pytensor
 
 from pymc.backends.report import SamplerReport
 from pymc.model import modelcontext
@@ -55,6 +56,7 @@ class IBaseTrace(ABC, Sized):
     """Sampler stats for each sampler."""
 
     def __len__(self):
+        """Length of the chain."""
         raise NotImplementedError()
 
     def get_values(self, varname: str, burn=0, thin=1) -> np.ndarray:
@@ -100,13 +102,26 @@ class IBaseTrace(ABC, Sized):
         """Slice trace object."""
         raise NotImplementedError()
 
-    def point(self, idx: int) -> dict[str, np.ndarray]:
-        """Return dictionary of point values at `idx` for current chain
-        with variables names as keys.
+    def point(self, idx: int) -> Mapping[str, np.ndarray | np.number]:
+        """Return point values at `idx` for current chain.
+
+        Returns
+        -------
+        values : Mapping[str, np.ndarray | np.number]
+            Dictionary of values with variable names as keys. Values for
+            scalar (0-d) variables may be returned as numpy scalars rather
+            than 0-d ndarrays; callers that need a strict ndarray must
+            wrap with ``np.asarray``.
         """
         raise NotImplementedError()
 
-    def record(self, draw: Mapping[str, np.ndarray], stats: Sequence[Mapping[str, Any]]):
+    def record(
+        self,
+        draw: Mapping[str, np.ndarray],
+        stats: Sequence[Mapping[str, Any]],
+        *,
+        in_warmup: bool,
+    ):
         """Record results of a sampling iteration.
 
         Parameters
@@ -115,6 +130,9 @@ class IBaseTrace(ABC, Sized):
             Values mapped to variable names
         stats: list of dicts
             The diagnostic values for each sampler
+        in_warmup: bool
+            Whether this draw belongs to the warmup phase. This is a driver-owned
+            concept and is intended for storage/backends to persist warmup information.
         """
         raise NotImplementedError()
 
@@ -127,7 +145,7 @@ class IBaseTrace(ABC, Sized):
 
 
 class BaseTrace(IBaseTrace):
-    """Base trace object
+    """Base trace object.
 
     Parameters
     ----------
@@ -142,32 +160,53 @@ class BaseTrace(IBaseTrace):
         use different test point that might be with changed variables shapes
     """
 
-    def __init__(self, name, model=None, vars=None, test_point=None):
-        self.name = name
-
+    def __init__(
+        self,
+        name=None,
+        model=None,
+        vars=None,
+        test_point=None,
+        *,
+        fn=None,
+        var_shapes=None,
+        var_dtypes=None,
+    ):
         model = modelcontext(model)
-        self.model = model
+
         if vars is None:
             vars = model.unobserved_value_vars
 
         unnamed_vars = {var for var in vars if var.name is None}
         if unnamed_vars:
             raise Exception(f"Can't trace unnamed variables: {unnamed_vars}")
-        self.vars = vars
-        self.varnames = [var.name for var in vars]
-        self.fn = model.compile_fn(vars, inputs=model.value_vars, on_unused_input="ignore")
+
+        if fn is None:
+            # borrow=True avoids deepcopy when inputs=output which is the case for untransformed value variables
+            # Routed through the model so the compilation is reused on frozen models.
+            fn = model.compile_fn(
+                outs=[pytensor.Out(v, borrow=True) for v in vars],
+                inputs=[pytensor.In(v, borrow=True) for v in model.value_vars],
+                point_fn=False,
+                on_unused_input="ignore",
+                trust_input=True,
+            )
 
         # Get variable shapes. Most backends will need this
         # information.
-        if test_point is None:
-            test_point = model.initial_point()
-        else:
-            test_point_ = model.initial_point().copy()
-            test_point_.update(test_point)
-            test_point = test_point_
-        var_values = list(zip(self.varnames, self.fn(test_point)))
-        self.var_shapes = {var: value.shape for var, value in var_values}
-        self.var_dtypes = {var: value.dtype for var, value in var_values}
+        if var_shapes is None or var_dtypes is None:
+            if test_point is None:
+                test_point = model.initial_point()
+            var_values = tuple(zip(vars, fn(**test_point)))
+            var_shapes = {var.name: value.shape for var, value in var_values}
+            var_dtypes = {var.name: value.dtype for var, value in var_values}
+
+        self.name = name
+        self.model = model
+        self.fn = fn
+        self.vars = vars
+        self.varnames = [var.name for var in vars]
+        self.var_shapes = var_shapes
+        self.var_dtypes = var_dtypes
         self.chain = None
         self._is_base_setup = False
         self.sampler_vars = None
@@ -186,7 +225,7 @@ class BaseTrace(IBaseTrace):
         for stats in sampler_vars:
             for key, dtype in stats.items():
                 if dtypes.setdefault(key, dtype) != dtype:
-                    raise ValueError("Sampler statistic %s appears with " "different types." % key)
+                    raise ValueError(f"Sampler statistic {key} appears with different types.")
 
         self.sampler_vars = sampler_vars
 
@@ -208,6 +247,7 @@ class BaseTrace(IBaseTrace):
     # Selection methods
 
     def __getitem__(self, idx):
+        """Get the sample at index `idx`."""
         if isinstance(idx, slice):
             return self._slice(idx)
 
@@ -247,7 +287,7 @@ class BaseTrace(IBaseTrace):
 
         sampler_idxs = [i for i, s in enumerate(self.sampler_vars) if stat_name in s]
         if not sampler_idxs:
-            raise KeyError("Unknown sampler stat %s" % stat_name)
+            raise KeyError(f"Unknown sampler stat {stat_name}")
 
         vals = np.stack(
             [self._get_sampler_stats(stat_name, i, burn, thin) for i in sampler_idxs], axis=-1
@@ -339,6 +379,7 @@ class MultiTrace:
         self._report = SamplerReport()
 
     def __repr__(self):
+        """Return a string representation of MultiTrace."""
         template = "<{}: {} chains, {} iterations, {} variables>"
         return template.format(self.__class__.__name__, self.nchains, len(self), len(self.varnames))
 
@@ -348,16 +389,18 @@ class MultiTrace:
 
     @property
     def chains(self) -> list[int]:
-        return list(sorted(self._straces.keys()))
+        return sorted(self._straces.keys())
 
     @property
     def report(self) -> SamplerReport:
         return self._report
 
     def __iter__(self):
+        """Return an iterator of the MultiTrace."""
         raise NotImplementedError
 
     def __getitem__(self, idx):
+        """Get the sample at index `idx`."""
         if isinstance(idx, slice):
             return self._slice(idx)
 
@@ -388,11 +431,12 @@ class MultiTrace:
             return self.get_values(var, burn=burn, thin=thin)
         if var in self.stat_names:
             return self.get_sampler_stats(var, burn=burn, thin=thin)
-        raise KeyError("Unknown variable %s" % var)
+        raise KeyError(f"Unknown variable {var}")
 
     _attrs = {"_straces", "varnames", "chains", "stat_names", "_report"}
 
     def __getattr__(self, name):
+        """Get the value of the attribute of name `name`."""
         # Avoid infinite recursion when called before __init__
         # variables are set up (e.g., when pickling).
         if name in self._attrs:
@@ -412,6 +456,7 @@ class MultiTrace:
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def __len__(self):
+        """Length of the chains."""
         chain = self.chains[-1]
         return len(self._straces[chain])
 
@@ -512,7 +557,7 @@ class MultiTrace:
             List or ndarray depending on parameters.
         """
         if stat_name not in self.stat_names:
-            raise KeyError("Unknown sampler statistic %s" % stat_name)
+            raise KeyError(f"Unknown sampler statistic {stat_name}")
 
         if chains is None:
             chains = self.chains
@@ -532,7 +577,7 @@ class MultiTrace:
         trace._report = self._report._slice(*idxs)
         return trace
 
-    def point(self, idx: int, chain: int | None = None) -> dict[str, np.ndarray]:
+    def point(self, idx: int, chain: int | None = None) -> Mapping[str, np.ndarray | np.number]:
         """Return a dictionary of point values at `idx`.
 
         Parameters
@@ -546,7 +591,7 @@ class MultiTrace:
         return self._straces[chain].point(idx)
 
     def points(self, chains=None):
-        """Return an iterator over all or some of the sample points
+        """Return an iterator over all or some of the sample points.
 
         Parameters
         ----------
@@ -561,8 +606,7 @@ class MultiTrace:
 
 
 def _squeeze_cat(results, combine: bool, squeeze: bool):
-    """Squeeze and concatenate the results depending on values of
-    `combine` and `squeeze`."""
+    """Squeeze and/or concatenate the results."""
     if combine:
         results = np.concatenate(results)
         if not squeeze:

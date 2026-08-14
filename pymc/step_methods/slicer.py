@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,19 +16,34 @@
 
 
 import numpy as np
-import numpy.random as nr
+
+from rich.progress import TextColumn
+from rich.table import Column
 
 from pymc.blocking import RaveledVars, StatsType
+from pymc.initial_point import PointType
 from pymc.model import modelcontext
-from pymc.pytensorf import compile_pymc, join_nonshared_inputs, make_shared_replacements
+from pymc.pytensorf import compile, join_nonshared_inputs, make_shared_replacements
 from pymc.step_methods.arraystep import ArrayStepShared
-from pymc.step_methods.compound import Competence
+from pymc.step_methods.compound import Competence, StepMethodState
+from pymc.step_methods.state import dataclass_state
 from pymc.util import get_value_vars_from_user_vars
 from pymc.vartypes import continuous_types
 
 __all__ = ["Slice"]
 
 LOOP_ERR_MSG = "max slicer iters %d exceeded"
+
+
+dataclass_state
+
+
+@dataclass_state
+class SliceState(StepMethodState):
+    w: np.ndarray
+    tune: bool
+    n_tunes: float
+    iter_limit: float
 
 
 class Slice(ArrayStepShared):
@@ -47,18 +62,35 @@ class Slice(ArrayStepShared):
         Optional model for sampling step. It will be taken from the context if not provided.
     iter_limit : int, default np.inf
         Maximum number of iterations for the slice sampler.
+    rng: RandomGenerator
+        An object that can produce be used to produce the step method's
+        :py:class:`~numpy.random.Generator` object. Refer to
+        :py:func:`pymc.util.get_random_generator` for more information.
 
     """
 
     name = "slice"
     default_blocked = False
     stats_dtypes_shapes = {
-        "tune": (bool, []),
         "nstep_out": (int, []),
         "nstep_in": (int, []),
     }
 
-    def __init__(self, vars=None, w=1.0, tune=True, model=None, iter_limit=np.inf, **kwargs):
+    _state_class = SliceState
+
+    def __init__(
+        self,
+        vars=None,
+        *,
+        w=1.0,
+        tune=True,
+        model=None,
+        iter_limit=np.inf,
+        rng=None,
+        initial_point: PointType | None = None,
+        compile_kwargs: dict | None = None,
+        blocked: bool = False,  # Could be true since tuning is independent across dims?
+    ):
         model = modelcontext(model)
         self.w = np.asarray(w).copy()
         self.tune = tune
@@ -70,15 +102,19 @@ class Slice(ArrayStepShared):
         else:
             vars = get_value_vars_from_user_vars(vars, model)
 
-        point = model.initial_point()
-        shared = make_shared_replacements(point, vars, model)
+        if initial_point is None:
+            initial_point = model.initial_point()
+
+        shared = make_shared_replacements(initial_point, vars, model)
         [logp], raveled_inp = join_nonshared_inputs(
-            point=point, outputs=[model.logp()], inputs=vars, shared_inputs=shared
+            point=initial_point, outputs=[model.logp()], inputs=vars, shared_inputs=shared
         )
-        self.logp = compile_pymc([raveled_inp], logp)
+        if compile_kwargs is None:
+            compile_kwargs = {}
+        self.logp = compile([raveled_inp], logp, **compile_kwargs)
         self.logp.trust_input = True
 
-        super().__init__(vars, shared)
+        super().__init__(vars, shared, blocked=blocked, rng=rng)
 
     def astep(self, apoint: RaveledVars) -> tuple[RaveledVars, StatsType]:
         # The arguments are determined by the list passed via `super().__init__(..., fs, ...)`
@@ -96,10 +132,10 @@ class Slice(ArrayStepShared):
         logp = self.logp
         for i, wi in enumerate(self.w):
             # uniformly sample from 0 to p(q), but in log space
-            y = logp(q) - nr.standard_exponential()
+            y = logp(q) - self.rng.standard_exponential()
 
             # Create initial interval
-            ql[i] = q[i] - nr.uniform() * wi  # q[i] + r * w
+            ql[i] = q[i] - self.rng.uniform() * wi  # q[i] + r * w
             qr[i] = ql[i] + wi  # Equivalent to q[i] + (1-r) * w
 
             # Stepping out procedure
@@ -120,14 +156,14 @@ class Slice(ArrayStepShared):
             nstep_out += cnt
 
             cnt = 0
-            q[i] = nr.uniform(ql[i], qr[i])
+            q[i] = self.rng.uniform(ql[i], qr[i])
             while y > logp(q):  # Changed leq to lt, to accommodate for locally flat posteriors
                 # Sample uniformly from slice
                 if q[i] > q0_val[i]:
                     qr[i] = q[i]
                 elif q[i] < q0_val[i]:
                     ql[i] = q[i]
-                q[i] = nr.uniform(ql[i], qr[i])
+                q[i] = self.rng.uniform(ql[i], qr[i])
                 cnt += 1
                 if cnt > self.iter_limit:
                     raise RuntimeError(LOOP_ERR_MSG % self.iter_limit)
@@ -147,7 +183,6 @@ class Slice(ArrayStepShared):
             self.n_tunes += 1
 
         stats = {
-            "tune": self.tune,
             "nstep_out": nstep_out,
             "nstep_in": nstep_in,
         }
@@ -161,3 +196,21 @@ class Slice(ArrayStepShared):
                 return Competence.PREFERRED
             return Competence.COMPATIBLE
         return Competence.INCOMPATIBLE
+
+    @staticmethod
+    def _progressbar_config(n_chains=1):
+        columns = [
+            TextColumn("{task.fields[nstep_out]}", table_column=Column("Steps out", ratio=1)),
+            TextColumn("{task.fields[nstep_in]}", table_column=Column("Steps in", ratio=1)),
+        ]
+
+        stats = {"nstep_out": [0] * n_chains, "nstep_in": [0] * n_chains}
+
+        return columns, stats
+
+    @staticmethod
+    def _make_progressbar_update_functions():
+        def update_stats(step_stats):
+            return {key: step_stats[key] for key in {"nstep_out", "nstep_in"}}
+
+        return (update_stats,)

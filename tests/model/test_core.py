@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,10 +11,10 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+import copy
 import pickle
 import threading
 import traceback
-import unittest
 import warnings
 
 from unittest.mock import patch
@@ -31,8 +31,13 @@ import pytest
 import scipy
 import scipy.sparse as sps
 import scipy.stats as st
+import xarray as xr
 
-from pytensor.graph import graph_inputs
+from pytensor.compile.mode import get_default_mode
+from pytensor.compile.sharedvalue import SharedVariable
+from pytensor.graph import Constant, graph_inputs
+from pytensor.graph.traversal import get_var_by_name
+from pytensor.link.numba import NumbaLinker
 from pytensor.raise_op import Assert
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.variable import TensorConstant
@@ -55,7 +60,9 @@ from pymc.exceptions import ImputationWarning, ShapeError, ShapeWarning
 from pymc.logprob.basic import transformed_conditional_logp
 from pymc.logprob.transforms import IntervalTransform
 from pymc.model import Point, ValueGradFunction, modelcontext
-from pymc.util import _FutureWarningValidatingScratchpad
+from pymc.model.core import BaseModel, FrozenModel
+from pymc.model.transform.optimization import freeze_model
+from pymc.pytensorf import compile, floatX, inputvars
 from pymc.variational.minibatch_rv import MinibatchRandomVariable
 from tests.models import simple_model
 
@@ -130,6 +137,34 @@ class TestBaseModel:
         assert m["d"] is model["one_more::d"]
         assert m["one_more::d"] is model["one_more::d"]
 
+    def test_docstring_example(self):
+        with pm.Model(name="root") as root:
+            x = pm.Normal("x")  # Variable wil be named "root::x"
+
+            with pm.Model(name="first") as first:
+                # Variable will belong to root and first
+                y = pm.Normal("y", mu=x)  # Variable wil be named "root::first::y"
+
+            # Can pass parent model explicitly
+            with pm.Model(name="second", model=root) as second:
+                # Variable will belong to root and second
+                z = pm.Normal("z", mu=y)  # Variable wil be named "root::second::z"
+
+            # Set None for standalone model
+            with pm.Model(name="third", model=None) as third:
+                # Variable will belong to third only
+                w = pm.Normal("w")  # Variable wil be named "third::w"
+
+        assert x.name == "root::x"
+        assert y.name == "root::first::y"
+        assert z.name == "root::second::z"
+        assert w.name == "third::w"
+
+        assert set(root.basic_RVs) == {x, y, z}
+        assert set(first.basic_RVs) == {y}
+        assert set(second.basic_RVs) == {z}
+        assert set(third.basic_RVs) == {w}
+
 
 class TestNested:
     def test_nest_context_works(self):
@@ -153,7 +188,7 @@ class TestNested:
         assert "v2" in usage1.named_vars
         assert "v3" in usage1.named_vars
         assert "v3_sq" in usage1.named_vars
-        assert len(usage1.potentials), 1
+        assert len(usage1.potentials), "1"
 
     def test_docstring_example2(self):
         with pm.Model() as model:
@@ -162,7 +197,7 @@ class TestNested:
         assert "prefix::v2" in model.named_vars
         assert "prefix::v3" in model.named_vars
         assert "prefix::v3_sq" in model.named_vars
-        assert len(model.potentials), 1
+        assert len(model.potentials), "1"
 
     def test_duplicates_detection(self):
         with pm.Model():
@@ -199,8 +234,8 @@ class TestNested:
         with pm.Model("scope") as model:
             b = pm.Normal("var")
             trace = pm.sample(100, tune=0)
-        az.to_netcdf(trace, tmp_path / "trace.nc")
-        trace1 = az.from_netcdf(tmp_path / "trace.nc")
+        trace.to_netcdf(tmp_path / "trace.nc")
+        trace1 = az.from_netcdf(str(tmp_path / "trace.nc"))
         assert "scope::var" in trace1.posterior
 
     def test_bad_name(self):
@@ -211,6 +246,11 @@ class TestNested:
             with pm.Model("scope::") as model:
                 b = pm.Normal("v")
 
+    def test_variable_name_with_slash(self):
+        with pm.Model():
+            with pytest.raises(ValueError, match="cannot contain '/'"):
+                pm.Normal("a/b")
+
 
 class TestObserved:
     def test_observed_rv_fail(self):
@@ -220,22 +260,14 @@ class TestObserved:
                 Normal("n", observed=x)
 
     def test_observed_type(self):
-        X_ = pm.floatX(np.random.randn(100, 5))
-        X = pm.floatX(pytensor.shared(X_))
+        X_ = floatX(np.random.randn(100, 5))
+        X = floatX(pytensor.shared(X_))
         with pm.Model():
             x1 = pm.Normal("x1", observed=X_)
             x2 = pm.Normal("x2", observed=X)
 
         assert x1.type.dtype == X.type.dtype
         assert x2.type.dtype == X.type.dtype
-
-    @pytensor.config.change_flags(compute_test_value="raise")
-    def test_observed_compute_test_value(self):
-        data = np.zeros(100)
-        with pm.Model():
-            obs = pm.Normal("obs", mu=pt.zeros_like(data), sigma=1, observed=data)
-        assert obs.tag.test_value.shape == data.shape
-        assert obs.tag.test_value.dtype == data.dtype
 
 
 def test_duplicate_vars():
@@ -266,33 +298,35 @@ def test_duplicate_vars():
 
 def test_empty_observed():
     pd = pytest.importorskip("pandas")
-    data = pd.DataFrame(np.ones((2, 3)) / 3)
-    data.values[:] = np.nan
+    data = pd.DataFrame(np.full((2, 3), np.nan))
     with pm.Model():
         a = pm.Normal("a", observed=data)
         assert not hasattr(a.tag, "observations")
 
 
-class TestValueGradFunction(unittest.TestCase):
+class TestValueGradFunction:
     def test_no_extra(self):
         a = pt.vector("a")
-        a.tag.test_value = np.zeros(3, dtype=a.dtype)
-        f_grad = ValueGradFunction([a.sum()], [a], {}, mode="FAST_COMPILE")
+        a_ = np.zeros(3, dtype=a.dtype)
+        f_grad = ValueGradFunction(
+            [a.sum()], [a], {}, ravel_inputs=True, initial_point={"a": a_}, mode="FAST_COMPILE"
+        )
         assert f_grad._extra_vars == []
 
     def test_invalid_type(self):
         a = pt.ivector("a")
-        a.tag.test_value = np.zeros(3, dtype=a.dtype)
+        a_ = np.zeros(3, dtype=a.dtype)
         a.dshape = (3,)
         a.dsize = 3
-        with pytest.raises(TypeError) as err:
-            ValueGradFunction([a.sum()], [a], {}, mode="FAST_COMPILE")
-        err.match("Invalid dtype")
+        with pytest.raises(TypeError, match="Invalid dtype"):
+            ValueGradFunction(
+                [a.sum()], [a], {}, ravel_inputs=True, initial_point={"a": a_}, mode="FAST_COMPILE"
+            )
 
-    def setUp(self):
+    def setup_method(self, test_method):
         extra1 = pt.iscalar("extra1")
         extra1_ = np.array(0, dtype=extra1.dtype)
-        extra1.dshape = tuple()
+        extra1.dshape = ()
         extra1.dsize = 1
 
         val1 = pt.vector("val1")
@@ -311,41 +345,68 @@ class TestValueGradFunction(unittest.TestCase):
 
         self.cost = extra1 * val1.sum() + val2.sum()
 
-        self.f_grad = ValueGradFunction(
-            [self.cost], [val1, val2], {extra1: extra1_}, mode="FAST_COMPILE"
-        )
+        self.initial_point = {
+            "extra1": extra1_,
+            "val1": val1_,
+            "val2": val2_,
+        }
 
-    def test_extra_not_set(self):
+        with pytest.warns(
+            UserWarning, match="ValueGradFunction will become a function of raveled inputs"
+        ):
+            self.f_grad = ValueGradFunction(
+                [self.cost],
+                [val1, val2],
+                {extra1: extra1_},
+                mode="FAST_COMPILE",
+            )
+
+        self.f_grad_raveled_inputs = ValueGradFunction(
+            [self.cost],
+            [val1, val2],
+            {extra1: extra1_},
+            initial_point=self.initial_point,
+            mode="FAST_COMPILE",
+            ravel_inputs=True,
+        )
+        self.f_grad_raveled_inputs.trust_input = True
+
+    @pytest.mark.parametrize("raveled_fn", (False, True))
+    def test_extra_not_set(self, raveled_fn):
+        f_grad = self.f_grad_raveled_inputs if raveled_fn else self.f_grad
         with pytest.raises(ValueError) as err:
-            self.f_grad.get_extra_values()
+            f_grad.get_extra_values()
         err.match("Extra values are not set")
 
         with pytest.raises(ValueError) as err:
             size = self.val1_.size + self.val2_.size
-            self.f_grad(np.zeros(size, dtype=self.f_grad.dtype))
+            f_grad(np.zeros(size, dtype=self.f_grad.dtype))
         err.match("Extra values are not set")
 
-    def test_grad(self):
-        self.f_grad.set_extra_values({"extra1": 5})
+    @pytest.mark.parametrize("raveled_fn", (False, True))
+    def test_grad(self, raveled_fn):
+        f_grad = self.f_grad_raveled_inputs if raveled_fn else self.f_grad
+        f_grad.set_extra_values({"extra1": 5})
+
         size = self.val1_.size + self.val2_.size
         array = RaveledVars(
             np.ones(size, dtype=self.f_grad.dtype),
             (
-                ("val1", self.val1_.shape, self.val1_.dtype),
-                ("val2", self.val2_.shape, self.val2_.dtype),
+                ("val1", self.val1_.shape, self.val1_.size, self.val1_.dtype),
+                ("val2", self.val2_.shape, self.val2_.size, self.val2_.dtype),
             ),
         )
-        val, grad = self.f_grad(array)
+
+        val, grad = f_grad(array)
         assert val == 21
         npt.assert_allclose(grad, [5, 5, 5, 1, 1, 1, 1, 1, 1])
 
-    @pytest.mark.xfail(reason="Test not refactored for v4")
     def test_edge_case(self):
         # Edge case discovered in #2948
         ndim = 3
         with pm.Model() as m:
             pm.LogNormal(
-                "sigma", mu=np.zeros(ndim), tau=np.ones(ndim), shape=ndim
+                "sigma", mu=np.zeros(ndim), tau=np.ones(ndim), initval=np.ones(ndim), shape=ndim
             )  # variance for the correlation matrix
             pm.HalfCauchy("nu", beta=10)
             step = pm.NUTS()
@@ -353,7 +414,7 @@ class TestValueGradFunction(unittest.TestCase):
         func = step._logp_dlogp_func
         initial_point = m.initial_point()
         func.set_extra_values(initial_point)
-        q = func.dict_to_array(initial_point)
+        q = DictToArrayBijection.map(initial_point)
         logp, dlogp = func(q)
         assert logp.size == 1
         assert dlogp.size == 4
@@ -369,7 +430,7 @@ class TestValueGradFunction(unittest.TestCase):
             with pytest.warns(ImputationWarning):
                 x2 = pm.Bernoulli("x2", x1, observed=X)
 
-        gf = m.logp_dlogp_function()
+        gf = m.logp_dlogp_function(ravel_inputs=True)
         gf._extra_are_set = True
 
         assert m["x2_unobserved"].type == gf._extra_vars_shared["x2_unobserved"].type
@@ -385,19 +446,21 @@ class TestValueGradFunction(unittest.TestCase):
         # Assert that all the elements of res are equal
         assert res[1:] == res[:-1]
 
+
+class TestPytensorRelatedLogpBugs:
     def test_pytensor_switch_broadcast_edge_cases_1(self):
         # Tests against two subtle issues related to a previous bug in Theano
         # where `tt.switch` would not always broadcast tensors with single
         # values https://github.com/pymc-devs/pytensor/issues/270
 
         # Known issue 1: https://github.com/pymc-devs/pymc/issues/4389
-        data = pm.floatX(np.zeros(10))
+        data = floatX(np.zeros(10))
         with pm.Model() as m:
             p = pm.Beta("p", 1, 1)
             obs = pm.Bernoulli("obs", p=p, observed=data)
 
         npt.assert_allclose(
-            m.compile_logp(obs)({"p_logodds__": pm.floatX(np.array(0.0))}),
+            m.compile_logp(obs)({"p_logodds__": floatX(np.array(0.0))}),
             np.log(0.5) * 10,
         )
 
@@ -431,25 +494,28 @@ def test_multiple_observed_rv():
     assert model["x"] not in model.value_vars
 
 
-def test_tempered_logp_dlogp():
+@pytest.mark.parametrize("ravel_inputs", (False, True))
+def test_tempered_logp_dlogp(ravel_inputs):
     with pm.Model() as model:
         pm.Normal("x")
         pm.Normal("y", observed=1)
         pm.Potential("z", pt.constant(-1.0, dtype=pytensor.config.floatX))
 
-    func = model.logp_dlogp_function()
+    func = model.logp_dlogp_function(ravel_inputs=ravel_inputs)
     func.set_extra_values({})
 
-    func_temp = model.logp_dlogp_function(tempered=True)
+    func_temp = model.logp_dlogp_function(tempered=True, ravel_inputs=ravel_inputs)
     func_temp.set_extra_values({})
 
-    func_nograd = model.logp_dlogp_function(compute_grads=False)
+    func_nograd = model.logp_dlogp_function(compute_grads=False, ravel_inputs=ravel_inputs)
     func_nograd.set_extra_values({})
 
-    func_temp_nograd = model.logp_dlogp_function(tempered=True, compute_grads=False)
+    func_temp_nograd = model.logp_dlogp_function(
+        tempered=True, compute_grads=False, ravel_inputs=ravel_inputs
+    )
     func_temp_nograd.set_extra_values({})
 
-    x = np.ones(1, dtype=func.dtype)
+    x = np.ones((1,), dtype=func.dtype)
     npt.assert_allclose(func(x)[0], func_temp(x)[0])
     npt.assert_allclose(func(x)[1], func_temp(x)[1])
 
@@ -503,7 +569,7 @@ class TestPickling:
                 cloudpickle.loads(s)
             except Exception:
                 raise AssertionError(
-                    "Exception while trying roundtrip with pickle protocol %d:\n" % proto
+                    f"Exception while trying roundtrip with pickle protocol {proto}:\n"
                     + "".join(traceback.format_exc())
                 )
 
@@ -515,7 +581,7 @@ def test_model_value_vars():
 
     value_vars = model.value_vars
     assert len(value_vars) == 2
-    assert set(value_vars) == set(pm.inputvars(model.logp()))
+    assert set(value_vars) == set(inputvars(model.logp()))
 
 
 def test_model_var_maps():
@@ -632,8 +698,8 @@ def test_initial_point():
 
     b_initval = np.array(0.3, dtype=pytensor.config.floatX)
 
-    with pytest.warns(FutureWarning), model:
-        b = pm.Uniform("b", testval=b_initval)
+    with model:
+        b = pm.Uniform("b", initval=b_initval)
 
     b_initval_trans = model.rvs_to_transforms[b].forward(b_initval, *b.owner.inputs).eval()
 
@@ -728,6 +794,20 @@ class TestCheckStartVals:
         with pytest.raises(KeyError):
             model.check_start_vals(start)
 
+    @pytest.mark.parametrize("mode", [None, "JAX", "NUMBA"])
+    def test_mode(self, mode):
+        with pm.Model() as model:
+            a = pm.Uniform("a", lower=0.0, upper=1.0)
+            b = pm.Uniform("b", lower=2.0, upper=3.0)
+        start = {
+            "a_interval__": model.rvs_to_transforms[a].forward(0.3, *a.owner.inputs).eval(),
+            "b_interval__": model.rvs_to_transforms[b].forward(2.1, *b.owner.inputs).eval(),
+        }
+        with patch("pymc.model.core.compile") as patched_compile:
+            model.check_start_vals(start, mode=mode)
+        patched_compile.assert_called_once()
+        assert patched_compile.call_args.kwargs["mode"] == mode
+
 
 def test_set_initval():
     # Make sure the dependencies between variables are maintained when
@@ -768,9 +848,9 @@ def test_datalogp_multiple_shapes():
 
 
 def test_nested_model_coords():
-    with pm.Model(name="m1", coords=dict(dim1=range(2))) as m1:
+    with pm.Model(name="m1", coords={"dim1": range(2)}) as m1:
         a = pm.Normal("a", dims="dim1")
-        with pm.Model(name="m2", coords=dict(dim2=range(4))) as m2:
+        with pm.Model(name="m2", coords={"dim2": range(4)}) as m2:
             b = pm.Normal("b", dims="dim1")
             m1.add_coord("dim3", range(4))
             c = pm.HalfNormal("c", dims="dim3")
@@ -779,6 +859,40 @@ def test_nested_model_coords():
     assert m1.coords is m2.coords
     assert m1.dim_lengths is m2.dim_lengths
     assert set(m2.named_vars_to_dims) < set(m1.named_vars_to_dims)
+
+
+def test_multiple_add_coords_with_same_name():
+    coord = {"dim1": ["a", "b", "c"]}
+    with pm.Model(coords=coord) as m:
+        a = pm.Normal("a", dims="dim1")
+        with pm.Model(coords=coord) as nested_m:
+            b = pm.Normal("b", dims="dim1")
+        m.add_coords(coord)
+        c = pm.Normal("c", dims="dim1")
+        d = pm.Deterministic("d", a + b + c)
+    variables = get_var_by_name([d], "dim1")
+    assert len(variables) == 1 and variables[0] is m.dim_lengths["dim1"]
+
+
+@pytest.mark.parametrize(
+    "coords_dict",
+    [
+        pytest.param({"city": ["nyc", "la", "chi"]}, id="string"),
+        pytest.param({"year": [2020, 2021, 2022]}, id="int"),
+        pytest.param(
+            {"time": np.array(["2020-01-01", "2020-01-02"], dtype="datetime64[D]")},
+            id="datetime64",
+        ),
+    ],
+)
+def test_xarray_coord_values_unwrapped(coords_dict):
+    """xarray DataArray coord values are unwrapped to plain tuples of values."""
+    ds = xr.Dataset(coords=coords_dict)
+    with pm.Model(coords=ds.coords) as m:
+        key = next(iter(coords_dict))
+        coord = m.coords[key]
+        assert isinstance(coord, tuple)
+        assert not isinstance(coord[0], xr.DataArray)
 
 
 class TestSetUpdateCoords:
@@ -794,7 +908,7 @@ class TestSetUpdateCoords:
             # Does not resize dim
             pmodel.set_data("m", [3, 4])
             # Resizes, but also passes new coords
-            pmodel.set_data("m", [1, 2, 3], coords=dict(dim_with_coords=[1, 2, 3]))
+            pmodel.set_data("m", [1, 2, 3], coords={"dim_with_coords": [1, 2, 3]})
 
             # Resizes, but does not pass new coords
             with pytest.raises(ValueError, match="'m' variable already had 3"):
@@ -854,7 +968,7 @@ class TestSetUpdateCoords:
             pmodel.add_coord("nomnom", [1, 2])
 
             # No name collisions
-            with pytest.raises(ValueError, match="same name as"):
+            with pytest.raises(ValueError, match="conflicts with an existing dimension name"):
                 pmodel.add_named_variable(rv, dims="nomnom")
 
             # This should work (regression test against #6335)
@@ -862,7 +976,17 @@ class TestSetUpdateCoords:
             rv2.name = "yumyum"
             pmodel.add_named_variable(rv2, dims=("nomnom", None))
 
-    def test_dims_type_check(self):
+    def test_add_named_variable_checks_number_of_dims(self):
+        match = "dim labels were provided"
+        with pm.Model(coords={"bad": range(6)}) as m:
+            with pytest.raises(ValueError, match=match):
+                m.add_named_variable(pt.random.normal(size=(6, 6, 6), name="a"), dims=("bad",))
+
+            # "bad" is an iterable with 3 elements, but we treat strings as a single dim, so it's still invalid
+            with pytest.raises(ValueError, match=match):
+                m.add_named_variable(pt.random.normal(size=(6, 6, 6), name="b"), dims="bad")
+
+    def test_rv_dims_type_check(self):
         with pm.Model(coords={"a": range(5)}) as m:
             with pytest.raises(TypeError, match="Dims must be string"):
                 x = pm.Normal("x", shape=(10, 5), dims=(None, "a"))
@@ -871,12 +995,14 @@ class TestSetUpdateCoords:
         # TODO: Either allow dims without coords everywhere or nowhere
         with pm.Model() as m:
             m.add_coord(name="a", values=None, length=3)
-            m.add_coord(name="b", values=range(5))
-            x = pm.Normal("x", dims=("a", "b"))
-            prior = pm.sample_prior_predictive(samples=2).prior
-        assert prior["x"].shape == (1, 2, 3, 5)
+            m.add_coord(name="b", values=range(-5, 0))
+            m.add_coord(name="c", values=None, length=7)
+            x = pm.Normal("x", dims=("a", "b", "c"))
+            prior = pm.sample_prior_predictive(draws=2).prior
+        assert prior["x"].shape == (1, 2, 3, 5, 7)
         assert list(prior.coords["a"].values) == list(range(3))
-        assert list(prior.coords["b"].values) == list(range(5))
+        assert list(prior.coords["b"].values) == list(range(-5, 0))
+        assert list(prior.coords["c"].values) == list(range(7))
 
     def test_set_data_indirect_resize_without_coords(self):
         with pm.Model() as pmodel:
@@ -900,7 +1026,7 @@ class TestSetUpdateCoords:
 
     def test_set_data_indirect_resize_with_coords(self):
         with pm.Model() as pmodel:
-            pmodel.add_coord("mdim", ["A", "B"], mutable=True, length=2)
+            pmodel.add_coord("mdim", ["A", "B"], length=2)
             pm.Data("mdata", [1, 2], dims="mdim")
 
         assert pmodel.coords["mdim"] == ("A", "B")
@@ -916,12 +1042,12 @@ class TestSetUpdateCoords:
         # Now the other way around.
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            pmodel.set_data("mdata", [1, 2, 3, 4], coords=dict(mdim=["A", "B", "C", "D"]))
+            pmodel.set_data("mdata", [1, 2, 3, 4], coords={"mdim": ["A", "B", "C", "D"]})
         assert pmodel.coords["mdim"] == ("A", "B", "C", "D")
 
         # This time with incorrectly sized coord values
         with pytest.raises(ShapeError, match="new coordinate values"):
-            pmodel.set_data("mdata", [1, 2], coords=dict(mdim=[1, 2, 3]))
+            pmodel.set_data("mdata", [1, 2], coords={"mdim": [1, 2, 3]})
 
     def test_set_data_warns_on_resize_of_dims_defined_by_other_data(self):
         with pm.Model() as pmodel:
@@ -964,19 +1090,18 @@ def test_model_logp(jacobian):
     if not jacobian:
         expected_y_logp -= np.array([0.0, 1.0])
 
-    x_logp, y_logp = m.compile_logp(sum=False, jacobian=jacobian)(
-        {"x": test_vals, "y_log__": test_vals}
-    )
+    test_val_dict = {"x": test_vals, "y_log__": test_vals}
+    x_logp, y_logp = m.compile_logp(sum=False, jacobian=jacobian)(test_val_dict)
     assert np.all(np.isclose(x_logp, expected_x_logp))
     assert np.all(np.isclose(y_logp, expected_y_logp))
 
-    x_logp2 = m.compile_logp(vars=[x], sum=False, jacobian=jacobian)({"x": test_vals})
+    x_logp2 = m.compile_logp(vars=[x], sum=False, jacobian=jacobian)(test_val_dict)
     assert np.all(np.isclose(x_logp2, expected_x_logp))
 
-    y_logp2 = m.compile_logp(vars=[y], sum=False, jacobian=jacobian)({"y_log__": test_vals})
+    y_logp2 = m.compile_logp(vars=[y], sum=False, jacobian=jacobian)(test_val_dict)
     assert np.all(np.isclose(y_logp2, expected_y_logp))
 
-    logp_sum = m.compile_logp(sum=True, jacobian=jacobian)({"x": test_vals, "y_log__": test_vals})
+    logp_sum = m.compile_logp(sum=True, jacobian=jacobian)(test_val_dict)
     assert np.isclose(logp_sum, expected_x_logp.sum() + expected_y_logp.sum())
 
 
@@ -1040,7 +1165,7 @@ def test_determinsitic_with_dims():
     Test to check the passing of dims to the potential
     """
     with pm.Model(coords={"observed": range(10)}) as model:
-        x = pm.Normal("x", 0, 1)
+        x = pm.Normal("x", 0, 1, shape=(10,))
         y = pm.Deterministic("y", x**2, dims=("observed",))
     assert model.named_vars_to_dims == {"y": ("observed",)}
 
@@ -1050,7 +1175,7 @@ def test_potential_with_dims():
     Test to check the passing of dims to the potential
     """
     with pm.Model(coords={"observed": range(10)}) as model:
-        x = pm.Normal("x", 0, 1)
+        x = pm.Normal("x", 0, 1, shape=(10,))
         y = pm.Potential("y", x**2, dims=("observed",))
     assert model.named_vars_to_dims == {"y": ("observed",)}
 
@@ -1077,20 +1202,318 @@ def test_compile_fn():
     np.testing.assert_allclose(result_compute, result_expect)
 
 
-def test_model_pytensor_config():
-    assert pytensor.config.mode != "JAX"
-    with pytest.warns(FutureWarning, match="pytensor_config is deprecated"):
-        m = pm.Model(pytensor_config=dict(mode="JAX"))
-    with m:
-        assert pytensor.config.mode == "JAX"
-    assert pytensor.config.mode != "JAX"
+class TestFrozenModelCaching:
+    def test_unfrozen_model_does_not_cache(self):
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1, size=2)
+            mu = pm.Deterministic("mu", x * 2)
+            pm.Normal("y", x, 1, observed=[0.3, -0.5])
 
+        assert m.compile_fn(mu, inputs=[x], point_fn=False) is not m.compile_fn(
+            mu, inputs=[x], point_fn=False
+        )
+        assert m.logp() is not m.logp()
+        assert m.logp_dlogp_function(ravel_inputs=True) is not m.logp_dlogp_function(
+            ravel_inputs=True
+        )
 
-def test_deprecated_model_property():
-    m = pm.Model()
-    with pytest.warns(FutureWarning, match="Model.model property is deprecated"):
-        m_property = m.model
-    assert m is m_property
+    def test_freeze_model_partitions_shared_inputs(self):
+        # Dims and data that free RVs depend on are frozen to constants; those that only
+        # Deterministics and observed RVs depend on stay shared (and settable).
+        with pm.Model(coords={"g": [0, 1, 2], "obs": [0, 1]}) as m:
+            n = pm.Data("n", np.array(3, dtype="int64"))  # drives a free RV size
+            x = pm.Data("x", np.zeros(2), dims="obs")  # only feeds the observed RV
+            pm.Normal("z", 0, 1, shape=(n,))
+            w = pm.Normal("w", 0, 1, dims="g")
+            pm.Normal("y", x.sum() + w.sum(), 1, observed=np.zeros(2), dims="obs")
+
+        fm = freeze_model(m)
+        assert isinstance(fm["n"], Constant)
+        assert isinstance(fm.dim_lengths["g"], Constant)
+        assert isinstance(fm["x"], SharedVariable)
+        assert isinstance(fm.dim_lengths["obs"], SharedVariable)
+        assert isinstance(fm, FrozenModel)
+        assert not isinstance(m, FrozenModel)  # original model is untouched
+
+    def test_freeze_model_preserves_initvals(self):
+        # fgraph_from_model drops (and rejects) initial values; freeze_model transplants
+        # them onto the frozen model without touching the original.
+        with pm.Model() as m:
+            pm.Uniform("u", 0, 10, initval=7.0)  # concrete
+            pm.Normal("p", 0, 1, size=3, initval="prior")  # strategy string
+
+        fm = freeze_model(m)
+        assert m.rvs_to_initial_values[m["u"]] == 7.0  # original untouched
+        ip = fm.initial_point(0)
+        np.testing.assert_allclose(ip["u_interval__"], m.initial_point(0)["u_interval__"])
+        np.testing.assert_allclose(fm.initial_point(1)["p"], m.initial_point(1)["p"])
+
+        # Symbolic initial values reference the original graph and cannot be transplanted.
+        with pm.Model() as m2:
+            x = pm.Data("d", np.array([10.0, 20.0, 30.0]))
+            pm.Normal("s", 0, 1, size=3, initval=x * 2)
+        with pytest.raises(NotImplementedError, match="symbolic initial value"):
+            freeze_model(m2)
+
+    def test_compile_fn_is_cached(self):
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1, size=2)
+            mu = pm.Deterministic("mu", x * 2)
+
+        fm = freeze_model(m)
+        f1 = fm.compile_fn(fm["mu"], inputs=[fm["x"]], point_fn=False)
+        f2 = fm.compile_fn(fm["mu"], inputs=[fm["x"]], point_fn=False)
+        assert f1 is f2
+        assert "_compiled_fn" in fm._cache
+
+    def test_mutation_forbidden_on_frozen(self):
+        # FrozenModel is a sibling of Model under BaseModel: the mutating methods do not
+        # exist on it at all.
+        with pm.Model() as m:
+            x = pm.Uniform("x", 0, 10)
+        fm = freeze_model(m)
+
+        assert isinstance(fm, FrozenModel)
+        assert isinstance(fm, BaseModel)
+        assert not isinstance(fm, pm.Model)
+        with pytest.raises(AttributeError, match="register_rv"):
+            with fm:
+                pm.Normal("y")
+        with pytest.raises(AttributeError, match="add_coord"):
+            fm.add_coord("new_dim", ["a", "b"])
+        with pytest.raises(AttributeError, match="set_initval"):
+            fm.set_initval(fm["x"], 5.0)
+
+    def test_abstract_and_final_classes(self):
+        with pytest.raises(TypeError, match="abstract"):
+            BaseModel()
+        with pytest.raises(TypeError, match="freeze_model"):
+            FrozenModel()
+
+    def test_sub_model_of_frozen_is_rejected(self):
+        # A sub-model shares its parent's variable containers, so registering variables in it
+        # would mutate the frozen parent and silently stale its cached functions.
+        with pm.Model() as m:
+            pm.Normal("a")
+        fm = freeze_model(m)
+        lp = fm.logp()
+
+        with pytest.raises(RuntimeError, match="sub-model of a FrozenModel"):
+            with fm:
+                with pm.Model(name="inner"):
+                    pm.Normal("q")
+        with pytest.raises(RuntimeError, match="sub-model of a FrozenModel"):
+            pm.Model(name="inner", model=fm)
+
+        assert [v.name for v in fm.free_RVs] == ["a"]  # untouched
+        assert fm.logp() is lp  # cache still valid
+        fm.compile_fn(fm.logp(), inputs=fm.value_vars, point_fn=False)
+
+    def test_set_data_on_frozen_model(self):
+        with pm.Model() as m:
+            x = pm.Data("x", np.zeros(3))
+            b = pm.Normal("b")
+            pm.Deterministic("mu", b + x)
+
+        fm = freeze_model(m)
+        f1 = fm.compile_fn(fm["mu"], inputs=[fm["b"]], point_fn=False)
+        with fm:
+            pm.set_data({"x": np.ones(3)})
+        f2 = fm.compile_fn(fm["mu"], inputs=[fm["b"]], point_fn=False)
+        assert f1 is f2  # value update reuses the cache ...
+        np.testing.assert_allclose(f2(0.0), np.ones(3))  # ... and flows through
+
+        # A resize also flows through: the remaining shapes are runtime inputs.
+        with fm:
+            pm.set_data({"x": np.zeros(5)})
+        f3 = fm.compile_fn(fm["mu"], inputs=[fm["b"]], point_fn=False)
+        assert f3 is f1
+        assert f3(1.0).shape == (5,)
+
+    def test_set_data_frozen_data_raises(self):
+        with pm.Model() as m:
+            n = pm.Data("n", np.array(3, dtype="int64"))
+            pm.Normal("z", 0, 1, shape=(n,))
+
+        fm = freeze_model(m)
+        with pytest.raises(TypeError, match="frozen"):
+            with fm:
+                pm.set_data({"n": np.array(5, dtype="int64")})
+
+    def test_compile_fn_reseeds_cached_function(self):
+        # A cache hit must still respect random_seed (reapplied on each compile_fn call).
+        with pm.Model() as m:
+            pm.Normal("z", 0, 1)
+
+        fm = freeze_model(m)
+        f_a = fm.compile_fn(fm["z"], inputs=[], point_fn=False, random_seed=123)
+        v1 = f_a()
+        f_b = fm.compile_fn(fm["z"], inputs=[], point_fn=False, random_seed=123)
+        v2 = f_b()
+        assert f_a is f_b  # cache hit (same compiled function reused)
+        np.testing.assert_allclose(v1, v2)  # same seed -> same draw
+
+        f_c = fm.compile_fn(fm["z"], inputs=[], point_fn=False, random_seed=456)
+        assert not np.allclose(v1, f_c())  # different seed -> different draw
+
+    def test_compile_fn_seeds_variables_in_the_same_order(self):
+        # Seeding hands out sub-seeds by position, so collecting the random variables in a
+        # different order than `pymc.pytensorf.compile` does silently gives every variable a
+        # different stream. Only visible with more than one variable.
+        with pm.Model() as m:
+            a = pm.Normal("a", size=2)
+            b = pm.Normal("b", size=2)
+
+        outs = [a, b]
+        expected = compile([], outs, random_seed=2)()
+        for model in (m, freeze_model(m)):
+            drawn = model.compile_fn(outs, inputs=[], point_fn=False, random_seed=2)()
+            for drawn_var, expected_var in zip(drawn, expected):
+                np.testing.assert_allclose(drawn_var, expected_var)
+
+    def test_compile_fn_jax_bypasses_cache_but_stays_seeded(self):
+        # JAX detaches a function's RNG variables at compile time, so a cached function
+        # can't be reseeded. compile_fn skips the cache for RNG functions on JAX and seeds
+        # before compiling; deterministic functions are still cached.
+        pytest.importorskip("jax")
+        with pm.Model() as m:
+            pm.Normal("z", 0, 1, size=3)
+            b = pm.Normal("b")
+            pm.Deterministic("d", b * 2)
+
+        fm = freeze_model(m)
+        f_a = fm.compile_fn(fm["z"], inputs=[], point_fn=False, random_seed=0, mode="JAX")
+        f_b = fm.compile_fn(fm["z"], inputs=[], point_fn=False, random_seed=0, mode="JAX")
+        assert f_a is not f_b  # not cached (RNG function on JAX)
+        np.testing.assert_allclose(f_a(), f_b())  # same seed -> same draw
+        f_c = fm.compile_fn(fm["z"], inputs=[], point_fn=False, random_seed=1, mode="JAX")
+        assert not np.allclose(f_a(), f_c())  # different seed -> different draw
+
+        g_a = fm.compile_fn(fm["d"], inputs=[fm["b"]], point_fn=False, mode="JAX")
+        g_b = fm.compile_fn(fm["d"], inputs=[fm["b"]], point_fn=False, mode="JAX")
+        assert g_a is g_b  # deterministic JAX functions are cached
+
+    def test_logp_dlogp_function_is_cached(self):
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1, size=2)
+            pm.Normal("y", x, 1, observed=[0.3, -0.5])
+
+        fm = freeze_model(m)
+        f1 = fm.logp_dlogp_function(ravel_inputs=True)
+        f2 = fm.logp_dlogp_function(ravel_inputs=True)
+        # Each caller gets its own shared variables on top of a single compiled graph.
+        assert f1 is not f2
+        # The cache bucket is named after the wrapped method, `BaseModel._logp_dlogp_function`.
+        assert len(fm._cache["_logp_dlogp_function"]) == 1
+
+    def test_logp_dlogp_d2logp_graphs_are_cached(self):
+        # Memoized graph construction returns the same object, so a freshly requested logp
+        # graph hits the compile cache instead of recompiling.
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1, size=2)
+            pm.Normal("y", x, 1, observed=[0.3, -0.5])
+
+        fm = freeze_model(m)
+        assert fm.logp() is fm.logp()
+        assert fm.dlogp() is fm.dlogp()
+        assert fm.d2logp() is fm.d2logp()
+
+        f1 = fm.compile_fn(fm.logp(), inputs=fm.value_vars, point_fn=False)
+        f2 = fm.compile_fn(fm.logp(), inputs=fm.value_vars, point_fn=False)
+        assert f1 is f2
+
+    def test_cached_logp_not_corrupted_by_dlogp(self):
+        # dlogp/d2logp rewrite the shared logp in place; it must stay compilable and correct.
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1, size=2)
+            pm.Normal("y", x, 1, observed=[0.3, -0.5])
+        fm = freeze_model(m)
+        _ = fm.dlogp()
+        _ = fm.d2logp()
+        f_cached = fm.compile_fn(fm.logp(), inputs=fm.value_vars, point_fn=False)
+        f_fresh = m.compile_fn(m.logp(), inputs=m.value_vars, point_fn=False)
+
+        val = np.array([0.1, 0.2])
+        np.testing.assert_allclose(f_cached(val), f_fresh(val))
+
+    def test_logp_dlogp_function_extra_values_are_per_call(self):
+        # A subset gradient leaves the other value var as an "extra" (shared) input.
+        # The cached function must reflect each call's extra values, not a stale set.
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1)
+            # A shaped extra value checks that the per-caller shared variables keep the
+            # static shape the compiled function was built for.
+            y = pm.Normal("y", 0, 1, shape=3)
+            pm.Normal("obs", x + y.sum(), 1, observed=[0.0])
+
+        fm = freeze_model(m)
+        x_val = fm.rvs_to_values[fm["x"]]
+        # Values must be arrays, as in a point returned by `initial_point`.
+        point_a = {"x": np.array(0.0), "y": np.ones(3)}
+        point_b = {"x": np.array(0.0), "y": np.full(3, 2.0)}
+        f_a = fm.logp_dlogp_function([x_val], ravel_inputs=True, initial_point=point_a)
+        logp_a, _ = f_a(np.array([0.0]))
+        f_b = fm.logp_dlogp_function([x_val], ravel_inputs=True, initial_point=point_b)
+        logp_b, _ = f_b(np.array([0.0]))
+        assert f_a is not f_b
+        assert not np.isclose(logp_a, logp_b)  # the extra value (y) took effect
+
+        # Handing out the cached function must not share its extra values across callers,
+        # neither those set when `f_b` was created nor those set on it afterwards.
+        np.testing.assert_allclose(f_a(np.array([0.0]))[0], logp_a)
+        f_b.set_extra_values({"x": np.array(0.0), "y": np.full(3, 3.0)})
+        np.testing.assert_allclose(f_a(np.array([0.0]))[0], logp_a)
+
+    def test_logp_dlogp_function_weights_are_per_call(self):
+        with pm.Model() as m:
+            pm.Normal("x", 0, 1)
+            pm.Normal("obs", m["x"], 1, observed=[0.0])
+
+        fm = freeze_model(m)
+        f_a = fm.logp_dlogp_function(tempered=True, ravel_inputs=True)
+        f_b = fm.logp_dlogp_function(tempered=True, ravel_inputs=True)
+        logp_a, _ = f_a(np.array([0.0]))
+        f_b.set_weights(np.array([0.5]))
+        np.testing.assert_allclose(f_a(np.array([0.0]))[0], logp_a)
+        assert not np.isclose(f_b(np.array([0.0]))[0], logp_a)
+
+    def test_initial_point_is_cached(self):
+        with pm.Model() as m:
+            pm.Normal("x", 0, 1, size=3)
+
+        fm = freeze_model(m)
+        ip1 = fm.initial_point(0)
+        assert "_make_initial_point" in fm._cache
+        np.testing.assert_allclose(ip1["x"], fm.initial_point(0)["x"])
+        np.testing.assert_allclose(ip1["x"], m.initial_point(0)["x"])  # matches unfrozen
+
+    def test_repeated_sampling_does_not_recompile(self):
+        with pm.Model() as m:
+            x = pm.Normal("x", 0, 1, size=2)
+            pm.Normal("y", x, 1, observed=[0.3, -0.5])
+
+        sample_kwargs = {
+            "draws": 5,
+            "tune": 5,
+            "chains": 1,
+            "progressbar": False,
+            "nuts_sampler": "pymc",
+            "compute_convergence_checks": False,
+        }
+        fm = freeze_model(m)
+        with fm:
+            pm.sample(random_seed=0, **sample_kwargs)
+
+        n_compiles = [0]
+        orig_function = pytensor.function
+
+        def counting_function(*args, **kwargs):
+            n_compiles[0] += 1
+            return orig_function(*args, **kwargs)
+
+        with patch("pytensor.function", counting_function), fm:
+            pm.sample(random_seed=1, **sample_kwargs)
+        assert n_compiles[0] == 0
 
 
 def test_model_parent_set_programmatically():
@@ -1100,7 +1523,18 @@ def test_model_parent_set_programmatically():
     with pm.Model(model=model):
         y = pm.Normal("y")
 
+    with model:
+        # Default inherits from model
+        with pm.Model():
+            z_in = pm.Normal("z_in")
+
+        # Explict None opts out of model context
+        with pm.Model(model=None):
+            z_out = pm.Normal("z_out")
+
     assert "y" in model.named_vars
+    assert "z_in" in model.named_vars
+    assert "z_out" not in model.named_vars
 
 
 class TestModelContext:
@@ -1334,8 +1768,10 @@ class TestImputationMissingData:
             np.testing.assert_array_equal(trace["theta2"][0][~obs2.mask], obs1[~obs2.mask])
 
             pp_idata = pm.sample_posterior_predictive(trace, random_seed=rng)
-            pp_trace = pp_idata.posterior_predictive.stack(sample=["chain", "draw"]).transpose(
-                "sample", ...
+            pp_trace = (
+                pp_idata.posterior_predictive.to_dataset()
+                .stack(sample=["chain", "draw"])
+                .transpose("sample", ...)
             )
             assert set(pp_trace.keys()) == {
                 "theta1",
@@ -1550,55 +1986,6 @@ class TestShared:
             )
 
 
-def test_tag_future_warning_model():
-    # Test no unexpected warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-
-        model = pm.Model()
-
-        x = pt.random.normal()
-        x.tag.something_else = "5"
-        x.tag.test_value = 0
-        assert not isinstance(x.tag, _FutureWarningValidatingScratchpad)
-
-        # Test that model changes the tag type, but copies existing contents
-        x = model.register_rv(x, name="x", transform=log)
-        assert isinstance(x.tag, _FutureWarningValidatingScratchpad)
-        assert x.tag.something_else == "5"
-        assert x.tag.test_value == 0
-
-        # Test expected warnings
-        with pytest.warns(FutureWarning, match="model.rvs_to_values"):
-            x_value = x.tag.value_var
-
-        assert isinstance(x_value.tag, _FutureWarningValidatingScratchpad)
-        with pytest.warns(FutureWarning, match="model.rvs_to_transforms"):
-            transform = x_value.tag.transform
-        assert transform is log
-
-        with pytest.raises(AttributeError):
-            x.tag.observations
-
-        # Cloning a node will keep the same tag type and contents
-        y = x.owner.clone().default_output()
-        assert y is not x
-        assert y.tag is not x.tag
-        assert isinstance(y.tag, _FutureWarningValidatingScratchpad)
-        y = model.register_rv(y, name="y", observed=5)
-        assert isinstance(y.tag, _FutureWarningValidatingScratchpad)
-
-        # Test expected warnings
-        with pytest.warns(FutureWarning, match="model.rvs_to_values"):
-            y_value = y.tag.value_var
-        with pytest.warns(FutureWarning, match="model.rvs_to_values"):
-            y_obs = y.tag.observations
-        assert y_value is y_obs
-        assert y_value.eval() == 5
-
-        assert isinstance(y_value.tag, _FutureWarningValidatingScratchpad)
-
-
 class TestModelDebug:
     @pytest.mark.parametrize("fn", ("logp", "dlogp", "random"))
     def test_no_problems(self, fn, capfd):
@@ -1620,11 +2007,15 @@ class TestModelDebug:
         if fn == "dlogp":
             # var dlogp is 0 or 1 without a likelihood
             assert "No problems found" in out
-        else:
-            assert "The parameters evaluate to:\n0: 0.0\n1: [ 1. -1.  1.]" in out
-            if fn == "logp":
-                assert "This does not respect one of the following constraints: sigma > 0" in out
+        elif fn == "logp":
+            assert "The parameters evaluate to:\n0: [0.]\n1: [ 1. -1.  1.]" in out
+            assert "This does not respect one of the following constraints: sigma > 0" in out
+        else:  # "random"
+            if isinstance(get_default_mode().linker, NumbaLinker):
+                # Numba doesn't raise for negative sigma in NormalRV
+                assert "No problems found" in out
             else:
+                assert "The parameters evaluate to:\n0: [0.]\n1: [ 1. -1.  1.]" in out
                 assert (
                     "The variable y random method raised the following exception: Domain error in arguments."
                     in out
@@ -1648,7 +2039,7 @@ class TestModelDebug:
     def test_invalid_value(self, capfd):
         with pm.Model() as m:
             x = pm.Normal("x", [1, -1, 1])
-            y = pm.HalfNormal("y", tau=pm.math.abs(x), initval=[-1, 1, -1], transform=None)
+            y = pm.HalfNormal("y", tau=pm.math.abs(x), initval=[-1, 1, -1], default_transform=None)
         m.debug()
 
         out, _ = capfd.readouterr()
@@ -1702,7 +2093,7 @@ class TestModelGraphs:
     )
     def test_graphviz_call_function(self, var_names, filenames) -> None:
         model = self.school_model(J=8)
-        with patch("pymc.model.core.model_to_graphviz") as mock_model_to_graphviz:
+        with patch("pymc.model_graph.model_to_graphviz") as mock_model_to_graphviz:
             model.to_graphviz(var_names=var_names, save=filenames)
             mock_model_to_graphviz.assert_called_once_with(
                 model=model,
@@ -1712,3 +2103,75 @@ class TestModelGraphs:
                 figsize=None,
                 dpi=300,
             )
+
+
+class TestModelCopy:
+    @pytest.mark.parametrize("copy_method", (copy.copy, copy.deepcopy))
+    def test_copy_model(self, copy_method) -> None:
+        with pm.Model() as simple_model:
+            pm.Normal("y")
+
+        copy_simple_model = copy_method(simple_model)
+
+        with simple_model:
+            simple_model_prior_predictive = pm.sample_prior_predictive(draws=1, random_seed=42)
+
+        with copy_simple_model:
+            z = pm.Deterministic("z", copy_simple_model["y"] + 1)
+            copy_simple_model_prior_predictive = pm.sample_prior_predictive(draws=1, random_seed=42)
+
+        assert (
+            simple_model_prior_predictive["prior"]["y"].values
+            == copy_simple_model_prior_predictive["prior"]["y"].values
+        )
+
+        assert "z" in copy_simple_model.named_vars
+        assert "z" not in simple_model.named_vars
+        assert (
+            copy_simple_model_prior_predictive["prior"]["z"].values
+            == 1 + simple_model_prior_predictive["prior"]["y"].values
+        )
+
+    @pytest.mark.parametrize("copy_method", (copy.copy, copy.deepcopy))
+    def test_guassian_process_copy_failure(self, copy_method) -> None:
+        with pm.Model() as gaussian_process_model:
+            ell = pm.Gamma("ell", alpha=2, beta=1)
+            cov = 2 * pm.gp.cov.ExpQuad(1, ell)
+            gp = pm.gp.Latent(cov_func=cov)
+            f = gp.prior("f", X=np.arange(10)[:, None])
+            pm.Normal("y", f * 2)
+
+        with pytest.warns(
+            UserWarning,
+            match="Detected variables likely created by GP objects. Further use of these old GP objects should be avoided as it may reintroduce variables from the old model. See issue: https://github.com/pymc-devs/pymc/issues/6883",
+        ):
+            copy_method(gaussian_process_model)
+
+
+class TestCoordVariableCollision:
+    def test_variable_name_conflicts_with_existing_coord(self):
+        with pm.Model(coords={"a": [0, 1]}):
+            with pytest.raises(ValueError, match="conflicts with an existing dimension name"):
+                pm.Data("a", [5, 10])
+
+            with pytest.raises(ValueError, match="conflicts with an existing dimension name"):
+                pm.Normal("a", dims="a")
+
+            with pytest.raises(ValueError, match="conflicts with an existing dimension name"):
+                pm.Deterministic("a", pt.ones(2))
+
+            with pytest.raises(ValueError, match="conflicts with an existing dimension name"):
+                pm.Potential("a", pt.ones(2))
+
+    def test_add_coord_conflicts_with_existing_variable_name(self):
+        with pm.Model() as m:
+            pm.Data("a", [5, 10])
+
+            with pytest.raises(ValueError, match="conflicts with an existing model variable name"):
+                m.add_coord("a", [0, 1])
+
+    def test_register_rv_with_dim_matching_name(self):
+        with pytest.raises(ValueError, match="conflicts with an existing dimension name"):
+            with pm.Model() as pmodel:
+                var = pt.as_tensor([1, 2, 3])
+                pmodel.register_rv(var, name="time", dims=("time",))

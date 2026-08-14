@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -15,10 +15,12 @@ import re
 
 import arviz
 import numpy as np
+import pytensor.tensor as pt
 import pytest
 import xarray
 
 from cachetools import cached
+from pytensor.compile.io import In, Out
 
 import pymc as pm
 
@@ -117,6 +119,39 @@ def test_hashing_of_rv_tuples():
                 assert isinstance(hashable(structure), int)
 
 
+def test_hashable_of_sets():
+    # Sets used to fall through to being pickled as a whole, which is not stable across
+    # calls, so equal sets got different hashes.
+    with pm.Model():
+        rv = pm.Normal("rv")
+
+    assert hashable({rv}) == hashable({rv})
+    assert hashable({rv}) != hashable(set())
+    assert hashable({1, 2}) == hashable({2, 1})  # order-insensitive
+    assert hashable(frozenset({1, 2})) == hashable(frozenset({1, 2}))
+
+
+def test_hashable_of_function_inputs_and_outputs():
+    # In/Out wrap a variable with compilation options and are hashed by identity, but
+    # callers rebuild them on every call.
+    x = pt.vector("x")
+    assert hashable(In(x, borrow=True)) == hashable(In(x, borrow=True))
+    assert hashable(In(x, borrow=True)) != hashable(In(x, borrow=False))
+    assert hashable(Out(x, borrow=True)) == hashable(Out(x, borrow=True))
+
+
+def test_hash_key_of_arrays():
+    # Looking a key up compares it with the stored one, which must not raise for arrays or
+    # for the containers holding them.
+    key = hash_key({"x": np.zeros(3)})
+    same = hash_key({"x": np.zeros(3)})
+    other = hash_key({"x": np.ones(3)})
+
+    assert key == same
+    assert key != other
+    assert {key: "value"}[same] == "value"
+
+
 def test_hash_key():
     class Bad1:
         def __hash__(self):
@@ -157,15 +192,17 @@ def test_unset_repr(capsys):
 
 def test_drop_warning_stat():
     idata = arviz.from_dict(
-        sample_stats={
-            "a": np.ones((2, 5, 4)),
-            "warning": np.ones((2, 5, 3), dtype=object),
+        {
+            "sample_stats": {
+                "a": np.ones((2, 5, 4)),
+                "warning": np.ones((2, 5, 3), dtype=object),
+            },
+            "warmup_sample_stats": {
+                "a": np.ones((2, 5, 4)),
+                "warning": np.ones((2, 5, 3), dtype=object),
+            },
         },
-        warmup_sample_stats={
-            "a": np.ones((2, 5, 4)),
-            "warning": np.ones((2, 5, 3), dtype=object),
-        },
-        attrs=dict(version="0.1.2"),
+        attrs={"/": {"version": "0.1.2"}},
         coords={
             "adim": [0, 1, None, 3],
             "warning_dim_0": list("ABC"),
@@ -180,7 +217,7 @@ def test_drop_warning_stat():
     assert new.attrs.get("version") == "0.1.2"
 
     for gname in ["sample_stats", "warmup_sample_stats"]:
-        ss = new.get(gname)
+        ss = new[gname].dataset
         assert isinstance(ss, xarray.Dataset), gname
         assert "a" in ss
         assert "warning" not in ss
@@ -235,6 +272,9 @@ def test_get_value_vars_from_user_vars():
     # The next line does not wrap the variable in a list on purpose, to test the
     # utility function can handle those as promised
     assert get_value_vars_from_user_vars(x1_value, model1) == [x1_value]
+
+    # Empty input is a valid user-facing case and should return an empty list
+    assert get_value_vars_from_user_vars([], model1) == []
 
     with pm.Model() as model2:
         x2 = pm.Normal("x2", mu=0, sigma=1)

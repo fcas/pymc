@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 #   limitations under the License.
 import functools as ft
 import itertools as it
-import warnings
 
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -21,15 +20,20 @@ from typing import Any
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
-import pytest
+import xarray as xr
 
 from numpy import random as nr
 from numpy import testing as npt
-from pytensor.compile.mode import Mode
-from pytensor.graph.basic import Variable
+from numpy.typing import NDArray
+from pytensor.compile import SharedVariable
+from pytensor.compile.mode import Mode, get_default_mode
+from pytensor.graph.basic import Constant, Variable, equal_computations
 from pytensor.graph.rewriting.basic import in2out
+from pytensor.graph.traversal import graph_inputs
+from pytensor.link.numba import NumbaLinker
 from pytensor.tensor import TensorVariable
 from pytensor.tensor.random.op import RandomVariable
+from pytensor.tensor.random.type import RandomType
 from scipy import special as sp
 from scipy import stats as st
 
@@ -38,13 +42,14 @@ import pymc as pm
 from pymc.distributions.distribution import Distribution
 from pymc.distributions.shape_utils import change_dist_size
 from pymc.initial_point import make_initial_point_fn
-from pymc.logprob.basic import icdf, logcdf, logp, transformed_conditional_logp
+from pymc.logprob.basic import icdf, logccdf, logcdf, logp, transformed_conditional_logp
 from pymc.logprob.utils import (
     ParameterValueError,
     local_check_parameter_to_ninf_switch,
-    rvs_in_graph,
 )
-from pymc.pytensorf import compile_pymc, floatX, inputvars, intX
+from pymc.model.core import Model
+from pymc.model.fgraph import ModelVar, fgraph_from_model
+from pymc.pytensorf import compile, floatX, inputvars, rvs_in_graph
 
 # This mode can be used for tests where model compilations takes the bulk of the runtime
 # AND where we don't care about posterior numerical or sampling stability (e.g., when
@@ -69,7 +74,7 @@ def product(domains, n_samples=-1):
                  must be "domain-like", as in, have a `.vals` property
         n_samples: int, maximum samples to return.  -1 to return whole product
 
-    Returns:
+    Returns
     -------
         list of the cartesian product of the domains
     """
@@ -115,6 +120,7 @@ class Domain:
         self.dtype = dtype
 
     def __add__(self, other):
+        """Add two domains."""
         return Domain(
             [v + other for v in self.vals],
             self.dtype,
@@ -123,6 +129,7 @@ class Domain:
         )
 
     def __mul__(self, other):
+        """Multiply two domains."""
         try:
             return Domain(
                 [v * other for v in self.vals],
@@ -139,6 +146,7 @@ class Domain:
             )
 
     def __neg__(self):
+        """Negate one domain."""
         return Domain([-v for v in self.vals], self.dtype, (-self.lower, -self.upper), self.shape)
 
 
@@ -215,7 +223,7 @@ Runif = Domain([-np.inf, -0.4, 0, 0.4, np.inf])
 Rdunif = Domain([-np.inf, -1, 0, 1, np.inf], "int64")
 Rplusunif = Domain([0, 0.5, np.inf])
 Rplusdunif = Domain([0, 10, np.inf], "int64")
-I = Domain([-np.inf, -3, -2, -1, 0, 1, 2, 3, np.inf], "int64")  # noqa E741
+I = Domain([-np.inf, -3, -2, -1, 0, 1, 2, 3, np.inf], "int64")  # noqa: E741
 NatSmall = Domain([0, 3, 4, 5, np.inf], "int64")
 Nat = Domain([0, 1, 2, 3, np.inf], "int64")
 NatBig = Domain([0, 1, 2, 3, 5000, np.inf], "int64")
@@ -224,7 +232,7 @@ Bool = Domain([0, 0, 1, 1], "int64")
 
 
 def select_by_precision(float64, float32):
-    """Helper function to choose reasonable decimal cutoffs for different floatX modes."""
+    """Choose reasonable decimal cutoffs for different floatX modes."""
     decimal = float64 if pytensor.config.floatX == "float64" else float32
     return decimal
 
@@ -243,7 +251,7 @@ def build_model(distfam, valuedomain, vardomains, extra_args=None):
         distfam(
             "value",
             **param_vars,
-            transform=None,
+            default_transform=None,
         )
     return m, param_vars
 
@@ -312,10 +320,8 @@ def check_logp(
     skip_paramdomain_outside_edge_test: bool = False,
 ) -> None:
     """
-    Generic test for PyMC logp methods
+    Test PyMC logp and equivalent scipy logpmf/logpdf methods give similar results for valid values and parameters inside the supported edges.
 
-    Test PyMC logp and equivalent scipy logpmf/logpdf methods give similar
-    results for valid values and parameters inside the supported edges.
     Edges are excluded by default, but can be artificially included by
     creating a domain with repeated values (e.g., `Domain([0, 0, .5, 1, 1]`)
 
@@ -342,6 +348,8 @@ def check_logp(
     scipy_args : Dictionary with extra arguments needed to call scipy logp method
         Usually the same as extra_args
     """
+    import pytest
+
     if decimal is None:
         decimal = select_by_precision(float64=6, float32=3)
 
@@ -355,7 +363,7 @@ def check_logp(
     dist = create_dist_from_paramdomains(pymc_dist, paramdomains, extra_args)
     value = dist.type()
     value.name = "value"
-    pymc_dist_logp = logp(dist, value).sum()
+    pymc_dist_logp = logp(dist, value).sum()  # type: ignore[attr-defined]
     pymc_logp = pytensor.function(list(inputvars(pymc_dist_logp)), pymc_dist_logp)
 
     # Test supported value and parameters domain matches Scipy
@@ -388,6 +396,7 @@ def check_logp(
                 point[invalid_param] = np.asarray(
                     invalid_edge, dtype=paramdomains[invalid_param].dtype
                 )
+
                 with pytest.raises(ParameterValueError):
                     pymc_logp(**point)
                     pytest.fail(f"test_params={point}")
@@ -419,7 +428,7 @@ def check_logcdf(
     skip_paramdomain_outside_edge_test: bool = False,
 ) -> None:
     """
-    Generic test for PyMC logcdf methods
+    Test PyMC logcdf and equivalent scipy logcdf methods give similar results for valid values and parameters inside the supported edges.
 
     The following tests are performed by default:
         1. Test PyMC logcdf and equivalent scipy logcdf methods give similar
@@ -459,6 +468,8 @@ def check_logcdf(
         returns -inf for invalid parameter values outside the supported domain edge
 
     """
+    import pytest
+
     if decimal is None:
         decimal = select_by_precision(float64=6, float32=3)
 
@@ -498,6 +509,7 @@ def check_logcdf(
 
                 point = valid_params.copy()
                 point[invalid_param] = invalid_edge
+
                 with pytest.raises(ParameterValueError):
                     pymc_logcdf(**point)
                     pytest.fail(f"test_params={point}")
@@ -522,6 +534,124 @@ def check_logcdf(
         )
 
 
+def check_logccdf(
+    pymc_dist: Distribution,
+    domain: Domain,
+    paramdomains: dict[str, Domain],
+    scipy_logccdf: Callable,
+    decimal: int | None = None,
+    n_samples: int = 100,
+    skip_paramdomain_inside_edge_test: bool = False,
+    skip_paramdomain_outside_edge_test: bool = False,
+) -> None:
+    """
+    Test PyMC logccdf and equivalent scipy logsf methods give similar results.
+
+    The following tests are performed by default:
+        1. Test PyMC logccdf and equivalent scipy logsf methods give similar
+        results for valid values and parameters inside the supported edges.
+        Edges are excluded by default, but can be artificially included by
+        creating a domain with repeated values (e.g., `Domain([0, 0, .5, 1, 1]`)
+        Can be skipped via skip_paramdomain_inside_edge_test
+        2. Test PyMC logccdf method returns -inf for invalid parameter values
+        outside the supported edges. Can be skipped via skip_paramdomain_outside_edge_test
+        3. Test PyMC logccdf method returns 0 for values below the supported
+        lower edge (S(t) = 1 when t is below support) and -inf for values above
+        the upper edge (S(t) = 0 when t exceeds support).
+
+    Parameters
+    ----------
+    pymc_dist: PyMC distribution
+    domain : Domain
+        Supported domain of distribution values
+    paramdomains : Dictionary of Parameter : Domain pairs
+        Supported domains of distribution parameters
+    scipy_logccdf : Callable
+        Scipy logsf method of equivalent pymc_dist distribution
+    decimal : Int
+        Level of precision with which pymc_dist and scipy_logccdf are compared.
+        Defaults to 6 for float64 and 3 for float32
+    n_samples : Int
+        Upper limit on the number of valid domain and value combinations that
+        are compared between pymc and scipy methods. If n_samples is below the
+        total number of combinations, a random subset is evaluated. Setting
+        n_samples = -1, will return all possible combinations. Defaults to 100
+    skip_paramdomain_inside_edge_test : Bool
+        Whether to run test 1., which checks that pymc and scipy distributions
+        match for valid values and parameters inside the respective domain edges
+    skip_paramdomain_outside_edge_test : Bool
+        Whether to run test 2., which checks that pymc distribution logccdf
+        returns -inf for invalid parameter values outside the supported domain edge
+
+    """
+    import pytest
+
+    if decimal is None:
+        decimal = select_by_precision(float64=6, float32=3)
+
+    dist = create_dist_from_paramdomains(pymc_dist, paramdomains)
+    value = dist.type()
+    value.name = "value"
+    dist_logccdf = logccdf(dist, value)
+    pymc_logccdf = pytensor.function(list(inputvars(dist_logccdf)), dist_logccdf)
+
+    # Test pymc and scipy distributions match for values and parameters
+    # within the supported domain edges (excluding edges)
+    if not skip_paramdomain_inside_edge_test:
+        domains = paramdomains.copy()
+        domains["value"] = domain
+        for point in product(domains, n_samples=n_samples):
+            point = dict(point)
+            npt.assert_almost_equal(
+                pymc_logccdf(**point),
+                scipy_logccdf(**point),
+                decimal=decimal,
+                err_msg=str(point),
+            )
+
+    valid_value = domain.vals[0]
+    valid_params = {param: paramdomain.vals[0] for param, paramdomain in paramdomains.items()}
+    valid_params["value"] = valid_value
+
+    # Test pymc distribution raises ParameterValueError for parameters outside the
+    # supported domain edges (excluding edges)
+    if not skip_paramdomain_outside_edge_test:
+        invalid_params = find_invalid_scalar_params(paramdomains)
+
+        for invalid_param, invalid_edges in invalid_params.items():
+            for invalid_edge in invalid_edges:
+                if invalid_edge is None:
+                    continue
+
+                point = valid_params.copy()
+                point[invalid_param] = invalid_edge
+
+                with pytest.raises(ParameterValueError):
+                    pymc_logccdf(**point)
+                    pytest.fail(f"test_params={point}")
+
+    # For logccdf: values below domain lower edge give 0 (S=1, entire distribution
+    # is above t), and values above domain upper edge give -inf (S=0, no mass above t).
+    # This is the inverse of check_logcdf boundary semantics.
+    invalid_lower, invalid_upper = find_invalid_scalar_params({"value": domain})["value"]
+    if invalid_lower is not None:
+        point = valid_params.copy()
+        point["value"] = invalid_lower
+        npt.assert_equal(
+            pymc_logccdf(**point),
+            0,
+            err_msg=str(point),
+        )
+    if invalid_upper is not None:
+        point = valid_params.copy()
+        point["value"] = invalid_upper
+        npt.assert_equal(
+            pymc_logccdf(**point),
+            -np.inf,
+            err_msg=str(point),
+        )
+
+
 def check_icdf(
     pymc_dist: Distribution,
     paramdomains: dict[str, Domain],
@@ -531,7 +661,7 @@ def check_icdf(
     n_samples: int = 100,
 ) -> None:
     """
-    Generic test for PyMC icdf methods
+    Test PyMC icdf and equivalent scipy icdf methods give similar results for valid values and parameters inside the supported edges.
 
     The following tests are performed by default:
         1. Test PyMC icdf and equivalent scipy icdf (ppf) methods give similar
@@ -563,6 +693,8 @@ def check_icdf(
         returns nan for invalid parameter values outside the supported domain edge
 
     """
+    import pytest
+
     if decimal is None:
         decimal = select_by_precision(float64=6, float32=3)
 
@@ -601,6 +733,7 @@ def check_icdf(
 
                 point = valid_params.copy()
                 point[invalid_param] = invalid_edge
+
                 with pytest.raises(ParameterValueError):
                     pymc_icdf(**point)
                     pytest.fail(f"test_params={point}")
@@ -625,9 +758,7 @@ def check_selfconsistency_discrete_logcdf(
     decimal: int | None = None,
     n_samples: int = 100,
 ) -> None:
-    """
-    Check that logcdf of discrete distributions matches sum of logps up to value.
-    """
+    """Check that logcdf of discrete distributions matches sum of logps up to value."""
     if decimal is None:
         decimal = select_by_precision(float64=6, float32=3)
 
@@ -638,7 +769,7 @@ def check_selfconsistency_discrete_logcdf(
     dist_logp_fn = pytensor.function(list(inputvars(dist_logp)), dist_logp)
 
     dist_logcdf = logcdf(dist, value)
-    dist_logcdf_fn = compile_pymc(list(inputvars(dist_logcdf)), dist_logcdf)
+    dist_logcdf_fn = compile(list(inputvars(dist_logcdf)), dist_logcdf)
 
     domains = paramdomains.copy()
     domains["value"] = domain
@@ -657,12 +788,50 @@ def check_selfconsistency_discrete_logcdf(
             )
 
 
-def assert_moment_is_expected(model, expected, check_finite_logp=True):
-    warnings.warn(
-        "assert_moment_is_expected is deprecated. Use assert_support_point_is_expected instead.",
-        FutureWarning,
-    )
-    assert_support_point_is_expected(model, expected, check_finite_logp=check_finite_logp)
+def check_selfconsistency_icdf(
+    distribution: Distribution,
+    paramdomains: dict[str, Domain],
+    *,
+    decimal: int | None = None,
+    n_samples: int = 100,
+) -> None:
+    """Check that the icdf and logcdf functions of the distribution are consistent.
+
+    Only works with continuous distributions.
+    """
+    if decimal is None:
+        decimal = select_by_precision(float64=6, float32=3)
+
+    dist = create_dist_from_paramdomains(distribution, paramdomains)
+    if dist.type.dtype.startswith("int"):
+        raise NotImplementedError(
+            "check_selfconsistency_icdf is not robust against discrete distributions."
+        )
+    value = dist.astype("float64").type("value")
+    dist_icdf = icdf(dist, value)
+    dist_cdf = pt.exp(logcdf(dist, value))
+
+    py_mode = Mode("py")
+    dist_icdf_fn = pytensor.function(list(inputvars(dist_icdf)), dist_icdf, mode=py_mode)
+    dist_cdf_fn = compile(list(inputvars(dist_cdf)), dist_cdf, mode=py_mode)
+
+    domains = paramdomains.copy()
+    domains["value"] = Domain(np.linspace(0, 1, 10))
+
+    for point in product(domains, n_samples=n_samples):
+        point = dict(point)
+        value = point.pop("value")
+        icdf_value = dist_icdf_fn(**point, value=value)
+        recovered_value = dist_cdf_fn(
+            **point,
+            value=icdf_value,
+        )
+        np.testing.assert_almost_equal(
+            value,
+            recovered_value,
+            decimal=decimal,
+            err_msg=f"point: {point}",
+        )
 
 
 def assert_support_point_is_expected(model, expected, check_finite_logp=True):
@@ -714,7 +883,7 @@ def continuous_random_tester(
 
     model, param_vars = build_model(dist, valuedomain, paramdomains, extra_args)
     model_dist = change_dist_size(model.named_vars["value"], size, expand=True)
-    pymc_rand = compile_pymc([], model_dist)
+    pymc_rand = compile([], model_dist)
 
     domains = paramdomains.copy()
     for point in product(domains, n_samples=100):
@@ -739,6 +908,56 @@ def continuous_random_tester(
         assert p > alpha, str(point)
 
 
+def partially_deterministic_continuous_random_tester(
+    dist,
+    paramdomains,
+    valuedomain=None,
+    ref_rand=None,
+    size=10000,
+    alpha=0.05,
+    fails=10,
+    extra_args=None,
+    model_args=None,
+):
+    if valuedomain is None:
+        valuedomain = Domain([0], edges=(None, None))
+
+    if model_args is None:
+        model_args = {}
+
+    model, param_vars = build_model(dist, valuedomain, paramdomains, extra_args)
+    model_dist = change_dist_size(model.named_vars["value"], size, expand=True)
+    pymc_rand = compile([], model_dist)
+
+    domains = paramdomains.copy()
+    for point in product(domains, n_samples=100):
+        point = pm.Point(point, model=model)
+        point.update(model_args)
+
+        # Update the shared parameter variables in `param_vars`
+        for k, v in point.items():
+            nv = param_vars.get(k, model.named_vars.get(k))
+            if nv.name in param_vars:
+                param_vars[nv.name].set_value(v)
+
+        p = alpha
+        # Allow KS test to fail (i.e., the samples be different)
+        # a certain number of times. Crude, but necessary.
+        f = fails
+        while p <= alpha and f > 0:
+            s0 = pymc_rand()
+            s1 = floatX(ref_rand(size=size, **point))
+
+            # If a distribution has non-stochastic elements in the output (e.g. LKJCorr putting 1's on the diagonal),
+            # it will mess up the KS test. So we filter those out here.
+            stacked_samples = np.c_[np.atleast_1d(s0).flatten(), np.atleast_1d(s1).flatten()]
+            samples = stacked_samples[~np.isclose(stacked_samples[..., 0], stacked_samples[..., 1])]
+
+            _, p = st.ks_2samp(*samples.T)
+            f -= 1
+        assert p > alpha, str(point)
+
+
 def discrete_random_tester(
     dist,
     paramdomains,
@@ -753,7 +972,7 @@ def discrete_random_tester(
 
     model, param_vars = build_model(dist, valuedomain, paramdomains)
     model_dist = change_dist_size(model.named_vars["value"], size, expand=True)
-    pymc_rand = compile_pymc([], model_dist)
+    pymc_rand = compile([], model_dist)
 
     domains = paramdomains.copy()
     for point in product(domains, n_samples=100):
@@ -771,7 +990,7 @@ def discrete_random_tester(
         f = fails
         while p <= alpha and f > 0:
             o = pymc_rand()
-            e = intX(ref_rand(size=size, **point))
+            e = ref_rand(size=size, **point).astype(int)
             o = np.atleast_1d(o).flatten()
             e = np.atleast_1d(e).flatten()
             bins = min(20, max(len(set(e)), len(set(o))))
@@ -788,8 +1007,9 @@ def discrete_random_tester(
 
 class BaseTestDistributionRandom:
     """
-    Base class for tests that new RandomVariables are correctly
-    implemented, and that the mapping of parameters between the PyMC
+    Base class for tests that new RandomVariables are correctly implemented.
+
+    Also checks that the mapping of parameters between the PyMC
     Distribution and the respective RandomVariable is correct.
 
     Three default tests are provided which check:
@@ -861,11 +1081,7 @@ class BaseTestDistributionRandom:
 
     def test_distribution(self):
         self.validate_tests_list()
-        if self.pymc_dist == pm.Wishart:
-            with pytest.warns(UserWarning, match="can currently not be used for MCMC sampling"):
-                self._instantiate_pymc_rv()
-        else:
-            self._instantiate_pymc_rv()
+        self._instantiate_pymc_rv()
         if self.reference_dist is not None:
             self.reference_dist_draws = self.reference_dist()(
                 size=self.size, **self.reference_dist_params
@@ -875,15 +1091,11 @@ class BaseTestDistributionRandom:
                 raise ValueError(
                     "Custom check cannot start with `test_` or else it will be executed twice."
                 )
-            if self.pymc_dist == pm.Wishart and check_name.startswith("check_rv_size"):
-                with pytest.warns(UserWarning, match="can currently not be used for MCMC sampling"):
-                    getattr(self, check_name)()
-            else:
-                getattr(self, check_name)()
+            getattr(self, check_name)()
 
     def get_random_state(self, reset=False):
         if self.random_state is None or reset:
-            self.random_state = nr.RandomState(20160911)
+            self.random_state = nr.default_rng(20160911)
         return self.random_state
 
     def _instantiate_pymc_rv(self, dist_params=None):
@@ -899,19 +1111,27 @@ class BaseTestDistributionRandom:
             self.pymc_rv.eval(), self.reference_dist_draws, decimal=self.decimal
         )
 
+    def check_pymc_draws_match_reference_not_numba(self):
+        # This calls `check_pymc_draws_match_reference` but only if the default linker is NOT numba.
+        # It's used when the draws aren't expected to match in that backend.
+        if isinstance(get_default_mode().linker, NumbaLinker):
+            return
+        npt.assert_array_almost_equal(
+            self.pymc_rv.eval(), self.reference_dist_draws, decimal=self.decimal
+        )
+
     def check_pymc_params_match_rv_op(self):
         op = self.pymc_rv.owner.op
         if isinstance(op, RandomVariable):
-            _, _, _, *pytensor_dist_inputs = self.pymc_rv.owner.inputs
+            pytensor_dist_inputs = op.dist_params(self.pymc_rv.owner)
         else:
-            inputs_signature, _ = op.signature.split("->")
-            pytensor_dist_inputs = [
-                inp
-                for inp, inp_signature in zip(
-                    self.pymc_rv.owner.inputs, inputs_signature.split(",")
-                )
-                if inp_signature not in ("[rng]", "[size]")
-            ]
+            extended_signature = op.extended_signature
+            if extended_signature is None:
+                raise NotImplementedError("Op requires extended signature to be tested")
+            [_, _, dist_params_idxs], _ = op.get_input_output_type_idxs(extended_signature)
+            dist_inputs = self.pymc_rv.owner.inputs
+            pytensor_dist_inputs = [dist_inputs[i] for i in dist_params_idxs]
+
         assert len(self.expected_rv_op_params) == len(pytensor_dist_inputs)
         for (expected_name, expected_value), actual_variable in zip(
             self.expected_rv_op_params.items(), pytensor_dist_inputs
@@ -920,6 +1140,9 @@ class BaseTestDistributionRandom:
             if isinstance(expected_value, pytensor.tensor.Variable):
                 expected_value = expected_value.eval()
 
+            # RVs introduce expand_dims on the parameters, but the tests do not expect this
+            implicit_expand_dims = actual_variable.type.ndim - np.ndim(expected_value)
+            actual_variable = actual_variable.squeeze(tuple(range(implicit_expand_dims)))
             npt.assert_almost_equal(expected_value, actual_variable.eval(), decimal=self.decimal)
 
     def check_rv_size(self):
@@ -927,18 +1150,15 @@ class BaseTestDistributionRandom:
         sizes_to_check = self.sizes_to_check or [None, (), 1, (1,), 5, (4, 5), (2, 4, 2)]
         sizes_expected = self.sizes_expected or [(), (), (1,), (1,), (5,), (4, 5), (2, 4, 2)]
         for size, expected in zip(sizes_to_check, sizes_expected):
-            pymc_rv = self.pymc_dist.dist(**self.pymc_dist_params, size=size)
-            expected_symbolic = tuple(pymc_rv.shape.eval())
-            actual = pymc_rv.eval().shape
+            rv = self.pymc_dist.dist(**self.pymc_dist_params, size=size)
+            expected_symbolic = tuple(rv.shape.eval())
+            actual = rv.eval().shape
             assert actual == expected_symbolic
             assert expected_symbolic == expected, (size, expected_symbolic, expected)
 
         # test multi-parameters sampling for univariate distributions (with univariate inputs)
-        if (
-            self.pymc_dist.rv_type.ndim_supp == 0
-            and self.pymc_dist.rv_type.ndims_params
-            and sum(self.pymc_dist.rv_type.ndims_params) == 0
-        ):
+        rv_op = rv.owner.op
+        if rv_op.ndim_supp == 0 and rv_op.ndims_params == 0:
             params = {
                 k: p * np.ones(self.repeated_params_shape) for k, p in self.pymc_dist_params.items()
             }
@@ -949,15 +1169,15 @@ class BaseTestDistributionRandom:
                 (5, self.repeated_params_shape),
             ]
             for size, expected in zip(sizes_to_check, sizes_expected):
-                pymc_rv = self.pymc_dist.dist(**params, size=size)
-                expected_symbolic = tuple(pymc_rv.shape.eval())
-                actual = pymc_rv.eval().shape
+                rv = self.pymc_dist.dist(**params, size=size)
+                expected_symbolic = tuple(rv.shape.eval())
+                actual = rv.eval().shape
                 assert actual == expected_symbolic == expected
 
     def validate_tests_list(self):
-        assert len(self.checks_to_run) == len(
-            set(self.checks_to_run)
-        ), "There are duplicates in the list of checks_to_run"
+        assert len(self.checks_to_run) == len(set(self.checks_to_run)), (
+            "There are duplicates in the list of checks_to_run"
+        )
 
 
 def seeded_scipy_distribution_builder(dist_name: str) -> Callable:
@@ -965,14 +1185,250 @@ def seeded_scipy_distribution_builder(dist_name: str) -> Callable:
 
 
 def seeded_numpy_distribution_builder(dist_name: str) -> Callable:
-    return lambda self: ft.partial(
-        getattr(np.random.RandomState, dist_name), self.get_random_state()
-    )
+    return lambda self: getattr(self.get_random_state(), dist_name)
 
 
 def assert_no_rvs(vars: Sequence[Variable]) -> None:
-    """Assert that there are no `MeasurableVariable` nodes in a graph."""
-
-    rvs = rvs_in_graph(vars)
-    if rvs:
+    """Assert that there are no `MeasurableOp` nodes in a graph."""
+    if rvs := rvs_in_graph(vars):
         raise AssertionError(f"RV found in graph: {rvs}")
+
+
+SampleStatsCreator = Callable[[tuple[int, int]], NDArray]
+
+
+def mock_sample(
+    draws: int = 10,
+    sample_stats: dict[str, SampleStatsCreator] | None = None,
+    **kwargs,
+) -> xr.DataTree:
+    """Mock :func:`pymc.sample` with :func:`pymc.sample_prior_predictive`.
+
+    Useful for testing models that use pm.sample without running MCMC sampling.
+
+    Examples
+    --------
+    Using mock_sample with pytest
+
+    .. note::
+
+        Use :func:`pymc.testing.mock_sample_setup_and_teardown` directly for pytest fixtures.
+
+    .. code-block:: python
+
+        import pytest
+
+        import pymc as pm
+        from pymc.testing import mock_sample
+
+
+        @pytest.fixture(scope="module")
+        def mock_pymc_sample():
+            original_sample = pm.sample
+            pm.sample = mock_sample
+
+            yield
+
+            pm.sample = original_sample
+
+    By default, the sample_stats group is not created. Pass a dictionary of functions
+    that create sample statistics, where the keys are the names of the statistics
+    and the values are functions that take a size tuple and return an array of that size.
+
+    .. code-block:: python
+
+        from functools import partial
+
+        import numpy as np
+        from numpy.typing import NDArray
+
+        from pymc.testing import mock_sample
+
+
+        def mock_diverging(size: tuple[int, int]) -> NDArray:
+            return np.zeros(size)
+
+
+        def mock_tree_depth(size: tuple[int, int]) -> NDArray:
+            return np.random.choice(range(2, 10), size=size)
+
+
+        mock_sample_with_stats = partial(
+            mock_sample,
+            sample_stats={
+                "diverging": mock_diverging,
+                "tree_depth": mock_tree_depth,
+            },
+        )
+
+    """
+    random_seed = kwargs.get("random_seed", None)
+    model = kwargs.get("model", None)
+    draws = kwargs.get("draws", draws)
+    n_chains = kwargs.get("chains", 1)
+    var_names = kwargs.get("var_names", None)
+    idata: xr.DataTree = pm.sample_prior_predictive(
+        model=model,
+        random_seed=random_seed,
+        draws=draws,
+        var_names=var_names,
+    )
+
+    idata["posterior"] = (
+        idata["prior"]
+        .to_dataset()
+        .isel(chain=0)
+        .expand_dims({"chain": range(n_chains)})
+        .transpose("chain", "draw", ...)
+    )
+    del idata["prior"]
+    if "prior_predictive" in idata:
+        del idata["prior_predictive"]
+
+    if sample_stats is not None:
+        posterior_ds = idata["posterior"].to_dataset()
+        sizes = posterior_ds.sizes
+        size = (sizes["chain"], sizes["draw"])
+        sample_stats_ds = xr.Dataset(
+            {name: (("chain", "draw"), creator(size)) for name, creator in sample_stats.items()},
+            coords=posterior_ds.coords,
+        )
+        idata["sample_stats"] = sample_stats_ds
+
+    return idata
+
+
+def mock_sample_setup_and_teardown():
+    """Set up and tear down mocking of PyMC sampling functions for testing.
+
+    This function is designed to be used with pytest fixtures to temporarily replace
+    PyMC's sampling functionality with faster alternatives for testing purposes.
+
+    Effects during the fixture's active period:
+
+    * Replaces :func:`pymc.sample` with :func:`pymc.testing.mock_sample`, which uses
+      prior predictive sampling instead of MCMC
+    * Replaces distributions:
+        * :class:`pymc.Flat` with :class:`pymc.Normal`
+        * :class:`pymc.HalfFlat` with :class:`pymc.HalfNormal`
+    * Automatically restores all original functions and distributions after the test completes
+
+    Examples
+    --------
+    Use with `pytest` to mock actual PyMC sampling in test suite.
+
+    .. code-block:: python
+
+        # tests/conftest.py
+        import pytest
+        import pymc as pm
+        from pymc.testing import mock_sample_setup_and_teardown
+
+        # Register as a pytest fixture
+        mock_pymc_sample = pytest.fixture(scope="function")(mock_sample_setup_and_teardown)
+
+
+        # tests/test_model.py
+        # Use in a test function
+        def test_model_inference(mock_pymc_sample):
+            with pm.Model() as model:
+                x = pm.Normal("x", 0, 1)
+                # This will use mock_sample instead of actual MCMC
+                idata = pm.sample()
+                # Test with the inference data...
+
+    """
+    import pymc as pm
+
+    original_flat = pm.Flat
+    original_half_flat = pm.HalfFlat
+    original_sample = pm.sample
+
+    pm.sample = mock_sample
+    pm.Flat = pm.Normal
+    pm.HalfFlat = pm.HalfNormal
+
+    yield
+
+    pm.sample = original_sample
+    pm.Flat = original_flat
+    pm.HalfFlat = original_half_flat
+
+
+def equal_computations_up_to_root(
+    xs: Sequence[Variable],
+    ys: Sequence[Variable],
+    ignore_rng_values=True,
+    strict_dtype=True,
+) -> bool:
+    # Check if graphs are equivalent even if root variables have distinct identities
+
+    x_graph_inputs = [var for var in graph_inputs(xs) if not isinstance(var, Constant)]
+    y_graph_inputs = [var for var in graph_inputs(ys) if not isinstance(var, Constant)]
+    if len(x_graph_inputs) != len(y_graph_inputs):
+        return False
+    for x, y in zip(x_graph_inputs, y_graph_inputs):
+        if x.type != y.type:
+            return False
+        if x.name != y.name:
+            return False
+        if isinstance(x, SharedVariable):
+            if not isinstance(y, SharedVariable):
+                return False
+            if isinstance(x.type, RandomType) and ignore_rng_values:
+                continue
+            if not x.type.values_eq(x.get_value(), y.get_value()):
+                return False
+
+    return equal_computations(
+        xs,  # type: ignore[arg-type]
+        ys,  # type: ignore[arg-type]
+        in_xs=x_graph_inputs,
+        in_ys=y_graph_inputs,
+        strict_dtype=strict_dtype,
+    )
+
+
+def assert_equivalent_model(model_1: Model, model_2: Model, *, strict_dtype: bool = True) -> None:
+    """Assert that two PyMC models are equivalent.
+
+    Model variable order is incidental (it follows graph construction history); model
+    variables are uniquely named, so they are compared by name, ignoring order.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        import pymc as pm
+        from pymc.testing import assert_equivalent_model
+
+        with pm.Model() as m1:
+            x = pm.Normal("x")
+            y = pm.Normal("y", x)
+
+        with pm.Model() as m2:
+            x = pm.Normal("x")
+            y = pm.Normal("y", x)
+
+        assert_equivalent_model(m1, m2)
+
+    """
+    fgraph_1, _ = fgraph_from_model(model_1)
+    fgraph_2, _ = fgraph_from_model(model_2)
+
+    def output_name(var: Variable) -> str:
+        # fgraph outputs are ModelVar nodes that carry the variable name on the Op
+        match var.owner_op:
+            case ModelVar(name=name):
+                return name
+            case _:
+                return ""
+
+    outputs_1 = sorted(fgraph_1.outputs, key=output_name)
+    outputs_2 = sorted(fgraph_2.outputs, key=output_name)
+    names_1 = [var.name for var in outputs_1]
+    names_2 = [var.name for var in outputs_2]
+    assert names_1 == names_2, f"Model variables differ: {names_1} != {names_2}"
+    assert equal_computations_up_to_root(outputs_1, outputs_2, strict_dtype=strict_dtype), (
+        "Model computations differ"
+    )

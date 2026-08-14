@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -48,21 +48,20 @@ class TestRVsAssignmentHamiltonianMC(RVsAssignmentStepsTester):
 
 def test_leapfrog_reversible():
     n = 3
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
     start, model, _ = models.non_normal(n)
     size = sum(start[n.name].size for n in model.value_vars)
-    scaling = floatX(np.random.rand(size))
+    scaling = floatX(rng.random(size))
 
     class HMC(BaseHMC):
         def _hamiltonian_step(self, *args, **kwargs):
             pass
 
-    step = HMC(vars=model.value_vars, model=model, scaling=scaling)
+    step = HMC(vars=model.value_vars, model=model, scaling=scaling, rng=rng)
 
-    step.integrator._logp_dlogp_func.set_extra_values({})
     astart = DictToArrayBijection.map(start)
     p = RaveledVars(floatX(step.potential.random()), astart.point_map_info)
-    q = RaveledVars(floatX(np.random.randn(size)), astart.point_map_info)
+    q = floatX(rng.normal(size=size))
     start = step.integrator.compute_state(p, q)
     for epsilon in [0.01, 0.1]:
         for n_steps in [1, 2, 3, 4, 20]:

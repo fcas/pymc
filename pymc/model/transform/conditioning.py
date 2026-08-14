@@ -1,4 +1,4 @@
-#   Copyright 2024 The PyMC Developers
+#   Copyright 2024 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -16,16 +16,17 @@ import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any, Union
 
-from pytensor.graph import ancestors
+import pytensor
+
+from pytensor.graph import Constant, ancestors
 from pytensor.tensor import TensorVariable
 
-from pymc import Model
 from pymc.logprob.transforms import Transform
-from pymc.logprob.utils import rvs_in_graph
+from pymc.model.core import BaseModel, Model
 from pymc.model.fgraph import (
     ModelDeterministic,
     ModelFreeRV,
-    extract_dims,
+    ModelValuedVar,
     fgraph_from_model,
     model_deterministic,
     model_free_rv,
@@ -38,7 +39,7 @@ from pymc.model.transform.basic import (
     parse_vars,
     prune_vars_detached_from_observed,
 )
-from pymc.pytensorf import replace_vars_in_graphs, toposort_replace
+from pymc.pytensorf import replace_vars_in_graphs, rvs_in_graph, toposort_replace
 from pymc.util import get_transformed_name, get_untransformed_name
 
 
@@ -74,7 +75,9 @@ def observe(
 
         m_new = pm.observe(m, {y: 0.5})
 
-    Deterministic variables can also be observed.
+    Deterministic variables can also be observed. If the variable has already
+    been observed, its old value is replaced with the one provided.
+
     This relies on PyMC ability to infer the logp of the underlying expression
 
     .. code-block:: python
@@ -95,9 +98,9 @@ def observe(
         for var, obs in vars_to_observations.items()
     }
 
-    valid_model_vars = set(model.free_RVs + model.deterministics)
+    valid_model_vars = set(model.basic_RVs + model.deterministics)
     if any(var not in valid_model_vars for var in vars_to_observations):
-        raise ValueError("At least one var is not a free variable or deterministic in the model")
+        raise ValueError("At least one var is not a random variable or deterministic in the model")
 
     fgraph, memo = fgraph_from_model(model)
 
@@ -106,13 +109,12 @@ def observe(
         model_var = memo[var]
 
         # Just a sanity check
-        assert isinstance(model_var.owner.op, ModelFreeRV | ModelDeterministic)
+        assert isinstance(model_var.owner.op, ModelValuedVar | ModelDeterministic)
         assert model_var in fgraph.variables
 
         var = model_var.owner.inputs[0]
-        var.name = model_var.name
-        dims = extract_dims(model_var)
-        model_obs_rv = model_observed_rv(var, var.type.filter_variable(obs), *dims)
+        op = model_var.owner.op
+        model_obs_rv = model_observed_rv(var, var.type.filter_variable(obs), op.name, *op.dims)
         replacements[model_var] = model_obs_rv
 
     toposort_replace(fgraph, tuple(replacements.items()))
@@ -123,7 +125,9 @@ def observe(
 def do(
     model: Model,
     vars_to_interventions: Mapping[Union["str", TensorVariable], Any],
-    prune_vars=False,
+    *,
+    make_interventions_shared: bool = True,
+    prune_vars: bool = False,
 ) -> Model:
     """Replace model variables by intervention variables.
 
@@ -137,6 +141,8 @@ def do(
         Dictionary that maps model variables (or names) to intervention expressions.
         Intervention expressions must have a shape and data type that is compatible
         with the original model variable.
+    make_interventions_shared: bool, defaults to True,
+        Whether to make constant interventions shared variables.
     prune_vars: bool, defaults to False
         Whether to prune model variables that are not connected to any observed variables,
         after the interventions.
@@ -167,11 +173,14 @@ def do(
 
     """
     do_mapping = {}
-    for var, obs in vars_to_interventions.items():
+    for var, intervention in vars_to_interventions.items():
         if isinstance(var, str):
             var = model[var]
         try:
-            do_mapping[var] = var.type.filter_variable(obs)
+            intervention = var.type.filter_variable(intervention)
+            if make_interventions_shared and isinstance(intervention, Constant):
+                intervention = pytensor.shared(intervention.data, name=var.name)
+            do_mapping[var] = intervention
         except TypeError as err:
             raise TypeError(
                 "Incompatible replacement type. Make sure the shape and datatype of the interventions match the original variables"
@@ -193,22 +202,22 @@ def do(
         # Just a sanity check
         assert model_var in fgraph.variables
 
+        op = model_var.owner.op
         # If the intervention references the original variable we must give it a different name
         if model_var in ancestors([intervention]):
-            intervention.name = f"do_{model_var.name}"
+            name = f"do_{op.name}"
             warnings.warn(
-                f"Intervention expression references the variable that is being intervened: {model_var.name}. "
-                f"Intervention will be given the name: {intervention.name}"
+                f"Intervention expression references the variable that is being intervened: {op.name}. "
+                f"Intervention will be given the name: {name}"
             )
         else:
-            intervention.name = model_var.name
-        dims = extract_dims(model_var)
+            name = op.name
         # If there are any RVs in the graph we introduce the intervention as a deterministic
         if rvs_in_graph([intervention]):
-            new_var = model_deterministic(intervention.copy(name=intervention.name), *dims)
+            new_var = model_deterministic(intervention.copy(), name, *op.dims)
         # Otherwise as a named variable (Constant or Shared data)
         else:
-            new_var = model_named(intervention, *dims)
+            new_var = model_named(intervention, name, *op.dims)
 
         replacements[model_var] = new_var
 
@@ -225,7 +234,7 @@ def change_value_transforms(
     model: Model,
     vars_to_transforms: Mapping[ModelVariable, Transform | None],
 ) -> Model:
-    """Change the value variables transforms in the model
+    r"""Change the value variables transforms in the model.
 
     Parameters
     ----------
@@ -246,17 +255,17 @@ def change_value_transforms(
 
         import pymc as pm
         from pymc.distributions.transforms import logodds
-        from pymc.model.transform.conditioning import change_value_transforms
+        from pymc.model.transform import change_value_transforms
 
         with pm.Model() as base_m:
-            p = pm.Uniform("p", 0, 1, transform=None)
+            p = pm.Uniform("p", 0, 1, default_transform=None)
             w = pm.Binomial("w", n=9, p=p, observed=6)
 
         with change_value_transforms(base_m, {"p": logodds}) as transformed_p:
             mean_q = pm.find_MAP()
 
         with change_value_transforms(transformed_p, {"p": None}) as untransformed_p:
-            new_p = untransformed_p['p']
+            new_p = untransformed_p["p"]
             std_q = ((1 / pm.find_hessian(mean_q, vars=[new_p])) ** 0.5)[0]
 
         print(f"  Mean, Standard deviation\\np {mean_q['p']:.2}, {std_q[0]:.2}")
@@ -285,7 +294,7 @@ def change_value_transforms(
 
         transform = vars_to_transforms[dummy_rv]
 
-        rv, value, *dims = node.inputs
+        rv, value = node.inputs
 
         new_value = rv.type()
         try:
@@ -298,7 +307,7 @@ def change_value_transforms(
             new_name = untransformed_name
         new_value.name = new_name
 
-        new_dummy_rv = model_free_rv(rv, new_value, transform, *dims)
+        new_dummy_rv = model_free_rv(rv, new_value, transform, node.op.name, *node.op.dims)
         replacements[dummy_rv] = new_dummy_rv
 
     toposort_replace(fgraph, tuple(replacements.items()))
@@ -306,10 +315,10 @@ def change_value_transforms(
 
 
 def remove_value_transforms(
-    model: Model,
+    model: BaseModel,
     vars: Sequence[ModelVariable] | None = None,
 ) -> Model:
-    """Remove the value variables transforms in the model
+    r"""Remove the value variables transforms in the model.
 
     Parameters
     ----------
@@ -329,7 +338,7 @@ def remove_value_transforms(
     .. code-block:: python
 
         import pymc as pm
-        from pymc.model.transform.conditioning import remove_value_transforms
+        from pymc.model.transform import remove_value_transforms
 
         with pm.Model() as transformed_m:
             p = pm.Uniform("p", 0, 1)
@@ -347,7 +356,7 @@ def remove_value_transforms(
     """
     if vars is None:
         vars = model.free_RVs
-    return change_value_transforms(model, {var: None for var in vars})
+    return change_value_transforms(model, dict.fromkeys(vars))
 
 
 __all__ = (
